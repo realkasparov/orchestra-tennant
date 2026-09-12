@@ -23,22 +23,31 @@
 - macOS или Linux
 - [`claude` CLI](https://docs.anthropic.com/claude-code) с выполненным входом (`claude login`) — этапы запускают его
 - `git`
-- Go 1.26+ — только для установки из исходников
+- Go — **не** нужен (бинари в Releases); только для сборки из исходников
 
 ## Установка
 
-Из GitHub одной командой (бинарь окажется в `$(go env GOPATH)/bin`, обычно `~/go/bin` — он должен быть в `PATH`):
+Go не нужен: готовые бинари для macOS (Apple Silicon и Intel) и Linux (amd64, arm64) лежат в [Releases](https://github.com/realkasparov/orchestra-tennant/releases). Одной командой — скрипт скачивает последний релиз, сверяет контрольную сумму и кладёт бинарь в `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/realkasparov/orchestra-tennant/main/install.sh | sh
+```
+
+Переменные скрипта: `ORCHESTRA_TENNANT_VERSION=v0.3.0` — конкретный релиз, `ORCHESTRA_TENNANT_BIN=/usr/local/bin` — другая папка.
+
+Вручную: скачайте архив под свою систему со страницы релиза, распакуйте и положите `orchestra-tennant` в любую папку из `PATH`:
+
+```bash
+tar -xzf orchestra-tennant_darwin_arm64.tar.gz
+mv orchestra-tennant ~/.local/bin/
+```
+
+Бинарь не подписан: на macOS архив, скачанный `curl`, запускается без вопросов; скачанный браузером может получить карантин — снимите его: `xattr -d com.apple.quarantine ~/.local/bin/orchestra-tennant`.
+
+Для разработчиков — из исходников (Go 1.26+):
 
 ```bash
 go install github.com/realkasparov/orchestra-tennant/cmd/orchestra-tennant@latest
-```
-
-Или из клона:
-
-```bash
-git clone https://github.com/realkasparov/orchestra-tennant.git
-cd orchestra-tennant
-go build -o orchestra-tennant ./cmd/orchestra-tennant
 ```
 
 Проверка:
