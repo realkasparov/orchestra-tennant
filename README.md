@@ -45,7 +45,7 @@ orchestra-tennant version
 2. Run that command on the machine:
 
    ```bash
-   orchestra-tennant setup -orchestrator http://127.0.0.1:8765 -pair-key XXXXX-XXXXX-XXXXX-XXXXX
+   orchestra-tennant setup -orchestrator http://127.0.0.1:8765 -pair-key orc_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
    ```
 
    Setup asks a few questions — which models to use, how many tasks to run at once, where to keep projects — checks that everything works, and offers to install itself as a background service that starts on boot. You can also run it in a terminal instead:
