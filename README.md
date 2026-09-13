@@ -1,150 +1,93 @@
 # orchestra-tennant
 
-Исполнитель тасок для оркестратора **Orchestra**: демон, который ставится на машину, подключается к оркестратору и выполняет на этой машине то, что оркестратор ему предлагает, — заводит проекты, создаёт ветки и рабочие копии, запускает агентов по этапам, гоняет тесты и отдаёт назад события, артефакты и дифф.
+**Orchestra** is an orchestrator for agent-driven software development. It lets you create new projects or connect existing ones in a couple of clicks, integrates with the repositories you already use — GitLab today, GitHub coming — and takes a task from analysis to a ready branch through a pipeline of AI agents: planning, review of the plan, implementation, tests, code review. You watch the progress, answer the agents' questions and send corrections in chat; Orchestra does the rest.
 
-Тот же код исполнителя встроен в сам оркестратор: машина, на которой он запущен, работает без отдельного демона. Демон нужен, чтобы подключить **другие** машины — ноутбук, рабочую станцию, сервер сборки.
+Orchestra never touches your code itself. The work happens on **your machines**: a laptop, a workstation, a build server — any device you connect. The code, the git credentials and the AI subscription stay where they are; the orchestrator only receives the progress, the artifacts and the diff.
 
-> Сейчас поддерживается оркестратор **на той же машине**: связь идёт по Unix-сокету. Адрес удалённого оркестратора настройка принимает и сохраняет, но честно говорит, что транспорта для него в этой версии нет.
+**orchestra-tennant** is the piece that runs on such a machine. Install it on every device where your projects live, pair it with the orchestrator once, and the device shows up in Orchestra as a place where tasks can run.
 
-## Что внутри
+## Requirements
 
-| Пакет | Что делает |
-|---|---|
-| `cmd/orchestra-tennant` | Сам демон: `setup`, `run`, `status`, `logs`, `service` |
-| `executor` | Исполнитель: цикл этапов, рабочие копии, скиллы, журнал заданий, задания на проект |
-| `protocol` | Протокол «оркестратор ⇄ исполнитель»: план таски, задания, события, транспорт |
-| `dispatch` | Очередь заданий оркестратора — здесь же, потому что описывает тот же протокол с другой стороны |
-| `agent` | Запуск `claude` CLI и разбор его потока |
-| `gitops`, `codeindex`, `mcpserver`, `repomap` | git, семантический индекс кода, MCP-сервер `code_search`, карта репозитория |
-| `skills/` | Скиллы этапов — встроены в бинарь, на машине ставятся в `~/.claude/skills` |
-
-## Требования
-
-- macOS или Linux
-- [`claude` CLI](https://docs.anthropic.com/claude-code) с выполненным входом (`claude login`) — этапы запускают его
+- macOS or Linux
+- [`claude` CLI](https://docs.anthropic.com/claude-code) with a completed login (`claude login`)
 - `git`
-- Go — **не** нужен (бинари в Releases); только для сборки из исходников
 
-## Установка
+Go is **not** required — ready-to-run binaries are published in [Releases](https://github.com/realkasparov/orchestra-tennant/releases).
 
-Go не нужен: готовые бинари для macOS (Apple Silicon и Intel) и Linux (amd64, arm64) лежат в [Releases](https://github.com/realkasparov/orchestra-tennant/releases). Одной командой — скрипт скачивает последний релиз, сверяет контрольную сумму и кладёт бинарь в `~/.local/bin`:
+## Install
+
+One command downloads the latest release, verifies its checksum and puts the binary into `~/.local/bin`:
 
 ```bash
 curl -fsSL https://github.com/realkasparov/orchestra-tennant/releases/latest/download/install.sh | sh
 ```
 
-Переменные скрипта: `ORCHESTRA_TENNANT_VERSION=v0.3.0` — конкретный релиз, `ORCHESTRA_TENNANT_BIN=/usr/local/bin` — другая папка.
-
-Вручную: скачайте архив под свою систему со страницы релиза, распакуйте и положите `orchestra-tennant` в любую папку из `PATH`:
+Prefer to do it by hand? Download the archive for your system from the [release page](https://github.com/realkasparov/orchestra-tennant/releases/latest), unpack it and put `orchestra-tennant` anywhere on your `PATH`:
 
 ```bash
 tar -xzf orchestra-tennant_darwin_arm64.tar.gz
 mv orchestra-tennant ~/.local/bin/
 ```
 
-Бинарь не подписан: на macOS архив, скачанный `curl`, запускается без вопросов; скачанный браузером может получить карантин — снимите его: `xattr -d com.apple.quarantine ~/.local/bin/orchestra-tennant`.
-
-Для разработчиков — из исходников (Go 1.26+):
-
-```bash
-go install github.com/realkasparov/orchestra-tennant/cmd/orchestra-tennant@latest
-```
-
-Проверка:
+Check:
 
 ```bash
 orchestra-tennant version
 ```
 
-## Подключение к оркестратору
+> macOS may quarantine a binary downloaded with a browser. Release it with
+> `xattr -d com.apple.quarantine ~/.local/bin/orchestra-tennant`.
 
-1. В оркестраторе откройте **Устройства → Добавить устройство**, назовите машину и нажмите «Создать и получить ключ». Ключ подключения показывается **один раз** и действует 15 минут; там же будет готовая команда настройки с адресом оркестратора и ключом.
+## Connect to Orchestra
 
-2. На машине запустите её (или просто `orchestra-tennant setup` — тогда всё спросится по шагам):
+1. In Orchestra open **Devices → Add device**, name the machine and get a pairing key. The key is shown once and is valid for 15 minutes; the panel also shows a ready-made setup command.
+
+2. Run that command on the machine:
 
    ```bash
    orchestra-tennant setup -orchestrator http://127.0.0.1:8765 -pair-key XXXXX-XXXXX-XXXXX-XXXXX
    ```
 
-   Настройка проходит пять шагов и заканчивается самопроверками:
-
-   | Шаг | Что спрашивается |
-   |---|---|
-   | Оркестратор | адрес HTTP-интерфейса (по умолчанию `http://127.0.0.1:8765`) |
-   | Ключ подключения | ключ из панели; меняется на постоянный ключ устройства и в журнал не попадает |
-   | Модели | что найдено на машине (`claude`, `codex`, `ollama`, ключи в окружении); выбираете, какие модели демон объявит оркестратору |
-   | Одновременные задания | сколько тасок вести параллельно (по умолчанию 2) |
-   | Папка проектов | одна на машину, по умолчанию `~/orchestra-projects`; проекты из оркестратора создаются внутри неё |
-
-   Самопроверки: оркестратор найден · ключ принят и сокет на месте · выбранные модели отвечают (каждой задаётся короткий вопрос) · версия схемы плана согласована. Провал любой называет причину, и настройка **не** считается завершённой — исправьте и запустите `setup` снова: ключ уже сохранён, вводить его заново не нужно.
-
-3. В конце настройка предложит поставить демона фоновой службой (`launchd` на macOS, `systemd --user` на Linux). Служба переживает перезагрузку и перезапускается после падения. Можно и без неё:
+   Setup asks a few questions — which models to use, how many tasks to run at once, where to keep projects — checks that everything works, and offers to install itself as a background service that starts on boot. You can also run it in a terminal instead:
 
    ```bash
    orchestra-tennant run
    ```
 
-Через несколько секунд карточка устройства в оркестраторе станет «на связи» и покажет версию демона, число мест и папку проектов.
+A few seconds later the device card in Orchestra turns **online**. From now on you can create projects on this machine and run tasks in them.
 
-Все шаги задаются флагами, поэтому настройка воспроизводится скриптом:
-
-```bash
-orchestra-tennant setup -orchestrator http://127.0.0.1:8765 -pair-key XXXXX-XXXXX-XXXXX-XXXXX \
-  -models fable,opus -slots 2 -projects ~/orchestra-projects -service yes -yes
-```
-
-## Команды
+## Commands
 
 ```
-orchestra-tennant setup                  настроить (повторный запуск не требует нового ключа)
-orchestra-tennant run                    работать в терминале
-orchestra-tennant status                 настройка, служба, живой процесс, связь с оркестратором
-orchestra-tennant logs [-n 50] [-f]      журнал; -f — следить
-orchestra-tennant service install        поставить фоновую службу
-orchestra-tennant service uninstall      снять
-orchestra-tennant update [-check]        обновиться до последнего релиза с GitHub (служба перезапустится сама)
+orchestra-tennant setup                 configure (re-running does not require a new key)
+orchestra-tennant run                   run in the terminal
+orchestra-tennant status                configuration, service, connection to Orchestra
+orchestra-tennant logs [-n 50] [-f]     show the log; -f follows it
+orchestra-tennant service install       install the background service
+orchestra-tennant service uninstall     remove it
+orchestra-tennant update [-check]       update to the latest release
 orchestra-tennant version
 ```
 
-Общий флаг `-home DIR` (или `ORCHESTRA_TENNANT_HOME`) — папка демона, по умолчанию `~/.orchestra-tennant`.
-
-## Что лежит на машине
-
-```
-~/.orchestra-tennant/
-  config.json      адрес оркестратора, ключ устройства, модели, места, папка проектов (только владелец, 0600)
-  agent.log        журнал с ротацией: подключения, принятые и завершённые задания, пакеты, ошибки
-  status.json      состояние живого процесса — его читает status
-  executor/        журнал незавершённых заданий: после перезапуска они возобновляются
-  tasks/           папки задач (артефакты этапов)
-  worktrees/       рабочие копии тасок
-  skills/          скиллы этапов, выложенные из бинаря
-~/orchestra-projects/   проекты, созданные из оркестратора
-~/.claude/skills/       симлинки на скиллы — их видит claude
-```
-
-## Как это работает
-
-- Соединение всегда открывает демон: перед подключением он спрашивает оркестратор по HTTP (`heartbeat`), где сокет и какие версии плана тот понимает, затем держит одно постоянное соединение. Оркестратор по нему **предлагает** задания, демон подтверждает, продлевает лиз и шлёт события.
-- Задание — это JSON-план таски: этапы со скиллами и точными сборками моделей, проект, бюджет, таймауты. Промпты собирает сам исполнитель из скиллов на машине.
-- Разрыв связи не прерывает работу: текущий этап дорабатывается, события копятся и досылаются после переподключения; продолжение — с границы этапа.
-- Ключ устройства в журнал не пишется. Тела пакетов — тоже.
-
-## Если что-то не так
+## Update
 
 ```bash
-orchestra-tennant status        # оркестратор отвечает? ключ принят? сокет на месте?
-orchestra-tennant logs -n 100   # дошло ли задание, прошла ли валидация плана
+orchestra-tennant update
 ```
 
-- **«ключ устройства не принят»** — устройство отозвано или ключ перевыпущен в оркестраторе: выпустите новый ключ на карточке и пройдите `setup`.
-- **«модели отвечают — провал»** — `claude` не установлен или не выполнен вход: `claude login`.
-- **«сокет исполнителей не найден»** — оркестратор не на этой машине или не запущен.
+The command downloads the latest release, verifies it, replaces the binary and restarts the background service if one is installed. `update -check` only reports whether a newer version exists.
 
-## Разработка
+## If something goes wrong
 
 ```bash
-go test ./...
+orchestra-tennant status
+orchestra-tennant logs -n 100
 ```
 
-Оркестратор (приватный репозиторий) подключает этот модуль как зависимость: у встроенного и внешнего исполнителя один код, и второй реализации быть не должно.
+- **device key not accepted** — the device was revoked or its key was reissued in Orchestra: get a new pairing key on the device card and run `setup` again.
+- **models do not respond** — `claude` is not installed or not logged in: run `claude login`.
+- **cannot reach the orchestrator** — check the address and that Orchestra is running.
+
+## License
+
+[Apache License 2.0](LICENSE)
