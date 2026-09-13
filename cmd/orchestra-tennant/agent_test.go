@@ -263,6 +263,13 @@ func TestNormalizeAddr(t *testing.T) {
 	if !isLocalAddr("http://127.0.0.1:8765") || !isLocalAddr("http://localhost:1") || isLocalAddr("http://10.0.0.5:8765") {
 		t.Error("локальность адреса определена неверно")
 	}
+	// Оркестратор за локальным reverse-proxy: имя *.localhost — эта машина.
+	if !isLocalAddr("http://agent-service.localhost") || !isLocalAddr("http://orchestra.localhost:8080") {
+		t.Error("*.localhost должен считаться этой машиной")
+	}
+	if isLocalAddr("http://example.com") {
+		t.Error("внешнее имя принято за локальное")
+	}
 }
 
 // Выбор моделей: номера через запятую, «все», проверка против найденного.
