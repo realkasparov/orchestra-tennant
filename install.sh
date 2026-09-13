@@ -1,7 +1,7 @@
 #!/bin/sh
 # Установка orchestra-tennant из GitHub Releases: без Go, без клона.
 #
-#   curl -fsSL https://raw.githubusercontent.com/realkasparov/orchestra-tennant/main/install.sh | sh
+#   curl -fsSL https://github.com/realkasparov/orchestra-tennant/releases/latest/download/install.sh | sh
 #
 # Переменные: ORCHESTRA_TENNANT_VERSION (тег, по умолчанию последний релиз),
 #             ORCHESTRA_TENNANT_BIN (папка установки, по умолчанию ~/.local/bin).
