@@ -272,38 +272,60 @@ func TestNormalizeAddr(t *testing.T) {
 	}
 }
 
-// Выбор моделей: номера через запятую, «все», проверка против найденного.
-func TestChooseAndParseModels(t *testing.T) {
+// Модели из флага проверяются против найденного; прежний выбор
+// ограничивается тем, что есть сейчас.
+func TestParseModels(t *testing.T) {
 	usable := []string{"fable", "opus", "sonnet"}
-	pr := &prompter{in: bufioReader("2, 3, 2\n"), out: &bytes.Buffer{}, interactive: true}
-	got, err := chooseModels(pr, usable, nil)
-	if err != nil || strings.Join(got, ",") != "opus,sonnet" {
-		t.Errorf("выбор: %v %v", got, err)
-	}
-	pr = &prompter{in: bufioReader("\n"), out: &bytes.Buffer{}, interactive: true}
-	if got, _ = chooseModels(pr, usable, nil); len(got) != 3 {
-		t.Errorf("по умолчанию все: %v", got)
-	}
-	pr = &prompter{in: bufioReader("9\n"), out: &bytes.Buffer{}, interactive: true}
-	if _, err := chooseModels(pr, usable, nil); err == nil {
-		t.Error("номер вне списка принят")
-	}
 	if got, err := parseModels("fable, haiku", usable); err == nil {
 		t.Errorf("недоступная модель принята: %v", got)
 	}
 	if got, err := parseModels("sonnet,fable", usable); err != nil || len(got) != 2 {
 		t.Errorf("флаг: %v %v", got, err)
 	}
+	if got := intersect([]string{"opus", "haiku"}, usable); strings.Join(got, ",") != "opus" {
+		t.Errorf("прежний выбор: %v", got)
+	}
 }
 
-// Без терминала вопрос без значения по умолчанию — ошибка, а не зависание.
-func TestPrompterWithoutTerminal(t *testing.T) {
-	pr := &prompter{in: bufioReader(""), out: &bytes.Buffer{}, interactive: false}
-	if _, err := pr.ask("Ключ", ""); err == nil {
+// Без терминала вопрос без значения по умолчанию — ошибка, а не зависание;
+// список без прежнего выбора — все модели.
+func TestSilentAsker(t *testing.T) {
+	pr := silent{}
+	if _, err := pr.text("Ключ", "", nil); err == nil {
 		t.Error("без терминала вопрос без умолчания должен падать")
 	}
-	if v, err := pr.ask("Адрес", "http://x"); err != nil || v != "http://x" {
+	if v, err := pr.text("Адрес", "http://x", nil); err != nil || v != "http://x" {
 		t.Errorf("умолчание без терминала: %q %v", v, err)
+	}
+	if got, _ := pr.multi("Модели", []string{"a", "b"}, nil); len(got) != 2 {
+		t.Errorf("по умолчанию все: %v", got)
+	}
+	if got, _ := pr.multi("Модели", []string{"a", "b"}, []string{"b"}); strings.Join(got, ",") != "b" {
+		t.Errorf("прежний выбор: %v", got)
+	}
+}
+
+// Подсказки пути — существующие папки по началу имени, в форме ввода.
+func TestDirSuggestions(t *testing.T) {
+	root := t.TempDir()
+	for _, d := range []string{"orchestra-projects", "orchid", "other", ".hidden"} {
+		if err := os.Mkdir(filepath.Join(root, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "orc.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := dirSuggestions(filepath.Join(root, "orc"))
+	want := []string{filepath.Join(root, "orchestra-projects") + "/", filepath.Join(root, "orchid") + "/"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("подсказки: %v, ожидалось %v", got, want)
+	}
+	if got := dirSuggestions(root + "/"); len(got) != 3 {
+		t.Errorf("все папки без скрытых: %v", got)
+	}
+	if got := dirSuggestions(""); got != nil {
+		t.Errorf("пустой ввод: %v", got)
 	}
 }
 
