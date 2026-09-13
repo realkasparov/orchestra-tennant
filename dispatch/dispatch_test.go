@@ -645,3 +645,47 @@ func TestLateFinishFromOldDeviceIgnored(t *testing.T) {
 		t.Errorf("итог с настоящей машины отвергнут: %v", err)
 	}
 }
+
+// Пауза обогнала приём: подтверждение к остановленному заданию не делает
+// его идущим — оркестратор должен сказать машине «стой».
+func TestAcceptAfterPauseIsRefused(t *testing.T) {
+	d, _ := newTestDispatcher()
+	d.AddExecutor(1, Capabilities{Slots: 1}, nil)
+	if _, err := d.Submit(10, dispatchPlan(10), false); err != nil {
+		t.Fatal(err)
+	}
+	offer := d.Next(1)
+	if dev, _, ok := d.Pause(10); !ok || dev != 1 {
+		t.Fatalf("пауза предложенного: dev=%d ok=%v", dev, ok)
+	}
+	if err := d.Accept(offer.JobID, 1); !errors.Is(err, ErrPaused) {
+		t.Fatalf("ожидался ErrPaused, получено %v", err)
+	}
+	if state, _, _ := d.State(10); state != JobPaused {
+		t.Fatalf("после отказа в приёме задание должно остаться на паузе, а не %q", state)
+	}
+}
+
+// Машина проекта отказалась наотрез: задание предназначено только ей, и
+// в очереди ему делать нечего — снимается с объяснением, а не висит вечно.
+func TestTargetRefusalStopsJob(t *testing.T) {
+	d, _ := newTestDispatcher()
+	d.AddExecutor(1, Capabilities{Slots: 1}, nil)
+	d.AddExecutor(2, Capabilities{Slots: 1}, nil)
+	if _, err := d.SubmitTo(10, dispatchPlan(10), false, 1); err != nil {
+		t.Fatal(err)
+	}
+	offer := d.Next(1)
+	if offer == nil {
+		t.Fatal("машине проекта задание не предложено")
+	}
+	if err := d.Reject(offer.JobID, 1, false); !errors.Is(err, ErrPinnedRefused) {
+		t.Fatalf("ожидался ErrPinnedRefused, получено %v", err)
+	}
+	if _, _, ok := d.State(10); ok {
+		t.Fatal("задание должно быть снято")
+	}
+	if d.Next(2) != nil {
+		t.Fatal("чужой машине задание проекта не предлагается")
+	}
+}

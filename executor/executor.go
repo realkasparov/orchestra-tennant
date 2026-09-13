@@ -272,13 +272,20 @@ func (e *Executor) handle(ctx context.Context, env *protocol.Envelope) {
 	case protocol.MsgCancel:
 		var c protocol.Cancel
 		_ = json.Unmarshal(env.Body, &c)
-		if j := e.job(env.JobID); j != nil {
+		if j, orphan := e.jobState(env.JobID); j != nil {
 			if c.Reason == "" {
 				c.Reason = CancelPause
 			}
-			if j.orphan {
-				// Не идёт, а оркестратор его снял: в журнале ему делать нечего.
-				e.forget(j.ID)
+			if orphan {
+				// Не идёт, а оркестратор его снял или остановил. Удалённому в
+				// журнале делать нечего; остановленное остаётся ждать
+				// «Возобновить» — память таски ещё понадобится.
+				if c.Reason == CancelDelete || c.Reason == cancelReassigned {
+					if cl, ok := e.runner.(Cleaner); ok && c.Reason == CancelDelete {
+						cl.Cleanup(j)
+					}
+					e.forget(j.ID)
+				}
 				return
 			}
 			j.stop(c.Reason)
@@ -330,6 +337,18 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	}
 	e.mu.Lock()
 	existing := e.jobs[offer.JobID]
+	// Память таски переживает и смену идентификатора задания: после ошибки
+	// или перезапуска оркестратора «Возобновить» ставит новое задание той же
+	// таски, а рабочая копия и сессии агента остались здесь под прежним.
+	adopted := ""
+	if existing == nil {
+		for id, j := range e.jobs {
+			if j.orphan && j.Plan.TaskID == offer.Plan.TaskID {
+				existing, adopted = j, id
+				break
+			}
+		}
+	}
 	if existing != nil && !existing.orphan {
 		// Повторная доставка уже принятого: подтверждаем тем же
 		// идентификатором, второго исполнения не начинаем.
@@ -355,12 +374,22 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	// единицы: иначе новые события отбрасывались бы как дубли. Своя память
 	// о подтверждениях (из журнала) — нижняя граница, оркестратор — верхняя.
 	j.seq, j.lastAck = offer.LastSeq, offer.LastSeq
-	if existing != nil && existing.lastAck > j.seq {
+	if existing != nil && adopted == "" && existing.lastAck > j.seq {
+		// Нумерация событий — на задание; от чужого идентификатора она не
+		// наследуется.
 		j.seq, j.lastAck = existing.lastAck, existing.lastAck
 	}
 	j.sent = j.lastAck
 	e.jobs[j.ID] = j
+	if adopted != "" {
+		delete(e.jobs, adopted)
+	}
 	e.mu.Unlock()
+	if adopted != "" {
+		// Прежняя запись снимается с пометкой: запоздавшее подтверждение к
+		// старому заданию не должно воскресить её рядом с новой.
+		existing.retire()
+	}
 
 	if err := e.journal.Put(&Record{JobID: j.ID, TaskID: j.Plan.TaskID, Plan: j.Plan, Resume: j.Resume, State: j.State}); err != nil {
 		// Без журнала задание не пережило бы перезапуск и пропало бы молча.
@@ -462,6 +491,33 @@ func (e *Executor) job(id string) *Job {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.jobs[id]
+}
+
+// jobState — задание и признак, что оно не идёт (из журнала или после
+// паузы). Признак читается под замком: park меняет его у живого задания.
+func (e *Executor) jobState(id string) (*Job, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	j := e.jobs[id]
+	if j == nil {
+		return nil, false
+	}
+	return j, j.orphan
+}
+
+// park оставляет память задания после паузы или ошибки: оно больше не идёт
+// и места не занимает, но рабочая копия, сессии агента и статусы этапов
+// остаются в журнале до возобновления или удаления.
+func (e *Executor) park(id string) {
+	e.mu.Lock()
+	j := e.jobs[id]
+	if j != nil {
+		j.orphan = true
+	}
+	e.mu.Unlock()
+	if j != nil {
+		j.SaveState()
+	}
 }
 
 func (e *Executor) forget(id string) {

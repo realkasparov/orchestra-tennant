@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	tennant "github.com/realkasparov/orchestra-tennant"
@@ -132,13 +133,20 @@ func modelIDs(keys []string) []string {
 	return out
 }
 
-// statusWriter держит status.json свежим.
+// statusWriter держит status.json свежим. Ошибку подключения пишет
+// горутина набора, состояние — сторож; замок нужен, чтобы они не
+// перетирали друг друга.
 type statusWriter struct {
 	path string
+	mu   sync.Mutex
 	st   runStatus
 }
 
-func (s *statusWriter) setError(msg string) { s.st.LastError = msg }
+func (s *statusWriter) setError(msg string) {
+	s.mu.Lock()
+	s.st.LastError = msg
+	s.mu.Unlock()
+}
 
 func (s *statusWriter) watch(ctx context.Context, ex *executor.Executor) {
 	t := time.NewTicker(2 * time.Second)
@@ -148,16 +156,20 @@ func (s *statusWriter) watch(ctx context.Context, ex *executor.Executor) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			s.mu.Lock()
 			s.st.Connected = ex.Connected()
 			s.st.Jobs = ex.ActiveJobs()
+			s.mu.Unlock()
 			s.write()
 		}
 	}
 }
 
 func (s *statusWriter) write() {
+	s.mu.Lock()
 	s.st.UpdatedAt = time.Now()
 	data, _ := json.MarshalIndent(s.st, "", "  ")
+	s.mu.Unlock()
 	tmp := s.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err == nil {
 		_ = os.Rename(tmp, s.path)

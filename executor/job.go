@@ -110,9 +110,27 @@ func (j *Job) flush() {
 	// под тем же идентификатором оно может идти на другой машине.
 	if finished && !gone {
 		if err := j.ex.send(protocol.MsgDone, j.ID, protocol.Done{JobID: j.ID, Status: status, Reason: reason}); err == nil {
-			j.ex.forget(j.ID)
+			if j.keepsState() {
+				j.ex.park(j.ID)
+			} else {
+				j.ex.forget(j.ID)
+			}
 		}
 	}
+}
+
+// keepsState — итог, после которого задание ещё вернётся: пауза (человеком
+// или бюджетом) и ошибка. Рабочая копия, сессии агента и статусы этапов
+// остаются на этой машине, и «Возобновить» должно продолжить с того же
+// места, а не заводить worktree поверх существующего. Удалённое и снятое
+// сверкой задание не возвращается — его память стирается.
+func (j *Job) keepsState() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.cancelR == CancelDelete || j.cancelR == cancelReassigned {
+		return false
+	}
+	return j.status == "paused" || j.status == "error"
 }
 
 // rewind откатывает отправленное к подтверждённому: связь восстановлена, и
