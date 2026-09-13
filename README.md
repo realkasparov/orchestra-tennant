@@ -30,7 +30,7 @@
 Go не нужен: готовые бинари для macOS (Apple Silicon и Intel) и Linux (amd64, arm64) лежат в [Releases](https://github.com/realkasparov/orchestra-tennant/releases). Одной командой — скрипт скачивает последний релиз, сверяет контрольную сумму и кладёт бинарь в `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/realkasparov/orchestra-tennant/main/install.sh | sh
+curl -fsSL https://github.com/realkasparov/orchestra-tennant/releases/latest/download/install.sh | sh
 ```
 
 Переменные скрипта: `ORCHESTRA_TENNANT_VERSION=v0.3.0` — конкретный релиз, `ORCHESTRA_TENNANT_BIN=/usr/local/bin` — другая папка.
@@ -102,6 +102,7 @@ orchestra-tennant status                 настройка, служба, жи�
 orchestra-tennant logs [-n 50] [-f]      журнал; -f — следить
 orchestra-tennant service install        поставить фоновую службу
 orchestra-tennant service uninstall      снять
+orchestra-tennant update [-check]        обновиться до последнего релиза с GitHub (служба перезапустится сама)
 orchestra-tennant version
 ```
 

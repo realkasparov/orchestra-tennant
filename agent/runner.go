@@ -7,50 +7,19 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/realkasparov/orchestra-tennant/protocol"
 )
 
-// Models — какую сборку означает короткий ключ из настроек. Таблица одна на
-// оркестратор и исполнителей: оркестратор кладёт в план точный идентификатор,
-// исполнитель объявляет в hello, какие идентификаторы умеет запускать.
-var Models = []struct{ Key, ID string }{
-	{"fable", "claude-fable-5"},
-	{"opus", "claude-opus-5"},
-	{"sonnet", "claude-sonnet-5"},          // средний уровень — ревью плана, ревью кода
-	{"haiku", "claude-haiku-4-5-20251001"}, // дешёвые служебные вызовы (триаж сообщений, импорт)
-}
-
-// ModelID переводит ключ настроек в идентификатор сборки. Уже готовый
-// идентификатор возвращается как есть: план несёт точную сборку, и
-// переводить её второй раз нечего.
-func ModelID(key string) string {
-	for _, m := range Models {
-		if m.Key == key || m.ID == key {
-			return m.ID
-		}
-	}
-	return Models[0].ID
-}
+// ModelID и таблица моделей живут в protocol: оркестратору они нужны для
+// плана, а тянуть ради них пакет запуска claude ему незачем.
+func ModelID(key string) string { return protocol.ModelID(key) }
 
 // ModelIDs — все сборки, которые умеет запускать этот исполнитель.
-func ModelIDs() []string {
-	out := make([]string, 0, len(Models))
-	for _, m := range Models {
-		out = append(out, m.ID)
-	}
-	return out
-}
-
-// ModelKey — ключ настроек по идентификатору сборки (для интерфейса).
-func ModelKey(id string) string {
-	for _, m := range Models {
-		if m.ID == id {
-			return m.Key
-		}
-	}
-	return id
-}
+func ModelIDs() []string { return protocol.ModelIDs() }
 
 type RunOpts struct {
 	Prompt  string // required — also for resume (bare --resume exits silently)
@@ -155,12 +124,25 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		}
 	}()
 
+	// stderr дочитывается до Wait: Wait закрывает трубу, и читатель, не
+	// успевший до конца, оставил бы причину падения обрезанной — а то и
+	// гонку с чтением буфера ниже.
 	var errBuf strings.Builder
+	var errMu sync.Mutex
+	stderrText := func() string {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return strings.TrimSpace(errBuf.String())
+	}
+	stderrDone := make(chan struct{})
 	go func() {
+		defer close(stderrDone)
 		sc := bufio.NewScanner(stderr)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for sc.Scan() {
+			errMu.Lock()
 			errBuf.WriteString(sc.Text() + "\n")
+			errMu.Unlock()
 		}
 	}()
 
@@ -176,6 +158,10 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		}
 		handleLine(msg, res, &text, onEvent)
 	}
+	select {
+	case <-stderrDone:
+	case <-time.After(5 * time.Second): // трубу мог унаследовать потомок агента
+	}
 	waitErr := cmd.Wait()
 	close(done)
 	res.FullText = text.String()
@@ -189,11 +175,11 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		if res.IsError && res.ErrText != "" {
 			return res, fmt.Errorf("claude exited: %w: %s", waitErr, res.ErrText)
 		}
-		return res, fmt.Errorf("claude exited: %w: %s", waitErr, strings.TrimSpace(errBuf.String()))
+		return res, fmt.Errorf("claude exited: %w: %s", waitErr, stderrText())
 	}
 	if !res.GotResult {
 		// exit 0 without a result event = stage error (e.g. bare resume quirk)
-		return res, fmt.Errorf("claude exited without a result event: %s", strings.TrimSpace(errBuf.String()))
+		return res, fmt.Errorf("claude exited without a result event: %s", stderrText())
 	}
 	if res.IsError {
 		return res, fmt.Errorf("claude reported error: %s", res.ErrText)

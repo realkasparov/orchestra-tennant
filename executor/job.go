@@ -55,6 +55,9 @@ type Job struct {
 
 	cancel  context.CancelFunc
 	cancelR string
+	// ended закрывается, когда прогон задания завершился: новое задание той
+	// же таски ждёт этого, прежде чем взять её память.
+	ended chan struct{}
 
 	answers  chan *protocol.Answer
 	messages chan *protocol.Message
@@ -110,9 +113,24 @@ func (j *Job) flush() {
 	// под тем же идентификатором оно может идти на другой машине.
 	if finished && !gone {
 		if err := j.ex.send(protocol.MsgDone, j.ID, protocol.Done{JobID: j.ID, Status: status, Reason: reason}); err == nil {
-			j.ex.forget(j.ID)
+			if j.keepsState() {
+				j.ex.park(j.ID)
+			} else {
+				j.ex.forget(j.ID)
+			}
 		}
 	}
+}
+
+// keepsState — после итога память таски остаётся: рабочая копия, сессии
+// агента и статусы этапов лежат на этой машине, и любое продолжение —
+// «Возобновить» после паузы или ошибки, правка к готовой таске — должно
+// идти с того же места, а не заводить worktree поверх существующего.
+// Стирается память только удалением таски.
+func (j *Job) keepsState() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cancelR != CancelDelete
 }
 
 // rewind откатывает отправленное к подтверждённому: связь восстановлена, и

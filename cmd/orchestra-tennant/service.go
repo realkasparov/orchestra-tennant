@@ -212,6 +212,18 @@ func stopService(path string) error {
 	return nil
 }
 
+// restartService перезапускает службу: после обновления бинаря процесс
+// должен подняться новой версией.
+func restartService() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return run("launchctl", "kickstart", "-k", launchdTarget()+"/"+launchdLabel)
+	case "linux":
+		return run("systemctl", "--user", "restart", systemdUnit)
+	}
+	return nil
+}
+
 // serviceState — установлена ли служба и идёт ли.
 func serviceState() (installed bool, running bool, detail string) {
 	path, err := servicePath()

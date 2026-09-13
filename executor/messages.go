@@ -53,20 +53,40 @@ func (c *changeRequest) arm(cancel context.CancelFunc) {
 	c.mu.Unlock()
 }
 
-// serveMessages разбирает сообщения, пока идёт задание.
+// question — вопрос, дождавшийся своей очереди: состояние таски одно, и
+// править его из двух горутин нельзя. Ответ даёт цикл этапов на границе
+// этапа или в ожидании; сюда попадают только распознанные вопросы.
+type question struct {
+	text  string
+	usage protocol.Usage
+}
+
+// serveMessages разбирает сообщения, пока идёт задание. Здесь только эхо и
+// триаж (он состояние не трогает): правка прерывает этап сразу, вопрос
+// встаёт в очередь к циклу этапов — у того в руках состояние таски.
 func (r *run) serveMessages(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case m := <-r.job.Messages():
-			r.handleMessage(ctx, m.Text, m.Mode)
+			mode, pending := r.classify(ctx, m.Text, m.Mode)
+			if mode == "question" {
+				select {
+				case r.questions <- question{m.Text, pending}:
+					r.log("", "Вопрос принят — отвечу, как только освобожусь от текущего этапа.")
+				default:
+					r.log("", "Очередь вопросов переполнена — повторите вопрос позже.")
+				}
+				continue
+			}
+			r.requestChange(m.Text, pending)
 		}
 	}
 }
 
-// handleMessage — одно сообщение: эхо в чат, триаж, затем ответ или правка.
-func (r *run) handleMessage(ctx context.Context, text, mode string) {
+// classify — эхо сообщения в чат и триаж, если режим не задан явно.
+func (r *run) classify(ctx context.Context, text, mode string) (string, protocol.Usage) {
 	r.job.Emit("", "user_message", map[string]any{"text": text})
 	var pending protocol.Usage
 	if mode != "question" && mode != "change" {
@@ -74,11 +94,30 @@ func (r *run) handleMessage(ctx context.Context, text, mode string) {
 		// Чип в чате: как распознали (для question — кнопка «это правка»).
 		r.job.Emit("", "triage", map[string]any{"mode": mode, "text": text})
 	}
+	return mode, pending
+}
+
+// handleMessage — сообщение, с которым задание запущено: разбирается в
+// горутине цикла этапов, поэтому ответ идёт сразу.
+func (r *run) handleMessage(ctx context.Context, text, mode string) {
+	mode, pending := r.classify(ctx, text, mode)
 	if mode == "question" {
 		r.answerQuestionRound(ctx, text, pending)
 		return
 	}
 	r.requestChange(text, pending)
+}
+
+// answerQueued отвечает на вопросы, накопившиеся, пока шёл этап.
+func (r *run) answerQueued(ctx context.Context) {
+	for {
+		select {
+		case q := <-r.questions:
+			r.answerQuestionRound(ctx, q.text, q.usage)
+		default:
+			return
+		}
+	}
 }
 
 // triage классифицирует сообщение дешёвой моделью. Всё, кроме уверенного

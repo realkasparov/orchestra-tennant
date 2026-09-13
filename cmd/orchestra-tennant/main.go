@@ -26,6 +26,7 @@ const usage = `orchestra-tennant — исполнитель тасок орке�
   status    настроен ли, идёт ли служба, на связи ли демон
   logs      показать журнал; logs -f — следить
   service   install | uninstall — фоновая служба без повторной настройки
+  update    обновиться до последнего релиза с GitHub (update -check — только проверить)
   version   версия
 
 Общие флаги:
@@ -54,6 +55,8 @@ func main() {
 		err = cmdLogs(args)
 	case "service":
 		err = cmdService(args)
+	case "update":
+		err = cmdUpdate(args)
 	case "version", "-v", "--version":
 		fmt.Println("orchestra-tennant", versionString())
 	case "help", "-h", "--help":
