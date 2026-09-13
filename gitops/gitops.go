@@ -3,6 +3,7 @@ package gitops
 import (
 	"encoding/base64"
 	"fmt"
+	"github.com/realkasparov/orchestra-tennant/protocol"
 	"os"
 	"os/exec"
 	"strconv"
@@ -21,12 +22,7 @@ func run(dir string, args ...string) (string, error) {
 // CheckRef is a defense-in-depth guard: even though callers sanitize branch
 // and base-ref names, a leading '-' would be parsed by git as an option
 // (argument injection). Reject it before the name reaches an argv slot.
-func CheckRef(name string) error {
-	if name == "" || strings.HasPrefix(name, "-") {
-		return fmt.Errorf("недопустимое имя ветки/ref: %q", name)
-	}
-	return nil
-}
+func CheckRef(name string) error { return protocol.CheckRef(name) }
 
 // FetchBase fetches the base branch from origin.
 func FetchBase(repo, baseBranch string) error {
