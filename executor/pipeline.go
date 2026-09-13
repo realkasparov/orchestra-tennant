@@ -80,6 +80,11 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 		r.handleMessage(ctx, m.Text, m.Mode)
 		if r.change.take() {
 			r.startChangeRound()
+		} else if r.allStagesDone() {
+			// Вопрос к готовой таске: ответ дан, этапам делать нечего —
+			// гонять их цикл значило бы мигать «выполняется → готово».
+			r.answerQueued(ctx)
+			return "done", nil
 		}
 	}
 	for {
@@ -95,13 +100,38 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	}
 }
 
+// allStagesDone — в последнем раунде не осталось этапов, которым есть что
+// делать (виртуальные не в счёт: ими управляет анализ).
+func (r *run) allStagesDone() bool {
+	for _, key := range r.stageKeys() {
+		st := r.st.stage(key)
+		if st == nil || st.Status == "done" || st.Status == "skipped" {
+			continue
+		}
+		if def := r.plan.Stage(key); def != nil && def.Virtual {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // prepare заводит папку задачи и первый раунд этапов, если их ещё нет.
 func (r *run) prepare() error {
-	if r.st.TaskDir == "" {
-		r.st.TaskDir = r.plan.TaskDir
+	own := filepath.Join(r.p.DataDir, "tasks", strconv.FormatInt(r.plan.TaskID, 10))
+	if r.st.TaskDir == "" && r.plan.TaskDir != "" {
+		// Папка задачи оркестратора — подсказка для машины, где он сам и
+		// живёт: там лежат вложения человека. На другой машине этого пути
+		// может не быть вовсе (чужой домашний каталог), и тогда папка —
+		// своя, а не ошибка на первом же шаге.
+		if err := os.MkdirAll(filepath.Join(r.plan.TaskDir, "attachments", "user"), 0o755); err == nil {
+			r.st.TaskDir = r.plan.TaskDir
+		} else {
+			r.log("", "Папка задачи оркестратора недоступна ("+err.Error()+") — использую свою: "+own)
+		}
 	}
 	if r.st.TaskDir == "" {
-		r.st.TaskDir = filepath.Join(r.p.DataDir, "tasks", strconv.FormatInt(r.plan.TaskID, 10))
+		r.st.TaskDir = own
 	}
 	if err := os.MkdirAll(filepath.Join(r.st.TaskDir, "attachments", "user"), 0o755); err != nil {
 		return err
@@ -168,6 +198,18 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 		return "error", err, false
 	}
 
+	// Ожидание «Возобновить» пережило перезапуск (демона или оркестратора):
+	// человек его ещё не нажал, и следующий этап не начинается сам.
+	if r.st.AwaitContinue != "" {
+		if paused := r.waitContinue(ctx, r.st.AwaitContinue); paused {
+			return "paused", nil, false
+		}
+		if r.change.take() {
+			return "", nil, true
+		}
+		r.taskStatus("running")
+	}
+
 	keys := r.stageKeys()
 	for i, key := range keys {
 		st := r.st.stage(key)
@@ -222,23 +264,8 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 
 		// per_stage: остановиться после этапа и ждать «Возобновить».
 		if r.plan.Continuity == "per_stage" && i != len(keys)-1 {
-			r.taskStatus("waiting_user")
-			r.log(key, "Этап завершён. Нажмите «Возобновить», чтобы продолжить.")
-		wait:
-			for {
-				select {
-				case c := <-r.job.Continue():
-					if c.BudgetAck {
-						r.st.BudgetAck = true
-					}
-					break wait
-				case q := <-r.questions:
-					// Ожидание — удобный момент ответить: этап не идёт.
-					r.answerQuestionRound(ctx, q.text, q.usage)
-				case <-ctx.Done():
-					r.markPaused("")
-					return "paused", nil, false
-				}
+			if paused := r.waitContinue(ctx, key); paused {
+				return "paused", nil, false
 			}
 			if r.change.take() {
 				return "", nil, true
@@ -260,6 +287,40 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 	r.emitDiff()
 	r.taskStatus("done")
 	return "done", nil, false
+}
+
+// waitContinue ждёт «Возобновить» после этапа key. Ожидание записано в
+// состоянии: после перезапуска оно продолжается, а не пропускается. Пока
+// ждём, отвечаем на вопросы из чата — этап не идёт, момент удобный.
+// Возвращает true, если задание остановили.
+func (r *run) waitContinue(ctx context.Context, key string) (paused bool) {
+	r.st.AwaitContinue = key
+	r.job.SaveState()
+	r.taskStatus("waiting_user")
+	r.log(key, "Этап завершён. Нажмите «Возобновить», чтобы продолжить.")
+	for {
+		select {
+		case c := <-r.job.Continue():
+			if c.BudgetAck {
+				r.st.BudgetAck = true
+			}
+			r.st.AwaitContinue = ""
+			r.job.SaveState()
+			return false
+		case q := <-r.questions:
+			r.answerQuestionRound(ctx, q.text, q.usage)
+		case <-ctx.Done():
+			// Остановили человеком: его «Возобновить» после паузы и есть
+			// ответ на это ожидание, второй раз спрашивать не нужно.
+			// Перезапуск демона или оркестратора — не человек: ожидание
+			// остаётся.
+			if r.job.cancelReason() == CancelPause {
+				r.st.AwaitContinue = ""
+			}
+			r.markPaused("")
+			return true
+		}
+	}
 }
 
 // --- запуск агента ---
@@ -617,7 +678,14 @@ func (p *Pipeline) Cleanup(job *Job) {
 	}
 	if st.WorktreeDir != "" && job.Plan.Workspace != "folder" {
 		if err := gitops.RemoveWorktree(job.Plan.Project.Path, st.WorktreeDir); err != nil {
-			job.Emit("", "log", map[string]any{"text": "Ошибка удаления worktree: " + err.Error()})
+			// Папку могли убрать руками: тогда остаётся только запись в
+			// .git/worktrees, и её снимает prune — иначе git считал бы
+			// путь занятым при следующей таске с тем же номером.
+			if _, statErr := os.Stat(st.WorktreeDir); statErr != nil {
+				_ = gitops.PruneWorktrees(job.Plan.Project.Path)
+			} else {
+				job.Emit("", "log", map[string]any{"text": "Ошибка удаления worktree: " + err.Error()})
+			}
 		}
 	}
 	if st.TaskDir != "" {

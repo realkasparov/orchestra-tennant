@@ -303,9 +303,14 @@ func TestJobRunsAndReportsDone(t *testing.T) {
 	if n != 5 {
 		t.Errorf("дошло %d событий из 5", n)
 	}
-	// Журнал чист: завершённое задание не должно всплыть при перезапуске.
-	if recs, _ := r.ex.journal.List(); len(recs) != 0 {
-		t.Errorf("завершённое задание осталось в журнале: %d", len(recs))
+	// Память таски остаётся (правка к готовой таске продолжит с той же
+	// рабочей копии), но идущим задание не считается и в hello идёт как
+	// отложенное, а не как ведущееся.
+	if recs, _ := r.ex.journal.List(); len(recs) != 1 {
+		t.Errorf("память завершённой таски должна остаться в журнале: %d", len(recs))
+	}
+	if r.ex.ActiveJobs() != 0 || len(r.ex.parkedJobs()) != 1 {
+		t.Errorf("завершённое задание: идущих %d, отложенных %d", r.ex.ActiveJobs(), len(r.ex.parkedJobs()))
 	}
 }
 
@@ -628,9 +633,16 @@ func TestPauseKeepsStateForResume(t *testing.T) {
 	if d, ok := r.orch.waitDone(other, 3*time.Second); !ok || d.Status != "done" {
 		t.Fatalf("итог: %+v %v", d, ok)
 	}
-	if recs, _ := r.ex.journal.List(); len(recs) != 0 {
-		t.Fatalf("после done журнал должен опустеть: %+v", recs)
+	// Удаление стирает память.
+	r.orch.sendTo(protocol.MsgCancel, other, protocol.Cancel{JobID: other, Reason: CancelDelete})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if recs, _ := r.ex.journal.List(); len(recs) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatal("после удаления память таски осталась")
 }
 
 // Удаление остановленной таски убирает и её память.
@@ -653,4 +665,44 @@ func TestDeleteOfParkedJobForgets(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("удалённое задание осталось в журнале")
+}
+
+// Оркестратор перезапустился и снял задание сверкой, а потом поставил ту
+// же таску новым заданием: память таски переходит к нему, второго прогона
+// поверх ещё останавливающегося не начинается.
+func TestReassignedJobHandsStateToSuccessor(t *testing.T) {
+	r := newRig(t, Config{DeviceKey: "k", Slots: 2})
+	conn := r.connect()
+	r.waitConnected()
+	r.orch.offer(plan(10), false)
+	first := <-r.run.started
+	r.run.steps <- func(j *Job) {
+		j.State = &TaskState{WorktreeDir: "/wt/10"}
+		j.SaveState()
+	}
+	time.Sleep(50 * time.Millisecond)
+	// Разрыв и второе соединение: оркестратор задание не знает — Cancel
+	// при сверке.
+	conn.Close()
+	time.Sleep(50 * time.Millisecond)
+	r.orch.disp.Cancel(10) // оркестратор «забыл» задание
+	r.connect()
+	r.waitConnected()
+	select {
+	case <-first.ended:
+	case <-time.After(3 * time.Second):
+		t.Fatal("снятое сверкой задание не остановилось")
+	}
+	other := r.orch.offer(plan(10), true)
+	second := <-r.run.started
+	if second.ID != other || second.State == nil || second.State.WorktreeDir != "/wt/10" {
+		t.Fatalf("новое задание не унаследовало память: %+v", second.State)
+	}
+	if got := r.ex.ActiveJobs(); got != 1 {
+		t.Fatalf("идущих заданий %d, ожидалось 1", got)
+	}
+	r.run.finish()
+	if d, ok := r.orch.waitDone(other, 3*time.Second); !ok || d.Status != "done" {
+		t.Fatalf("итог: %+v %v", d, ok)
+	}
 }

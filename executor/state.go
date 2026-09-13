@@ -46,6 +46,9 @@ type TaskState struct {
 	Reference   string `json:"reference,omitempty"`
 	Title       string `json:"title,omitempty"`
 	BudgetAck   bool   `json:"budget_ack,omitempty"`
+	// AwaitContinue — этап, после которого таска ждёт «Возобновить»
+	// (per_stage). Хранится, чтобы перезапуск не пропустил ожидание.
+	AwaitContinue string `json:"await_continue,omitempty"`
 
 	// Stages — указатели намеренно: этап держат в руках всё время его
 	// прогона, а раунды добавляются и посреди него (ответ на вопрос в чате),

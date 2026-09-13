@@ -102,6 +102,12 @@ func RemoveWorktree(repo, dir string) error {
 	return err
 }
 
+// PruneWorktrees снимает записи о рабочих копиях, папок которых больше нет.
+func PruneWorktrees(repo string) error {
+	_, err := run(repo, "worktree", "prune")
+	return err
+}
+
 func HeadSHA(dir string) (string, error) { return run(dir, "rev-parse", "HEAD") }
 
 // HasRef reports whether the branch exists locally or on origin.

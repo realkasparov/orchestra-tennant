@@ -94,8 +94,10 @@ func New(cfg Config, runner Runner) (*Executor, error) {
 		// Задание из журнала: процесс перезапустился посреди него. Оно не
 		// идёт — его нужно получить заново с resume, — но оркестратору о нём
 		// нужно сказать, иначе он будет ждать нас впустую.
+		ended := make(chan struct{})
+		close(ended) // прогона нет — ждать нечего
 		e.jobs[r.JobID] = &Job{ID: r.JobID, Plan: r.Plan, Resume: r.Resume,
-			lastAck: r.LastAck, orphan: true, ex: e, State: r.State}
+			lastAck: r.LastAck, orphan: true, ex: e, State: r.State, ended: ended}
 	}
 	return e, nil
 }
@@ -173,7 +175,7 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 		DeviceKey: e.cfg.DeviceKey, Hostname: e.cfg.Hostname, OS: e.cfg.OS,
 		Version: e.cfg.Version, MinSchema: protocol.MinSchemaVersion,
 		MaxSchema: protocol.SchemaVersion, Slots: e.cfg.Slots, ProjectsDir: e.cfg.ProjectsDir,
-		Models: e.cfg.Models, Skills: e.cfg.Skills, Running: e.runningIDs(),
+		Models: e.cfg.Models, Skills: e.cfg.Skills, Running: e.runningIDs(), Parked: e.parkedJobs(),
 	}
 	e.trace("→", protocol.MsgHello, "")
 	if err := send(conn, protocol.MsgHello, "", hello); err != nil {
@@ -196,10 +198,17 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 	}
 
 	// Сверка: чего за нами больше нет — бросаем; что продолжается — досылаем.
+	// Идущее задание останавливается, но память таски остаётся: после
+	// перезапуска оркестратор ставит ту же таску новым заданием, и оно
+	// продолжит с той же рабочей копией. Запись из журнала, о которой
+	// оркестратор ничего не знает, — сирота прошлого запуска, её убираем.
 	for _, id := range welcome.Cancel {
-		if j := e.job(id); j != nil {
+		if j, orphan := e.jobState(id); j != nil {
+			if orphan {
+				e.forget(id)
+				continue
+			}
 			j.stop(cancelReassigned)
-			e.forget(id)
 		}
 	}
 	// Откат отправленного — до того, как соединение станет видно отправке:
@@ -272,6 +281,21 @@ func (e *Executor) handle(ctx context.Context, env *protocol.Envelope) {
 	case protocol.MsgCancel:
 		var c protocol.Cancel
 		_ = json.Unmarshal(env.Body, &c)
+		if env.JobID == "" && c.TaskID != 0 && c.Reason == CancelDelete {
+			// Таска удалена, а задания у оркестратора уже нет: убираем всё,
+			// что помним о ней, — рабочую копию и папку задачи.
+			for _, ref := range e.parkedJobs() {
+				if ref.TaskID == c.TaskID {
+					if j, _ := e.jobState(ref.JobID); j != nil {
+						if cl, ok := e.runner.(Cleaner); ok {
+							cl.Cleanup(j)
+						}
+						e.forget(ref.JobID)
+					}
+				}
+			}
+			return
+		}
 		if j, orphan := e.jobState(env.JobID); j != nil {
 			if c.Reason == "" {
 				c.Reason = CancelPause
@@ -343,10 +367,32 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	adopted := ""
 	if existing == nil {
 		for id, j := range e.jobs {
-			if j.orphan && j.Plan.TaskID == offer.Plan.TaskID {
+			if j.Plan.TaskID != offer.Plan.TaskID {
+				continue
+			}
+			if j.orphan {
 				existing, adopted = j, id
 				break
 			}
+			if j.cancelReason() != "" {
+				// Прежнее задание той же таски ещё останавливается: его
+				// память возьмём, когда оно встанет, — иначе два прогона
+				// писали бы одно состояние.
+				e.mu.Unlock()
+				go func() {
+					select {
+					case <-j.ended:
+					case <-time.After(20 * time.Second):
+					}
+					e.accept(ctx, offer)
+				}()
+				return
+			}
+			// Таска уже идёт здесь другим заданием — второй прогон
+			// исключён; оркестратор разберётся по сверке.
+			e.mu.Unlock()
+			e.reject(offer.JobID, "таска уже выполняется на этой машине", true)
+			return
 		}
 	}
 	if existing != nil && !existing.orphan {
@@ -364,7 +410,7 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	jctx, cancel := context.WithCancel(ctx)
 	j := &Job{ID: offer.JobID, Plan: offer.Plan, Resume: offer.Resume, Skip: offer.Done, ex: e,
 		answers: make(chan *protocol.Answer, 8), messages: make(chan *protocol.Message, 8),
-		cont: make(chan protocol.Continue, 1), cancel: cancel}
+		cont: make(chan protocol.Continue, 1), cancel: cancel, ended: make(chan struct{})}
 	if existing != nil {
 		// Память прошлого запуска: сессии агента, прогоны, вопросы. Без неё
 		// возобновление начинало бы этап заново, не зная, что можно продолжить.
@@ -411,6 +457,7 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 // run ведёт задание до конца и сообщает итог. Итог тоже может не дойти —
 // тогда он уйдёт при следующем подключении вместе с досылкой событий.
 func (e *Executor) run(ctx context.Context, j *Job) {
+	defer close(j.ended)
 	status, err := e.runner.Run(ctx, j)
 	reason := ""
 	if r := j.cancelReason(); r != "" {
@@ -419,6 +466,12 @@ func (e *Executor) run(ctx context.Context, j *Job) {
 			if c, ok := e.runner.(Cleaner); ok {
 				c.Cleanup(j)
 			}
+		}
+		if r == cancelReassigned {
+			// Итога не будет: под этим идентификатором задание оркестратору
+			// уже не нужно. Память таски — остаётся.
+			e.park(j.ID)
+			return
 		}
 	} else if ctx.Err() != nil {
 		// Останавливается сам исполнитель (перезапуск демона, выключение), а
@@ -547,6 +600,20 @@ func (e *Executor) runningIDs() []string {
 	for id, j := range e.jobs {
 		if !j.orphan {
 			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// parkedJobs — задания, которые не идут, но чья память хранится: из
+// журнала после перезапуска и после паузы или ошибки.
+func (e *Executor) parkedJobs() []protocol.JobRef {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []protocol.JobRef
+	for id, j := range e.jobs {
+		if j.orphan {
+			out = append(out, protocol.JobRef{JobID: id, TaskID: j.Plan.TaskID})
 		}
 	}
 	return out
