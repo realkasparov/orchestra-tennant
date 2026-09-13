@@ -44,6 +44,11 @@ func cmdRun(args []string) error {
 	if err := p.mkdirAll(); err != nil {
 		return err
 	}
+	// Второй демон с тем же ключом не помощник: оркестратор держит одну
+	// сессию на машину, и два процесса выбивали бы друг друга по кругу.
+	if pid := runningDaemon(p); pid != 0 {
+		return fmt.Errorf("демон уже запущен (pid %d) — остановите его или службу: orchestra-tennant service uninstall", pid)
+	}
 	logw, err := openLog(p.log())
 	if err != nil {
 		return err
@@ -174,4 +179,17 @@ func (s *statusWriter) write() {
 	if err := os.WriteFile(tmp, data, 0o600); err == nil {
 		_ = os.Rename(tmp, s.path)
 	}
+}
+
+// runningDaemon — pid живого демона из status.json или 0.
+func runningDaemon(p paths) int {
+	data, err := os.ReadFile(p.status())
+	if err != nil {
+		return 0
+	}
+	var st runStatus
+	if err := json.Unmarshal(data, &st); err != nil || st.PID == os.Getpid() || !processAlive(st.PID) {
+		return 0
+	}
+	return st.PID
 }

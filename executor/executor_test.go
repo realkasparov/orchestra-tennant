@@ -589,7 +589,7 @@ func TestPauseKeepsStateForResume(t *testing.T) {
 	job := r.orch.offer(plan(10), false)
 	first := <-r.run.started
 	r.run.steps <- func(j *Job) {
-		j.State = &TaskState{WorktreeDir: "/repo-agent-worktrees/10", Stages: []StageState{{Key: "execute", Round: 1, Status: "running"}}}
+		j.State = &TaskState{WorktreeDir: "/repo-agent-worktrees/10", Stages: []*StageState{{Key: "execute", Round: 1, Status: "running"}}}
 		j.SaveState()
 	}
 	r.orch.sendTo(protocol.MsgCancel, job, protocol.Cancel{JobID: job, Reason: CancelPause})

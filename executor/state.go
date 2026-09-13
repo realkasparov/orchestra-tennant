@@ -47,7 +47,10 @@ type TaskState struct {
 	Title       string `json:"title,omitempty"`
 	BudgetAck   bool   `json:"budget_ack,omitempty"`
 
-	Stages       []StageState    `json:"stages"`
+	// Stages — указатели намеренно: этап держат в руках всё время его
+	// прогона, а раунды добавляются и посреди него (ответ на вопрос в чате),
+	// и срез, переехавший при добавлении, оставил бы в руках копию.
+	Stages       []*StageState   `json:"stages"`
 	Questions    []QuestionState `json:"questions,omitempty"`
 	NextQuestion int64           `json:"next_question"`
 }
@@ -57,9 +60,9 @@ type TaskState struct {
 // не перезапускают и не переименовывают.
 func (s *TaskState) stage(key string) *StageState {
 	var found *StageState
-	for i := range s.Stages {
-		if s.Stages[i].Key == key {
-			found = &s.Stages[i]
+	for _, st := range s.Stages {
+		if st.Key == key {
+			found = st
 		}
 	}
 	return found
@@ -84,7 +87,7 @@ func (s *TaskState) addRound(keys []string) int {
 	}
 	r++
 	for _, k := range keys {
-		s.Stages = append(s.Stages, StageState{Key: k, Round: r, Status: "pending"})
+		s.Stages = append(s.Stages, &StageState{Key: k, Round: r, Status: "pending"})
 	}
 	return r
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -123,12 +124,25 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		}
 	}()
 
+	// stderr дочитывается до Wait: Wait закрывает трубу, и читатель, не
+	// успевший до конца, оставил бы причину падения обрезанной — а то и
+	// гонку с чтением буфера ниже.
 	var errBuf strings.Builder
+	var errMu sync.Mutex
+	stderrText := func() string {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return strings.TrimSpace(errBuf.String())
+	}
+	stderrDone := make(chan struct{})
 	go func() {
+		defer close(stderrDone)
 		sc := bufio.NewScanner(stderr)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for sc.Scan() {
+			errMu.Lock()
 			errBuf.WriteString(sc.Text() + "\n")
+			errMu.Unlock()
 		}
 	}()
 
@@ -144,6 +158,10 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		}
 		handleLine(msg, res, &text, onEvent)
 	}
+	select {
+	case <-stderrDone:
+	case <-time.After(5 * time.Second): // трубу мог унаследовать потомок агента
+	}
 	waitErr := cmd.Wait()
 	close(done)
 	res.FullText = text.String()
@@ -157,11 +175,11 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		if res.IsError && res.ErrText != "" {
 			return res, fmt.Errorf("claude exited: %w: %s", waitErr, res.ErrText)
 		}
-		return res, fmt.Errorf("claude exited: %w: %s", waitErr, strings.TrimSpace(errBuf.String()))
+		return res, fmt.Errorf("claude exited: %w: %s", waitErr, stderrText())
 	}
 	if !res.GotResult {
 		// exit 0 without a result event = stage error (e.g. bare resume quirk)
-		return res, fmt.Errorf("claude exited without a result event: %s", strings.TrimSpace(errBuf.String()))
+		return res, fmt.Errorf("claude exited without a result event: %s", stderrText())
 	}
 	if res.IsError {
 		return res, fmt.Errorf("claude reported error: %s", res.ErrText)
