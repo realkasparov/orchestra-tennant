@@ -252,7 +252,9 @@ func CloneRepo(hostURL, token, repoPath, dst string) error {
 // из веток репозитория. У свежего клона это ветка по умолчанию хоста.
 func DefaultBranch(dir string) (string, error) {
 	if out, err := run(dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
-		if b := strings.TrimPrefix(out, "origin/"); b != "" {
+		// origin/HEAD может указывать на ветку, которой уже нет (её удалили
+		// на хосте и вычистили локально) — такая главной не считается.
+		if b := strings.TrimPrefix(out, "origin/"); b != "" && HasRef(dir, b) {
 			return b, nil
 		}
 	}
