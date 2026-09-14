@@ -109,7 +109,7 @@ func (p *Pipeline) projectPath(dir string) (string, error) {
 // checkProject — сухая проверка: чек-лист без изменений на диске. Та же
 // логика, что у создания, чтобы «Валидировать» и «Создать» не расходились.
 func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResult {
-	res := &protocol.ProjectResult{OK: true, Path: path}
+	res := &protocol.ProjectResult{OK: true, Path: path, Repo: isRepo(path)}
 	add := func(name, detail, level string) {
 		res.Checks = append(res.Checks, protocol.ProjectCheckItem{Name: name, Detail: detail, Level: level})
 	}
@@ -174,7 +174,7 @@ func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResu
 // существующего репозитория. Непустую папку без .git не трогает — опечатка в
 // имени не должна молча заводить репозиторий поверх чужих файлов.
 func createProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResult {
-	res := &protocol.ProjectResult{Path: path}
+	res := &protocol.ProjectResult{Path: path, Repo: isRepo(path)}
 	branch := spec.BaseBranch
 	if branch == "" {
 		branch = "develop"
@@ -216,6 +216,12 @@ func createProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectRes
 	}
 	res.OK, res.BaseBranch = true, branch
 	return res
+}
+
+// isRepo — в папке есть git-репозиторий.
+func isRepo(path string) bool {
+	fi, err := os.Stat(filepath.Join(path, ".git"))
+	return err == nil && fi.IsDir()
 }
 
 // ensureProjectIndex применяет настройки индексации проекта.

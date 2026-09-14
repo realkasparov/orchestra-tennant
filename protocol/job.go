@@ -299,9 +299,13 @@ type ProjectResult struct {
 	Path string `json:"path,omitempty"`
 	// BaseBranch — базовая ветка, которой проект заведён: у клона без явной
 	// ветки это ветка по умолчанию репозитория, которую знает только машина.
-	BaseBranch  string             `json:"base_branch,omitempty"`
-	Cloned      bool               `json:"cloned,omitempty"`
-	Initialized bool               `json:"initialized,omitempty"`
-	Checks      []ProjectCheckItem `json:"checks,omitempty"`
-	Verdict     string             `json:"verdict,omitempty"` // ok | warn | err
+	BaseBranch  string `json:"base_branch,omitempty"`
+	Cloned      bool   `json:"cloned,omitempty"`
+	Initialized bool   `json:"initialized,omitempty"`
+	// Repo — в папке уже есть git-репозиторий (до задания). Переезд проекта
+	// на другую машину разрешён только в такую папку: заводить пустой
+	// репозиторий вместо перенесённого кода — не переезд, а потеря.
+	Repo    bool               `json:"repo,omitempty"`
+	Checks  []ProjectCheckItem `json:"checks,omitempty"`
+	Verdict string             `json:"verdict,omitempty"` // ok | warn | err
 }
