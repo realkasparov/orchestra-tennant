@@ -148,6 +148,10 @@ func dirSuggestions(typed string) []string {
 	if typed == "" {
 		return nil
 	}
+	if typed == "~" {
+		// Домашняя папка целиком: дополнять нечего, кроме разделителя.
+		return []string{"~/"}
+	}
 	expanded := typed
 	if typed == "~" || strings.HasPrefix(typed, "~/") {
 		expanded = filepath.Join(userHome(), strings.TrimPrefix(typed, "~"))
@@ -163,7 +167,12 @@ func dirSuggestions(typed string) []string {
 	if err != nil {
 		return nil
 	}
-	// Введённая часть до последнего разделителя остаётся как есть.
+	// Введённая часть до последнего разделителя остаётся как есть. Раскрытие
+	// «~» меняет только начало строки, поэтому хвост совпадает; на всякий
+	// случай проверяем, а не режем срез вслепую.
+	if len(prefix) > len(typed) || !strings.HasSuffix(typed, prefix) {
+		return nil
+	}
 	typedDir := typed[:len(typed)-len(prefix)]
 	var out []string
 	for _, e := range entries {

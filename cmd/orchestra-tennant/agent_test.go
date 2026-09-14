@@ -327,6 +327,10 @@ func TestDirSuggestions(t *testing.T) {
 	if got := dirSuggestions(""); got != nil {
 		t.Errorf("пустой ввод: %v", got)
 	}
+	// Одна тильда раньше роняла подсказку: имя домашней папки длиннее ввода.
+	if got := dirSuggestions("~"); len(got) != 1 || got[0] != "~/" {
+		t.Errorf("тильда: %v", got)
+	}
 }
 
 // Файл службы указывает на этот бинарь и папку демона, а не на что-то
