@@ -2,10 +2,12 @@ package gitops
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"github.com/realkasparov/orchestra-tennant/protocol"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -245,10 +247,52 @@ func CloneRepo(hostURL, token, repoPath, dst string) error {
 	return nil
 }
 
-// DefaultBranch возвращает текущую ветку свежего клона (ветку по умолчанию).
+// DefaultBranch — главная ветка репозитория: та, на которую указывает
+// origin/HEAD; без origin — текущая ветка; при отсоединённом HEAD — первая
+// из веток репозитория. У свежего клона это ветка по умолчанию хоста.
 func DefaultBranch(dir string) (string, error) {
+	if out, err := run(dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		if b := strings.TrimPrefix(out, "origin/"); b != "" {
+			return b, nil
+		}
+	}
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output()
-	return strings.TrimSpace(string(out)), err
+	if err != nil {
+		return "", err
+	}
+	if cur := strings.TrimSpace(string(out)); cur != "" && cur != "HEAD" {
+		return cur, nil
+	}
+	if bs, berr := Branches(dir); berr == nil && len(bs) > 0 {
+		return bs[0], nil
+	}
+	return "", errors.New("в репозитории нет ни одной ветки")
+}
+
+// Branches — ветки репозитория: локальные и из origin, без дублей и без
+// служебной origin/HEAD, в алфавитном порядке. По ним человек выбирает
+// базовую ветку проекта, поэтому список должен быть тем, что есть на
+// самом деле, а не тем, что он помнит.
+func Branches(dir string) ([]string, error) {
+	out, err := run(dir, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin")
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var list []string
+	for _, line := range strings.Split(out, "\n") {
+		name := strings.TrimSpace(line)
+		if strings.HasPrefix(name, "origin/") {
+			name = strings.TrimPrefix(name, "origin/")
+		}
+		if name == "" || name == "HEAD" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		list = append(list, name)
+	}
+	sort.Strings(list)
+	return list, nil
 }
 
 // ChangedFiles возвращает пути файлов, изменившихся между двумя коммитами

@@ -3,7 +3,9 @@ package executor
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/realkasparov/orchestra-tennant/protocol"
@@ -79,5 +81,40 @@ func TestProjectPathStaysInRoot(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(repo, ".git"), 0o755)
 	if got, err := p.projectPath(repo); err != nil || got != repo {
 		t.Errorf("абсолютный путь к репозиторию: %q %v", got, err)
+	}
+}
+
+// Существующий репозиторий: проверка отдаёт его ветки и главную ветку, без
+// явной ветки регистрация берёт главную, а несуществующая ветка — отказ.
+func TestProjectExistingRepoBranches(t *testing.T) {
+	p, root := projectPipeline(t)
+	dir := filepath.Join(root, "lib")
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "master", dir},
+		{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"},
+		{"-C", dir, "branch", "feature"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s", args, out)
+		}
+	}
+	check := p.Project(context.Background(), &protocol.ProjectRequest{Action: protocol.ProjectCheck, Spec: protocol.ProjectSpec{Name: "lib", Dir: "lib"}})
+	if !check.Repo || check.BaseBranch != "master" || check.Verdict != "ok" {
+		t.Fatalf("проверка: %+v", check)
+	}
+	if got := strings.Join(check.Branches, ","); got != "feature,master" {
+		t.Fatalf("ветки: %q", got)
+	}
+	res := p.Project(context.Background(), &protocol.ProjectRequest{Action: protocol.ProjectCreate, Spec: protocol.ProjectSpec{Name: "lib", Dir: "lib"}})
+	if !res.OK || res.BaseBranch != "master" || res.Initialized {
+		t.Fatalf("регистрация без ветки: %+v", res)
+	}
+	res = p.Project(context.Background(), &protocol.ProjectRequest{Action: protocol.ProjectCreate, Spec: protocol.ProjectSpec{Name: "lib", Dir: "lib", BaseBranch: "nope"}})
+	if res.OK || !strings.Contains(res.Error, "nope") {
+		t.Fatalf("регистрация с несуществующей веткой прошла: %+v", res)
+	}
+	check = p.Project(context.Background(), &protocol.ProjectRequest{Action: protocol.ProjectCheck, Spec: protocol.ProjectSpec{Name: "lib", Dir: "lib", BaseBranch: "nope"}})
+	if check.Verdict != "err" {
+		t.Fatalf("проверка пропустила несуществующую ветку: %+v", check)
 	}
 }

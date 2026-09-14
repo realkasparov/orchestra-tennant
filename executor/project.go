@@ -118,7 +118,16 @@ func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResu
 	} else {
 		add("Название проекта", "Заполнено", "ok")
 	}
+	// Репозиторий уже есть: его ветки — единственный источник правды о
+	// базовой. Ветка по умолчанию подставляется, когда человек не выбрал.
+	if res.Repo {
+		res.Branches, _ = gitops.Branches(path)
+		res.BaseBranch, _ = gitops.DefaultBranch(path)
+	}
 	branch := spec.BaseBranch
+	if branch == "" {
+		branch = res.BaseBranch
+	}
 	if branch == "" {
 		branch = "develop"
 	}
@@ -127,6 +136,8 @@ func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResu
 		add("Базовая ветка", "Не задана — возьмётся ветка по умолчанию репозитория после клона", "ok")
 	case gitops.CheckRef(branch) != nil:
 		add("Базовая ветка", "Недопустимое имя ветки: "+branch, "err")
+	case res.Repo && spec.BaseBranch == "":
+		add("Базовая ветка", "Не задана — возьмётся главная ветка репозитория «"+branch+"»", "ok")
 	default:
 		add("Базовая ветка", branch, "ok")
 	}
@@ -188,32 +199,54 @@ func createProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectRes
 			res.Error = "клонирование не удалось: " + err.Error()
 			return res
 		}
-		res.Cloned = true
 		if spec.BaseBranch == "" {
 			if def, derr := gitops.DefaultBranch(path); derr == nil && def != "" {
 				branch = def
 			}
+		} else if !gitops.HasRef(path, branch) {
+			// Названной ветки на хосте нет: клон убирается, иначе непустая
+			// папка помешала бы повторить с правильной веткой.
+			_ = os.RemoveAll(path)
+			res.Error = "в репозитории нет ветки «" + branch + "» — проверьте имя на хосте"
+			return res
+		}
+		res.OK, res.Cloned, res.BaseBranch = true, true, branch
+		return res
+	}
+	if res.Repo {
+		// Регистрация существующего репозитория: без явной ветки — его
+		// главная; названная должна существовать, иначе первая же таска
+		// упадёт на checkout — лучше отказать сейчас.
+		if spec.BaseBranch == "" {
+			def, derr := gitops.DefaultBranch(path)
+			if derr != nil {
+				res.Error = "не удалось определить главную ветку репозитория: " + derr.Error()
+				return res
+			}
+			branch = def
+		}
+		if !gitops.HasRef(path, branch) {
+			res.Error = "в репозитории нет ветки «" + branch + "» ни локально, ни в origin"
+			return res
 		}
 		res.OK, res.BaseBranch = true, branch
 		return res
 	}
-	if fi, err := os.Stat(filepath.Join(path, ".git")); err != nil || !fi.IsDir() {
-		entries, rerr := os.ReadDir(path)
-		dirMissing := rerr != nil && os.IsNotExist(rerr)
-		if rerr != nil && !dirMissing {
-			res.Error = "папка недоступна: " + path
-			return res
-		}
-		if !dirMissing && len(entries) > 0 {
-			res.Error = "папка не является git-репозиторием: " + path
-			return res
-		}
-		if err := gitops.InitRepo(path, branch); err != nil {
-			res.Error = "не удалось инициализировать репозиторий: " + err.Error()
-			return res
-		}
-		res.Initialized = true
+	entries, rerr := os.ReadDir(path)
+	dirMissing := rerr != nil && os.IsNotExist(rerr)
+	if rerr != nil && !dirMissing {
+		res.Error = "папка недоступна: " + path
+		return res
 	}
+	if !dirMissing && len(entries) > 0 {
+		res.Error = "папка не является git-репозиторием: " + path
+		return res
+	}
+	if err := gitops.InitRepo(path, branch); err != nil {
+		res.Error = "не удалось инициализировать репозиторий: " + err.Error()
+		return res
+	}
+	res.Initialized = true
 	res.OK, res.BaseBranch = true, branch
 	return res
 }

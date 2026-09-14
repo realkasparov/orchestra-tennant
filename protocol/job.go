@@ -305,7 +305,11 @@ type ProjectResult struct {
 	// Repo — в папке уже есть git-репозиторий (до задания). Переезд проекта
 	// на другую машину разрешён только в такую папку: заводить пустой
 	// репозиторий вместо перенесённого кода — не переезд, а потеря.
-	Repo    bool               `json:"repo,omitempty"`
-	Checks  []ProjectCheckItem `json:"checks,omitempty"`
-	Verdict string             `json:"verdict,omitempty"` // ok | warn | err
+	Repo bool `json:"repo,omitempty"`
+	// Branches — ветки найденного репозитория (локальные и origin): из них
+	// человек выбирает базовую, а BaseBranch у проверки — главная ветка
+	// репозитория, которая подставится, если он не выбрал сам.
+	Branches []string           `json:"branches,omitempty"`
+	Checks   []ProjectCheckItem `json:"checks,omitempty"`
+	Verdict  string             `json:"verdict,omitempty"` // ok | warn | err
 }
