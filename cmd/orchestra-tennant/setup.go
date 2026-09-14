@@ -42,7 +42,9 @@ func cmdSetup(args []string) error {
 	if cfg == nil {
 		cfg = &Config{}
 	}
-	cfg.Configured = false
+	// Признак «настроен» не сбрасывается заранее: прерванный на середине
+	// повторный setup (Ctrl+C на выборе моделей) не должен превращать
+	// работающего демона в ненастроенного. Его выставят самопроверки в конце.
 
 	// 1. Оркестратор.
 	fmt.Fprintln(out, "1/5 Оркестратор")
@@ -64,6 +66,7 @@ func cmdSetup(args []string) error {
 	}
 	cfg.Remote = !isLocalAddr(cfg.Orchestrator)
 	if cfg.Remote {
+		cfg.Configured = false
 		fmt.Fprintf(out, "  Адрес %s не на этой машине. Адрес сохранён, но транспорта для удалённого\n"+
 			"  оркестратора в этой версии нет: демон умеет подключаться только к сокету на своей машине.\n"+
 			"  Настройка не завершена.\n", cfg.Orchestrator)
