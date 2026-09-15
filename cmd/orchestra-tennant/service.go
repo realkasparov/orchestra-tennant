@@ -36,23 +36,23 @@ func cmdService(args []string) error {
 	p := paths{*home}
 	rest := fs.Args()
 	if len(rest) != 1 {
-		return errors.New("использование: orchestra-tennant service install | uninstall")
+		return errors.New("использование: orchestra-tennant service enable | disable")
 	}
 	switch rest[0] {
-	case "install":
+	case "enable", "install":
 		if _, err := readyConfig(p); err != nil {
 			return err
 		}
 		if err := installService(p); err != nil {
 			return err
 		}
-		fmt.Println("служба установлена и запущена")
+		fmt.Println("фоновая служба включена: запущена сейчас и будет запускаться при входе в систему")
 		return nil
-	case "uninstall":
+	case "disable", "uninstall":
 		if err := uninstallService(p); err != nil {
 			return err
 		}
-		fmt.Println("служба остановлена и удалена")
+		fmt.Println("фоновая служба выключена: остановлена и не будет запускаться при входе")
 		return nil
 	}
 	return fmt.Errorf("неизвестное действие %q", rest[0])

@@ -62,9 +62,10 @@ A few seconds later the device card in Orchestra turns **online**. From now on y
 orchestra-tennant setup                 configure (re-running does not require a new key)
 orchestra-tennant run                   run in the terminal
 orchestra-tennant status                configuration, service, connection to Orchestra
-orchestra-tennant logs [-n 50] [-f]     show the log; -f follows it
-orchestra-tennant service install       install the background service
-orchestra-tennant service uninstall     remove it
+orchestra-tennant log [-n 50] [-f]      show the log; -f follows it
+orchestra-tennant log -project NAME [-task N] [-f]   only one project / one task
+orchestra-tennant service enable        run as a background service (starts at login)
+orchestra-tennant service disable       stop it and remove the service
 orchestra-tennant update [-check]       update to the latest release
 orchestra-tennant version
 ```

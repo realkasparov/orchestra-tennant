@@ -75,6 +75,7 @@ func (j *Job) Emit(stage, typ string, payload map[string]any) {
 	ev := &protocol.Event{Seq: j.seq, TaskID: j.Plan.TaskID, Stage: stage, Type: typ, Payload: payload}
 	j.pending = append(j.pending, ev)
 	j.mu.Unlock()
+	j.ex.taskLog(j, ev)
 	j.flush()
 }
 

@@ -87,7 +87,7 @@ func TestLogRotation(t *testing.T) {
 		t.Errorf("текущий файл %d байт больше потолка", info.Size())
 	}
 	var out bytes.Buffer
-	if err := printTail(&out, path, 3); err != nil || strings.Count(out.String(), "\n") != 3 {
+	if err := printTail(&out, path, 3, func(string) bool { return true }); err != nil || strings.Count(out.String(), "\n") != 3 {
 		t.Errorf("хвост: %v %q", err, out.String())
 	}
 }

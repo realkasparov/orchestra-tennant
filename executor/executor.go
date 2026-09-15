@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -451,6 +452,11 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	if err := e.send(protocol.MsgAccept, j.ID, nil); err != nil {
 		e.logf("accept %s: %v", j.ID, err)
 	}
+	var keys []string
+	for _, s := range j.Plan.Stages {
+		keys = append(keys, stageTitle(s.Key))
+	}
+	e.taskNote(j, "Задание принято: %s; рабочая область — %s; папка проекта %s", strings.Join(keys, " → "), j.Plan.Workspace, j.Plan.Project.Path)
 	go e.run(jctx, j)
 }
 
@@ -487,6 +493,11 @@ func (e *Executor) run(ctx context.Context, j *Job) {
 	}
 	if status == "" {
 		status = "done"
+	}
+	if reason != "" {
+		e.taskNote(j, "Итог: %s — %s", statusTitle(status), reason)
+	} else {
+		e.taskNote(j, "Итог: %s", statusTitle(status))
 	}
 	j.finish(status, reason)
 	j.flush()
