@@ -222,7 +222,9 @@ func (r *run) requestChange(text string, pending protocol.Usage) {
 
 // startChangeRound заводит новый раунд: все этапы плана, кроме импорта.
 // База раунда — текущий HEAD, иначе пустой раунд прошёл бы проверку.
-func (r *run) startChangeRound() {
+// Незакоммиченные изменения в рабочей копии — отказ до первого этапа:
+// иначе они всплыли бы после выполнения, когда анализ уже оплачен.
+func (r *run) startChangeRound() error {
 	var keys []string
 	for _, s := range r.plan.Stages {
 		if s.Key != "import" {
@@ -230,8 +232,16 @@ func (r *run) startChangeRound() {
 		}
 	}
 	if len(keys) == 0 {
-		return
+		return nil
 	}
+	if r.st.WorktreeDir != "" {
+		if dirty, err := gitops.DirtyFiles(r.st.WorktreeDir); err == nil && len(dirty) > 0 {
+			return fmt.Errorf("в рабочей копии есть незакоммиченные изменения (%s) — закоммитьте, спрячьте (git stash) или отмените их и повторите правку", strings.Join(dirty, ", "))
+		}
+	}
+	// Артефакты прошлого раунда — в его папку: этапы нового раунда должны
+	// видеть свои step-файлы, а не прошлогодний план.
+	archiveRound(r.st.TaskDir, r.st.round())
 	round := r.st.addRound(keys)
 	if r.st.WorktreeDir != "" {
 		if head, err := gitops.HeadSHA(r.st.WorktreeDir); err == nil {
@@ -251,4 +261,5 @@ func (r *run) startChangeRound() {
 	}
 	r.log("", fmt.Sprintf("Правка принята — раунд %d: продолжаю с этапа «Анализ задачи».", round))
 	r.job.SaveState()
+	return nil
 }

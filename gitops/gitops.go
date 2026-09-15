@@ -135,6 +135,22 @@ func IsClean(dir string) (bool, error) {
 	return out == "", err
 }
 
+// DirtyFiles — незакоммиченные пути (изменённые, добавленные, неотслеживаемые):
+// ошибка «дерево не чистое» должна называть, что именно.
+func DirtyFiles(dir string) ([]string, error) {
+	out, err := run(dir, "status", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) > 3 {
+			files = append(files, strings.TrimSpace(line[3:]))
+		}
+	}
+	return files, nil
+}
+
 // InitRepo creates dir (if needed) and initializes a git repository on the
 // given branch with an initial empty commit — without a commit the base ref
 // doesn't exist and worktree/branch creation would fail. Commit identity falls

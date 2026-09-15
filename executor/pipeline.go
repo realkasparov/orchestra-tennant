@@ -79,7 +79,9 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	if m := r.plan.Message; m != nil {
 		r.handleMessage(ctx, m.Text, m.Mode)
 		if r.change.take() {
-			r.startChangeRound()
+			if err := r.startChangeRound(); err != nil {
+				return r.failRound(err)
+			}
 		} else if r.allStagesDone() {
 			// Вопрос к готовой таске: ответ дан, этапам делать нечего —
 			// гонять их цикл значило бы мигать «выполняется → готово».
@@ -96,8 +98,18 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			}
 			return status, err
 		}
-		r.startChangeRound()
+		if err := r.startChangeRound(); err != nil {
+			return r.failRound(err)
+		}
 	}
+}
+
+// failRound — новый раунд не начался (грязная рабочая копия): ошибка в
+// журнал и статус задания, этапы не тронуты.
+func (r *run) failRound(err error) (string, error) {
+	r.log("", "Ошибка: "+err.Error())
+	r.taskStatus("error")
+	return "error", err
 }
 
 // allStagesDone — в последнем раунде не осталось этапов, которым есть что

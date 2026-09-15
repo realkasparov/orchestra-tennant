@@ -60,8 +60,12 @@ func (r *run) stageAnalyze(ctx context.Context, st *StageState) error {
 	// Правка: если человек оставил отзыв, это повторный прогон — строить на
 	// существующем плане и уже написанном коде, а не выводить всё заново.
 	revision := "no"
+	prevRound := ""
 	if _, err := os.Stat(filepath.Join(r.st.TaskDir, "user-feedback.md")); err == nil {
 		revision = "yes"
+		if dir := roundDir(r.st.TaskDir, r.st.round()-1); dir != "" {
+			prevRound = "\nPREVIOUS_ROUND: " + dir
+		}
 	}
 	projectCtx := ""
 	if r.plan.Project.Stack != "" {
@@ -70,8 +74,8 @@ func (r *run) stageAnalyze(ctx context.Context, st *StageState) error {
 	if r.plan.Project.Description != "" {
 		projectCtx += "\nProject description (from the user):\n" + r.plan.Project.Description
 	}
-	prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nDECOMPOSE: %s\nREVISION: %s%s%s\n\nTask text from the user:\n%s",
-		r.skill("analyze", "analyze-task"), r.st.TaskDir, decompose, revision, projectCtx, r.repoMapSection(), r.plan.Prompt)
+	prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nDECOMPOSE: %s\nREVISION: %s%s%s%s\n\nTask text from the user:\n%s",
+		r.skill("analyze", "analyze-task"), r.st.TaskDir, decompose, revision, prevRound, projectCtx, r.repoMapSection(), r.plan.Prompt)
 	text, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, 1)
 	if err != nil {
 		return err
@@ -132,6 +136,38 @@ func (r *run) repoMapSection() string {
 	}
 	r.log("analyze", fmt.Sprintf("Карта репозитория: %d файлов с кодом, %d КБ в промпт анализа.", rm.TotalFiles, len(rendered)>>10))
 	return "\n\n" + rendered
+}
+
+// roundStepFiles — артефакты этапов одного раунда: в новом раунде они
+// уходят в подпапку, чтобы «step03, если есть» означало план этого
+// раунда, а не прошлого.
+var roundStepFiles = []string{"step02-analyze.md", "step03-refined-plan.md", "step04-execution.md", "step05-review.md", "step06-handoff.md"}
+
+// archiveRound переносит файлы шагов раунда n в TASK_DIR/round<n>/.
+func archiveRound(taskDir string, n int) {
+	dir := filepath.Join(taskDir, fmt.Sprintf("round%d", n))
+	for _, name := range roundStepFiles {
+		src := filepath.Join(taskDir, name)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return
+		}
+		_ = os.Rename(src, filepath.Join(dir, name))
+	}
+}
+
+// roundDir — папка артефактов раунда n, если она есть.
+func roundDir(taskDir string, n int) string {
+	if n < 1 {
+		return ""
+	}
+	dir := filepath.Join(taskDir, fmt.Sprintf("round%d", n))
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		return ""
+	}
+	return dir
 }
 
 // planSection — секция с текстом актуального плана. Большой план (>24К)
@@ -317,12 +353,10 @@ func (r *run) stageExecute(ctx context.Context, st *StageState) error {
 	if head == r.roundBase() {
 		return fmt.Errorf("выполнение не создало ни одного коммита")
 	}
-	clean, err := gitops.IsClean(r.st.WorktreeDir)
-	if err != nil {
-		return err
-	}
-	if !clean {
-		return fmt.Errorf("после выполнения рабочее дерево не чистое")
+	if dirty, derr := gitops.DirtyFiles(r.st.WorktreeDir); derr != nil {
+		return derr
+	} else if len(dirty) > 0 {
+		return fmt.Errorf("после выполнения рабочее дерево не чистое: %s", strings.Join(dirty, ", "))
 	}
 	if _, err := os.Stat(filepath.Join(r.st.TaskDir, "step04-execution.md")); err != nil {
 		return fmt.Errorf("выполнение не создало step04-execution.md")

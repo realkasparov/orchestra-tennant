@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/realkasparov/orchestra-tennant/gitops"
 	"testing"
 
 	"github.com/realkasparov/orchestra-tennant/protocol"
@@ -278,5 +280,57 @@ func TestStateSurvivesJournal(t *testing.T) {
 	}
 	if len(back.Questions) != 1 || back.Questions[0].Status != "open" || back.NextQuestion != 1 {
 		t.Errorf("вопросы потеряны: %+v", back.Questions)
+	}
+}
+
+// Новый раунд: артефакты прошлого уходят в round<N>/, а грязная рабочая
+// копия — отказ до первого этапа, с именами файлов.
+func TestChangeRoundArchivesAndRefusesDirty(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	r.st.addRound(r.stageKeys())
+	for i := range r.st.Stages {
+		r.st.Stages[i].Status = "done"
+	}
+	for _, name := range []string{"step02-analyze.md", "step03-refined-plan.md", "task.md"} {
+		if err := os.WriteFile(filepath.Join(r.st.TaskDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repo := t.TempDir()
+	if err := gitops.InitRepo(repo, "main"); err != nil {
+		t.Fatal(err)
+	}
+	r.st.WorktreeDir = repo
+	if err := os.WriteFile(filepath.Join(repo, "snake"), []byte("bin"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := r.startChangeRound()
+	if err == nil || !strings.Contains(err.Error(), "snake") {
+		t.Fatalf("грязная копия не остановила раунд: %v", err)
+	}
+	if r.st.round() != 1 {
+		t.Fatalf("раунд заведён несмотря на отказ: %d", r.st.round())
+	}
+	if _, serr := os.Stat(filepath.Join(r.st.TaskDir, "step02-analyze.md")); serr != nil {
+		t.Fatal("артефакты перенесены до отказа")
+	}
+	_ = os.Remove(filepath.Join(repo, "snake"))
+	if err := r.startChangeRound(); err != nil {
+		t.Fatal(err)
+	}
+	if r.st.round() != 2 {
+		t.Fatalf("раунд %d", r.st.round())
+	}
+	if _, serr := os.Stat(filepath.Join(r.st.TaskDir, "round1", "step03-refined-plan.md")); serr != nil {
+		t.Fatal("план прошлого раунда не в round1/")
+	}
+	if _, serr := os.Stat(filepath.Join(r.st.TaskDir, "step03-refined-plan.md")); serr == nil {
+		t.Fatal("план прошлого раунда остался наверху — execute взял бы его вместо нового")
+	}
+	if _, serr := os.Stat(filepath.Join(r.st.TaskDir, "task.md")); serr != nil {
+		t.Fatal("task.md не должен переезжать")
+	}
+	if roundDir(r.st.TaskDir, 1) == "" || roundDir(r.st.TaskDir, 2) != "" {
+		t.Fatal("roundDir")
 	}
 }
