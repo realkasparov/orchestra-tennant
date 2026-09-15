@@ -17,7 +17,7 @@ func validPlan() *Plan {
 			ID: 1, Name: "demo", Path: "/repo", BaseBranch: "main",
 		},
 		Stages: []Stage{
-			{Key: "analyze", Skill: "analyze-task", Model: "claude-fable-5-1", Effort: "high"},
+			{Key: "analyze", Skill: "analyze-task", Model: "claude-fable-5", Effort: "high"},
 			{Key: "execute", Skill: "execute-plan", Model: "claude-opus-5", Effort: "max", Passes: 2},
 			{Key: "branch"},
 		},

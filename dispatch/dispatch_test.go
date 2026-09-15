@@ -406,11 +406,11 @@ func TestRequeuedJobKeepsItsPlace(t *testing.T) {
 // задание не предлагается. Пустые списки в hello ничего не запрещают.
 func TestCapabilitiesGateOffers(t *testing.T) {
 	d, _ := newTestDispatcher()
-	d.AddExecutor(1, Capabilities{Slots: 1, Models: []string{"claude-fable-5-1"}, Skills: []string{"analyze-task"}}, nil)
+	d.AddExecutor(1, Capabilities{Slots: 1, Models: []string{"claude-fable-5"}, Skills: []string{"analyze-task"}}, nil)
 	// Этап без агента (ветка) не требует модели: машина с одной моделью
 	// подходит плану, где у ветки модели нет.
 	plain := dispatchPlan(12)
-	plain.Stages = []protocol.Stage{{Key: "analyze", Skill: "analyze-task", Model: "claude-fable-5-1", Effort: "high"}, {Key: "branch"}}
+	plain.Stages = []protocol.Stage{{Key: "analyze", Skill: "analyze-task", Model: "claude-fable-5", Effort: "high"}, {Key: "branch"}}
 	if got := d.MissingFor(1, plain); len(got) != 0 {
 		t.Errorf("этап без модели посчитан нехваткой: %v", got)
 	}
