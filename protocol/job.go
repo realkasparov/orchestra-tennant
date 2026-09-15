@@ -245,10 +245,11 @@ const (
 	ProjectCheck  = "check"  // сухая проверка: чек-лист, диск не трогается
 	ProjectCreate = "create" // клон, init или регистрация существующей папки
 	ProjectUpdate = "update" // настройки изменились: индекс, хук
-	// ProjectCheckout — ветку таски выставить в папке проекта: worktree
-	// снимается (чистый), ветка выкладывается в папку, память таски
-	// переводится на папку. Дальше человек смотрит ветку в редакторе.
-	ProjectCheckout = "checkout"
+	// ProjectView — показать ветку в папке проекта: папка переключается на
+	// её коммит в отсоединённом состоянии, сама ветка остаётся в worktree,
+	// и таска продолжает работать. Ветка, равная базовой, выкладывается
+	// как есть — это «вернуть папку на основную ветку».
+	ProjectView = "view"
 )
 
 // ProjectSpec — описание проекта, как план таски: что нужно, а не как
@@ -263,11 +264,8 @@ type ProjectSpec struct {
 	Repo *ProjectRepo `json:"repo,omitempty"`
 
 	BaseBranch string `json:"base_branch"`
-	// Branch, Worktree и TaskID — для checkout: ветка таски, её worktree
-	// (пусто — ветка уже в папке) и сама таска, чью память переводят.
+	// Branch — для view: какую ветку показать в папке проекта.
 	Branch       string `json:"branch,omitempty"`
-	Worktree     string `json:"worktree,omitempty"`
-	TaskID       int64  `json:"task_id,omitempty"`
 	PostCreate   string `json:"post_create_hook,omitempty"`
 	Description  string `json:"description,omitempty"`
 	Stack        string `json:"stack,omitempty"`

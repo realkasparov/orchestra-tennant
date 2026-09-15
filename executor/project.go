@@ -36,10 +36,10 @@ func (e *Executor) handleProject(ctx context.Context, env *protocol.Envelope) {
 		res := &protocol.ProjectResult{ReqID: req.ReqID}
 		h, ok := e.runner.(ProjectHandler)
 		switch {
-		case req.Action == protocol.ProjectCheckout:
-			// Checkout трогает память заданий, поэтому его ведёт сам
+		case req.Action == protocol.ProjectView:
+			// Показ смотрит на идущие задания, поэтому его ведёт сам
 			// исполнитель, а не конвейер.
-			res = e.checkout(&req.Spec)
+			res = e.view(&req.Spec)
 			res.ReqID = req.ReqID
 		case !ok:
 			res.Error = "исполнитель не умеет заводить проекты"
@@ -55,11 +55,13 @@ func (e *Executor) handleProject(ctx context.Context, env *protocol.Envelope) {
 	}()
 }
 
-// checkout выкладывает ветку таски в папку проекта. Отказы: папка занята
-// идущей таской, в папке или в worktree незакоммиченные изменения, ветки
-// нет. Память таски (парковка) переводится на папку: следующая правка
-// пойдёт в ней, а не в снятом worktree.
-func (e *Executor) checkout(spec *protocol.ProjectSpec) *protocol.ProjectResult {
+// view показывает ветку в папке проекта. Ветка таски выкладывается
+// отсоединённым HEAD на её коммите: сама ветка остаётся в worktree, и
+// таска продолжает работать; человек смотрит код в редакторе. Базовая
+// ветка выкладывается как есть — так папку возвращают в исходное
+// состояние. Отказы: папка занята идущей в ней таской, незакоммиченные
+// изменения, ветки нет.
+func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	path := strings.TrimSpace(spec.Dir)
 	if path == "" || !isRepo(path) {
 		return &protocol.ProjectResult{Error: "папка проекта не является git-репозиторием: " + path}
@@ -67,31 +69,23 @@ func (e *Executor) checkout(spec *protocol.ProjectSpec) *protocol.ProjectResult 
 	if spec.Branch == "" || !gitops.HasRef(path, spec.Branch) {
 		return &protocol.ProjectResult{Error: "ветки «" + spec.Branch + "» нет в репозитории"}
 	}
-	if other := e.folderHolder(path, spec.TaskID); other != 0 {
-		return &protocol.ProjectResult{Error: fmt.Sprintf("папка проекта занята таской #%d, которая сейчас идёт в ней; дождитесь её или остановите", other)}
+	if other := e.folderHolder(path, 0); other != 0 {
+		return &protocol.ProjectResult{Error: fmt.Sprintf("папка проекта занята таской #%d, которая сейчас идёт прямо в ней; дождитесь её или остановите", other)}
 	}
 	if dirty, err := gitops.DirtyFiles(path); err != nil {
 		return &protocol.ProjectResult{Error: err.Error()}
 	} else if len(dirty) > 0 {
 		return &protocol.ProjectResult{Error: "в папке проекта незакоммиченные изменения (" + strings.Join(dirty, ", ") + ") — закоммитьте или спрячьте их (git stash)"}
 	}
-	wt := strings.TrimSpace(spec.Worktree)
-	if wt != "" && filepath.Clean(wt) != filepath.Clean(path) {
-		if _, err := os.Stat(wt); err == nil {
-			if dirty, derr := gitops.DirtyFiles(wt); derr == nil && len(dirty) > 0 {
-				return &protocol.ProjectResult{Error: "в worktree таски незакоммиченные изменения (" + strings.Join(dirty, ", ") + ") — они пропали бы при снятии worktree"}
-			}
-			if err := gitops.RemoveWorktree(path, wt); err != nil {
-				return &protocol.ProjectResult{Error: "снять worktree: " + err.Error()}
-			}
-		} else {
-			_ = gitops.PruneWorktrees(path)
-		}
+	var err error
+	if spec.Branch == spec.BaseBranch {
+		err = gitops.Checkout(path, spec.Branch)
+	} else {
+		err = gitops.CheckoutDetached(path, spec.Branch)
 	}
-	if err := gitops.Checkout(path, spec.Branch); err != nil {
-		return &protocol.ProjectResult{Error: "переключить ветку: " + err.Error()}
+	if err != nil {
+		return &protocol.ProjectResult{Error: "переключить папку: " + err.Error()}
 	}
-	e.moveTaskToFolder(spec.TaskID, path)
 	return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
 }
 
@@ -110,24 +104,6 @@ func (e *Executor) folderHolder(path string, except int64) int64 {
 		}
 	}
 	return 0
-}
-
-// moveTaskToFolder переводит память таски на папку проекта: worktree снят,
-// ветка теперь в папке, и продолжение должно идти там.
-func (e *Executor) moveTaskToFolder(taskID int64, path string) {
-	e.mu.Lock()
-	var jobs []*Job
-	for _, j := range e.jobs {
-		if j.Plan != nil && j.Plan.TaskID == taskID && j.State != nil {
-			jobs = append(jobs, j)
-		}
-	}
-	e.mu.Unlock()
-	for _, j := range jobs {
-		j.State.WorktreeDir = path
-		j.Plan.Workspace = "folder"
-		j.SaveState()
-	}
 }
 
 // Project — реализация задания на проект у Pipeline.

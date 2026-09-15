@@ -120,10 +120,10 @@ func TestProjectExistingRepoBranches(t *testing.T) {
 	}
 }
 
-// Checkout: worktree снимается, ветка таски выкладывается в папку проекта,
-// память таски переводится на папку; грязная папка и идущая в ней таска —
-// отказ.
-func TestProjectCheckout(t *testing.T) {
+// Показ: папка проекта встаёт на коммит ветки таски отсоединённым HEAD,
+// worktree и ветка остаются; базовая ветка выкладывается как есть; грязная
+// папка и идущая в ней таска — отказ.
+func TestProjectView(t *testing.T) {
 	ex, err := New(Config{DeviceKey: "k", JournalDir: t.TempDir(), Log: func(string, ...any) {}}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -136,40 +136,40 @@ func TestProjectCheckout(t *testing.T) {
 	if _, err := gitops.AddWorktree(repo, wt, "task-7-x", "main"); err != nil {
 		t.Fatal(err)
 	}
-	// Парковка таски 7 с worktree.
-	j := &Job{ID: "j7", Plan: &protocol.Plan{TaskID: 7, Workspace: "worktree", Project: protocol.Project{Path: repo}}, ex: ex,
-		State: &TaskState{WorktreeDir: wt, BranchName: "task-7-x"}, orphan: true}
-	ex.jobs["j7"] = j
-	// Идущая таска 8 прямо в папке — отказ.
+	if out, err := exec.Command("git", "-C", wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "work").CombinedOutput(); err != nil {
+		t.Fatalf("commit: %s", out)
+	}
 	ex.jobs["j8"] = &Job{ID: "j8", Plan: &protocol.Plan{TaskID: 8, Workspace: "folder", Project: protocol.Project{Path: repo}}, ex: ex,
 		State: &TaskState{WorktreeDir: repo, BranchName: "task-8-y"}}
-	spec := protocol.ProjectSpec{Dir: repo, Branch: "task-7-x", Worktree: wt, TaskID: 7}
-	if res := ex.checkout(&spec); res.OK || !strings.Contains(res.Error, "#8") {
+	spec := protocol.ProjectSpec{Dir: repo, BaseBranch: "main", Branch: "task-7-x"}
+	if res := ex.view(&spec); res.OK || !strings.Contains(res.Error, "#8") {
 		t.Fatalf("занятая папка: %+v", res)
 	}
 	delete(ex.jobs, "j8")
-	// Грязная папка — отказ.
 	_ = os.WriteFile(filepath.Join(repo, "junk"), []byte("x"), 0o644)
-	if res := ex.checkout(&spec); res.OK || !strings.Contains(res.Error, "junk") {
+	if res := ex.view(&spec); res.OK || !strings.Contains(res.Error, "junk") {
 		t.Fatalf("грязная папка: %+v", res)
 	}
 	_ = os.Remove(filepath.Join(repo, "junk"))
-	res := ex.checkout(&spec)
-	if !res.OK || res.Path != repo {
-		t.Fatalf("checkout: %+v", res)
+	if res := ex.view(&spec); !res.OK {
+		t.Fatalf("показ: %+v", res)
 	}
-	if cur, _ := gitops.CurrentBranch(repo); cur != "task-7-x" {
-		t.Fatalf("ветка в папке: %q", cur)
+	head, _ := gitops.HeadSHA(repo)
+	want, _ := gitops.HeadSHA(wt)
+	if cur, _ := gitops.CurrentBranch(repo); cur != "HEAD" || head != want {
+		t.Fatalf("папка не на коммите ветки: %s %s/%s", cur, head, want)
 	}
-	if _, err := os.Stat(wt); err == nil {
-		t.Fatal("worktree не снят")
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatal("worktree снят, а не должен")
 	}
-	if j.State.WorktreeDir != repo || j.Plan.Workspace != "folder" {
-		t.Fatalf("память таски не переведена: %+v", j.State)
+	if cur, _ := gitops.CurrentBranch(wt); cur != "task-7-x" {
+		t.Fatalf("ветка ушла из worktree: %q", cur)
 	}
-	// Повторный checkout той же ветки — идемпотентен.
-	spec.Worktree = ""
-	if res := ex.checkout(&spec); !res.OK {
-		t.Fatalf("повтор: %+v", res)
+	spec.Branch = "main"
+	if res := ex.view(&spec); !res.OK {
+		t.Fatalf("возврат на main: %+v", res)
+	}
+	if cur, _ := gitops.CurrentBranch(repo); cur != "main" {
+		t.Fatalf("папка не на main: %q", cur)
 	}
 }

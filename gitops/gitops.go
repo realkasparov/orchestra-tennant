@@ -130,6 +130,17 @@ func Checkout(dir, branch string) error {
 	return err
 }
 
+// CheckoutDetached выставляет коммит ветки отсоединённым HEAD: папка
+// показывает код ветки, а сама ветка остаётся там, где выложена (в
+// worktree таски), и её можно продолжать.
+func CheckoutDetached(dir, branch string) error {
+	if err := CheckRef(branch); err != nil {
+		return err
+	}
+	_, err := run(dir, "checkout", "--detach", branch)
+	return err
+}
+
 // PruneWorktrees снимает записи о рабочих копиях, папок которых больше нет.
 func PruneWorktrees(repo string) error {
 	_, err := run(repo, "worktree", "prune")
