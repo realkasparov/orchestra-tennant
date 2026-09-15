@@ -40,8 +40,8 @@ func TestModelID(t *testing.T) {
 		"opus":   "claude-opus-5",
 		"sonnet": "claude-sonnet-5",
 		"haiku":  "claude-haiku-4-5-20251001",
-		"fable":  "claude-fable-5",
-		"":       "claude-fable-5",
+		"fable":  "claude-fable-5-1",
+		"":       "claude-fable-5-1",
 	} {
 		if got := ModelID(key); got != want {
 			t.Errorf("ModelID(%q) = %q, want %q", key, got, want)

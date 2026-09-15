@@ -369,7 +369,7 @@ func TestCancelPausesJob(t *testing.T) {
 // Плана с моделью, которой нет на машине, исполнитель не принимает —
 // отказывает без права повтора и с причиной.
 func TestRejectsPlanBeyondCapabilities(t *testing.T) {
-	r := newRig(t, Config{DeviceKey: "k", Slots: 1, Models: []string{"claude-fable-5"}})
+	r := newRig(t, Config{DeviceKey: "k", Slots: 1, Models: []string{"claude-fable-5-1"}})
 	r.connect()
 	r.waitConnected()
 	// Очередь с объявленными моделями сама не предложит план с opus; шлём

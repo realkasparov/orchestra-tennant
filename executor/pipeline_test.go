@@ -39,7 +39,7 @@ func fullPlan() *protocol.Plan {
 		Project: protocol.Project{ID: 1, Name: "demo", Path: "/repo", BaseBranch: "main"},
 		Stages: []protocol.Stage{
 			{Key: "import", Skill: "import-gitlab", Model: "claude-haiku-4-5-20251001", Effort: "low"},
-			{Key: "analyze", Skill: "analyze-task", Model: "claude-fable-5", Effort: "high"},
+			{Key: "analyze", Skill: "analyze-task", Model: "claude-fable-5-1", Effort: "high"},
 			{Key: "decompose", Virtual: true},
 			{Key: "err_work", Skill: "plan-review", Model: "claude-sonnet-5", Effort: "high", Passes: 2},
 			{Key: "branch"},
