@@ -4,7 +4,8 @@ package protocol
 // оркестратор и исполнителей: оркестратор кладёт в план точный идентификатор,
 // исполнитель объявляет в hello, какие идентификаторы умеет запускать.
 var Models = []struct{ Key, ID string }{
-	{"fable", "claude-fable-5"}, // Fable 5: claude-fable-5-1 требует Claude Code ≥ 2.1.251
+	{"fable", "claude-fable-5"},
+	{"fable51", "claude-fable-5-1"}, // Fable 5.1 — только через Claude Code ≥ 2.1.251
 	{"opus", "claude-opus-5"},
 	{"sonnet", "claude-sonnet-5"},          // средний уровень — ревью плана, ревью кода
 	{"haiku", "claude-haiku-4-5-20251001"}, // дешёвые служебные вызовы (триаж сообщений, импорт)
