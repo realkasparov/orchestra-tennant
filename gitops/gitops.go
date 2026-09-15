@@ -110,6 +110,26 @@ func RemoveWorktree(repo, dir string) error {
 	return err
 }
 
+// CurrentBranch — ветка, выставленная в рабочей копии ("HEAD" при
+// отсоединённом HEAD).
+func CurrentBranch(dir string) (string, error) {
+	return run(dir, "rev-parse", "--abbrev-ref", "HEAD")
+}
+
+// Checkout выставляет существующую ветку в рабочей копии.
+func Checkout(dir, branch string) error {
+	if err := CheckRef(branch); err != nil {
+		return err
+	}
+	_, err := run(dir, "checkout", "--", branch)
+	if err != nil {
+		// «--» после имени ветки git читает как разделитель путей; форма
+		// без него — на случай старых версий.
+		_, err = run(dir, "checkout", branch)
+	}
+	return err
+}
+
 // PruneWorktrees снимает записи о рабочих копиях, папок которых больше нет.
 func PruneWorktrees(repo string) error {
 	_, err := run(repo, "worktree", "prune")

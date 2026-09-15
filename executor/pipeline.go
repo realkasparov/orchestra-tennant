@@ -190,6 +190,11 @@ func (r *run) stageKeys() []string {
 // прислал правку: раунд нужно завести заново и пройти снова.
 func (r *run) pipeline(ctx context.Context) (status string, err error, restart bool) {
 	r.taskStatus("running")
+	if err := r.checkWorkspace(); err != nil {
+		r.log("", "Ошибка: "+err.Error())
+		r.taskStatus("error")
+		return "error", err, false
+	}
 
 	fail := func(stage string, err error) (string, error, bool) {
 		if ctx.Err() != nil { // пауза или остановка, не провал
@@ -612,6 +617,30 @@ func (r *run) emitDiff() {
 }
 
 // --- рабочая копия ---
+
+// checkWorkspace — рабочая копия в папке проекта всё ещё наша: там наша
+// ветка и в ней не идёт другая таска. Иначе продолжение легло бы в чужую
+// ветку.
+func (r *run) checkWorkspace() error {
+	proj := r.plan.Project
+	if r.plan.Workspace != "folder" {
+		return nil
+	}
+	if other := r.job.ex.folderHolder(proj.Path, r.plan.TaskID); other != 0 {
+		return fmt.Errorf("папка проекта занята таской #%d, которая сейчас идёт в ней — запустите эту таску в режиме git worktree или дождитесь той", other)
+	}
+	if r.st.WorktreeDir == "" || r.st.BranchName == "" {
+		return nil
+	}
+	cur, err := gitops.CurrentBranch(r.st.WorktreeDir)
+	if err != nil {
+		return err
+	}
+	if cur != r.st.BranchName {
+		return fmt.Errorf("в папке проекта сейчас ветка «%s», а таска ждёт свою «%s» — переключите ветку или откройте таску в папке проекта", cur, r.st.BranchName)
+	}
+	return nil
+}
 
 func (r *run) setupWorktree() error {
 	proj := r.plan.Project
