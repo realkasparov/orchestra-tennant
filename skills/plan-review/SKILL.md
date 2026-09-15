@@ -11,7 +11,7 @@ You are an independent reviewer with a clean context: you did NOT write this pla
 
 ## Inputs (provided in the prompt)
 
-- `TASK_DIR` — contains `step01-import.md` (requirements) and the plan: `step02-analyze.md` (from the analysis stage). On pass 2+ a `step03-refined-plan.md` from the previous pass already exists — refine that one.
+- `TASK_DIR` — contains `step01-import.md` (requirements — only if the import stage ran; otherwise the requirements are the task text in `task.md`) and the plan: `step02-analyze.md` (from the analysis stage). On pass 2+ a `step03-refined-plan.md` from the previous pass already exists — refine that one.
 - `PASS_NUMBER` — which pass this is (1..N)
 - CWD — the task's git worktree (checked out from the fresh base branch). Read-only, except `TASK_DIR/step03-refined-plan.md` (the file you produce).
 

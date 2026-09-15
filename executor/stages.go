@@ -371,6 +371,23 @@ func (r *run) stageReview(ctx context.Context, st *StageState) error {
 	return r.finishStage(st)
 }
 
+// stageHandoff — последний этап: инструкция, как запустить, установить или
+// проверить результат. Код не трогает; пишет step06-handoff.md. Самая
+// частая беда после готовой таски — человек смотрит на старую сборку, и
+// этап существует ровно затем, чтобы сказать, что пересобрать.
+func (r *run) stageHandoff(ctx context.Context, st *StageState) error {
+	prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nREFERENCE: %s\nBRANCH: %s\nBASE_COMMIT: %s\nWORKSPACE: %s\nWORKTREE_DIR: %s\nTEST_CMD: %s",
+		r.skill("handoff", "handoff-notes"), r.st.TaskDir, r.st.Reference, r.st.BranchName, r.st.BaseCommit,
+		r.plan.Workspace, r.st.WorktreeDir, r.plan.Project.TestCmd)
+	if _, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, 1); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(r.st.TaskDir, "step06-handoff.md")); err != nil {
+		return fmt.Errorf("этап не создал step06-handoff.md")
+	}
+	return r.finishStage(st)
+}
+
 // skill — имя скилла этапа из плана; запасное — если план старой схемы его
 // не назвал.
 func (r *run) skill(key, fallback string) string {

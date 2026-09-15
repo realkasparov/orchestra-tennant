@@ -26,6 +26,12 @@ func run(dir string, args ...string) (string, error) {
 // (argument injection). Reject it before the name reaches an argv slot.
 func CheckRef(name string) error { return protocol.CheckRef(name) }
 
+// HasRemote — у репозитория настроен remote с таким именем.
+func HasRemote(repo, name string) bool {
+	_, err := run(repo, "remote", "get-url", name)
+	return err == nil
+}
+
 // FetchBase fetches the base branch from origin.
 func FetchBase(repo, baseBranch string) error {
 	if err := CheckRef(baseBranch); err != nil {

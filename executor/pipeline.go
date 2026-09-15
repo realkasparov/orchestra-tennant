@@ -248,6 +248,8 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 			err = r.stageExecute(sctx, st)
 		case "review":
 			err = r.stageReview(sctx, st)
+		case "handoff":
+			err = r.stageHandoff(sctx, st)
 		default:
 			err = fmt.Errorf("неизвестный этап %q", key)
 		}
@@ -601,7 +603,11 @@ func (r *run) emitDiff() {
 
 func (r *run) setupWorktree() error {
 	proj := r.plan.Project
-	if err := gitops.FetchBase(proj.Path, proj.BaseBranch); err != nil {
+	// Репозиторий без origin — обычное дело для локального проекта: базу
+	// берём как есть, без «не удался» в журнале каждой таски.
+	if !gitops.HasRemote(proj.Path, "origin") {
+		r.log("", "У репозитория нет origin — база берётся из локальной ветки "+proj.BaseBranch+".")
+	} else if err := gitops.FetchBase(proj.Path, proj.BaseBranch); err != nil {
 		r.log("", "fetch origin не удался (продолжаю от локальной базы): "+err.Error())
 	}
 	branch := fmt.Sprintf("task/%d-wip", r.plan.TaskID)
