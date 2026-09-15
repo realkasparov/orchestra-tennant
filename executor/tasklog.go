@@ -111,10 +111,10 @@ func describeEvent(ev *protocol.Event) string {
 		}
 		return "Поля таски: " + strings.Join(parts, ", ")
 	case protocol.EventArtifact:
-		return "Артефакт записан: " + str(p, "name")
+		return "" // файлы шагов уходят после каждого этапа — в журнале это шум
 	case protocol.EventDiff:
 		if files, ok := p["files"].([]gitops.FileDiff); ok {
-			return fmt.Sprintf("Дифф ветки: %d файлов", len(files))
+			return fmt.Sprintf("Дифф ветки: файлов — %d", len(files))
 		}
 		return "Дифф ветки обновлён"
 	}
