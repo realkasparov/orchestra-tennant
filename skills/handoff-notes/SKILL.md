@@ -28,8 +28,9 @@ You are the last stage. The code is written, reviewed and committed. The person 
    - database migrations, seed data, config/env keys added by the change;
    - dependency installs (`npm install`, `go mod download`, `pip install`) when lockfiles changed;
    - generated code (protobuf, ORM models) when sources changed.
-4. Explain where the result lives given `WORKSPACE`: in `folder` mode the project folder *is* the branch — but a build started before the task finished is stale; in `worktree` mode the person must either run from `WORKTREE_DIR` or merge/check out `BRANCH` in the project folder first.
-5. Write `TASK_DIR/step06-handoff.md` **in Russian** (technical identifiers and commands as-is) with these sections:
+4. Build commands must not dirty the checkout: in `folder` mode the project folder is the task branch and a later revision round refuses to start on uncommitted changes. If a build output lands inside the repository (a binary next to `main.go`, a bundle in a tracked folder), either point it outside (`go build -o /tmp/app .`) or note that the path must be git-ignored — and if the repository *tracks* such an artifact, say so explicitly as a problem to fix (`git rm --cached`, add to `.gitignore`).
+5. Explain where the result lives given `WORKSPACE`: in `folder` mode the project folder *is* the branch — but a build started before the task finished is stale; in `worktree` mode the person must either run from `WORKTREE_DIR` or merge/check out `BRANCH` in the project folder first.
+6. Write `TASK_DIR/step06-handoff.md` **in Russian** (technical identifiers and commands as-is) with these sections:
    - **Где результат** — branch, checkout path, workspace mode consequence (one or two sentences).
    - **Собрать и запустить** — an ordered list of concrete shell commands in the right order, each with a one-line reason when it is not obvious (e.g. «фронтенд встраивается в бинарник через go:embed — сначала он, потом go build»). Include the URL/port/entry point to open.
    - **Что проверить руками** — a checklist mapped to the task requirements: what to click/call and what the expected result is; include a negative case where the change has one.
@@ -37,7 +38,7 @@ You are the last stage. The code is written, reviewed and committed. The person 
    - **Если что-то не так** — the 2–3 most likely reasons the change is *not visible* (stale binary, cached bundle, old data) and how to tell.
    - **Дальше** — what is left to do outside the code: merge into the base branch, push, MR/PR, deploy, migrations on other environments, documentation — only what applies.
    Keep it short: a person should be able to follow it top to bottom in a few minutes. No praise, no summary of the implementation — that is in `step04-execution.md`.
-6. Update `TASK_DIR/task.md`: current stage = «инструкция по проверке», next step = the first command of «Собрать и запустить».
+7. Update `TASK_DIR/task.md`: current stage = «инструкция по проверке», next step = the first command of «Собрать и запустить».
 
 ## Output
 
