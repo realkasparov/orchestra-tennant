@@ -170,6 +170,17 @@ func roundDir(taskDir string, n int) string {
 	return dir
 }
 
+// planText — текст актуального плана: step03, если ревью плана прошло,
+// иначе step02.
+func planText(taskDir string) string {
+	for _, name := range []string{"step03-refined-plan.md", "step02-analyze.md"} {
+		if data, err := os.ReadFile(filepath.Join(taskDir, name)); err == nil {
+			return string(data)
+		}
+	}
+	return ""
+}
+
 // planSection — секция с текстом актуального плана. Большой план (>24К)
 // агент прочитает сам.
 func planSection(taskDir string) string {
@@ -184,6 +195,66 @@ func planSection(taskDir string) string {
 		return fmt.Sprintf("\n\nPLAN (current contents of %s, embedded for convenience — no need to Read it; edits still go to the file):\n<<<PLAN\n%s\nPLAN>>>", name, data)
 	}
 	return ""
+}
+
+// planPathRe — путь к файлу в обратных кавычках, как их пишет план:
+// `web/src/game.ts`, `web/src/game.ts:67`. Кавычки отсекают прозу и
+// команды; расширение — каталоги.
+var planPathRe = regexp.MustCompile("`([A-Za-z0-9_][A-Za-z0-9_./-]*\\.[A-Za-z0-9]{1,8})(?::\\d+(?:-\\d+)?)?`")
+
+// planFiles — файлы, которые план называет, в порядке первого упоминания,
+// без повторов; только те, что есть в рабочей копии и не выходят из неё.
+func planFiles(worktree, plan string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range planPathRe.FindAllStringSubmatch(plan, -1) {
+		rel := filepath.Clean(m[1])
+		if seen[rel] || rel == "." || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		seen[rel] = true
+		if fi, err := os.Stat(filepath.Join(worktree, rel)); err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		out = append(out, rel)
+	}
+	return out
+}
+
+// filesSection — содержимое файлов плана в промпт: свежий контекст этапа
+// иначе читает те же файлы заново, по одному вызову на каждый. Бюджет — как
+// у диффа; файл, не влезающий в остаток, пропускается и назван, чтобы агент
+// прочитал его сам. Бинарные файлы не вкладываются.
+func filesSection(worktree, plan string) string {
+	const budget = 60 << 10
+	const perFile = 32 << 10
+	files := planFiles(worktree, plan)
+	if len(files) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	var skipped []string
+	used := 0
+	for _, rel := range files {
+		data, err := os.ReadFile(filepath.Join(worktree, rel))
+		if err != nil || len(data) == 0 || strings.IndexByte(string(data[:min(len(data), 8<<10)]), 0) >= 0 {
+			continue
+		}
+		if len(data) > perFile || used+len(data) > budget {
+			skipped = append(skipped, rel)
+			continue
+		}
+		used += len(data)
+		fmt.Fprintf(&sb, "<<<FILE %s\n%s\nFILE>>>\n", rel, strings.TrimRight(string(data), "\n"))
+	}
+	if sb.Len() == 0 && len(skipped) == 0 {
+		return ""
+	}
+	out := "\n\nFILES (current contents of the files the plan names, as they are in the checkout now — embedded for convenience, no need to Read them; a file you have edited must be re-read before further edits):\n" + sb.String()
+	if len(skipped) > 0 {
+		out += "Not embedded (too large for the prompt — Read them yourself): " + strings.Join(skipped, ", ") + "\n"
+	}
+	return out
 }
 
 // diffSection — готовый дифф ветки для ревью: список файлов всегда, патчи —
@@ -249,7 +320,7 @@ func (r *run) stageErrWork(ctx context.Context, st *StageState) error {
 			scope = "\nSCOPE: delta — проверяй правки прошлого прогона и изменённые секции плана, не повторяй полную проверку (см. Pass scope в скилле)."
 		}
 		prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nPASS_NUMBER: %d%s%s",
-			r.skill("err_work", "plan-review"), r.st.TaskDir, pass, scope, planSection(r.st.TaskDir))
+			r.skill("err_work", "plan-review"), r.st.TaskDir, pass, scope, planSection(r.st.TaskDir)+filesSection(r.st.WorktreeDir, planText(r.st.TaskDir)))
 		text, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, pass)
 		if err != nil {
 			return err
@@ -340,7 +411,7 @@ func (r *run) stageExecute(ctx context.Context, st *StageState) error {
 		title = r.st.Title
 	}
 	prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nREFERENCE: %s\nTITLE: %s\nBASE: %s%s",
-		r.skill("execute", "execute-plan"), r.st.TaskDir, r.st.Reference, title, r.st.BaseCommit, planSection(r.st.TaskDir))
+		r.skill("execute", "execute-plan"), r.st.TaskDir, r.st.Reference, title, r.st.BaseCommit, planSection(r.st.TaskDir)+filesSection(r.st.WorktreeDir, planText(r.st.TaskDir)))
 	if _, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, 1); err != nil {
 		return err
 	}

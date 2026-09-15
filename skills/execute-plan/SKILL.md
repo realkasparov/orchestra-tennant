@@ -18,7 +18,7 @@ description: Implement a solution plan in the task's git worktree — step by st
 
 ## Process
 
-1. Read the plan — the prompt may already embed its text in a `<<<PLAN ... PLAN>>>` section (use it, no need to Read the file); skim the requirements to keep them in view. The plan is the source of truth for WHAT to build; the codebase is the source of truth for HOW.
+1. Read the plan — the prompt may already embed its text in a `<<<PLAN ... PLAN>>>` section (use it, no need to Read the file), and the current contents of the files the plan names in a `FILES` section (`<<<FILE path ... FILE>>>` blocks — use them instead of Read; after you edit a file, re-read it before editing again, the embedded copy is stale by then). Skim the requirements to keep them in view. The plan is the source of truth for WHAT to build; the codebase is the source of truth for HOW.
 2. Confirm the base: `git merge-base --is-ancestor "$BASE" HEAD` must succeed; if it doesn't, stop and report instead of guessing.
 3. Work through the plan steps in order. After each completed logical step:
    `git add -A && git commit -m "WIP: <short step description>"` — these are recovery points for pause/crash.

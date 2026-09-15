@@ -30,7 +30,7 @@ This stage produces `TASK_DIR/step03-refined-plan.md` — the corrected plan. On
 
 ## Process
 
-1. Read the requirements first (`step01-import.md` + attachments if referenced), then the plan. The prompt may already contain the current plan text in a `<<<PLAN ... PLAN>>>` section — use it instead of reading the plan file (your edits still go to `step03-refined-plan.md`).
+1. Read the requirements first (`step01-import.md` + attachments if referenced), then the plan. The prompt may already contain the current plan text in a `<<<PLAN ... PLAN>>>` section — use it instead of reading the plan file (your edits still go to `step03-refined-plan.md`) — and the current contents of the files the plan names in a `FILES` section (`<<<FILE path ... FILE>>>` blocks): verify the plan's claims against those blocks first, and Read only what the plan does not name or what is marked as not embedded.
 2. Check the plan against the requirements: does it actually solve the task? Anything missing, anything invented that wasn't asked for?
 3. Verify every factual claim against the real codebase: each listed file exists and does what the plan says it does; each claimed dependency is real; the steps are implementable in the stated order. Cite evidence as `file:line`.
 4. Compile the top ~8 errors, risks, or omissions (fewer if fewer genuinely exist — do not pad). Each finding: the plan section/claim + the contradicting evidence.

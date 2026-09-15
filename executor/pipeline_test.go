@@ -334,3 +334,30 @@ func TestChangeRoundArchivesAndRefusesDirty(t *testing.T) {
 		t.Fatal("roundDir")
 	}
 }
+
+// Файлы плана вкладываются в промпт: только существующие, без повторов, в
+// бюджет; бинарные и не влезающие — пропущены, последние названы.
+func TestFilesSection(t *testing.T) {
+	wt := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(wt, "web/src"), 0o755)
+	_ = os.WriteFile(filepath.Join(wt, "web/src/game.ts"), []byte("export const GRID_W = 28;\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(wt, "web/src/big.ts"), []byte(strings.Repeat("x", 40<<10)), 0o644)
+	_ = os.WriteFile(filepath.Join(wt, "logo.png"), []byte("\x89PNG\x00\x00"), 0o644)
+	plan := "## Affected files\n- `web/src/game.ts:67` — граница\n- `web/src/game.ts` ещё раз\n- `web/src/missing.ts`\n- `../etc/passwd`\n- `web/src/big.ts`\n- `logo.png`\n"
+	got := filesSection(wt, plan)
+	if !strings.Contains(got, "<<<FILE web/src/game.ts\nexport const GRID_W = 28;\nFILE>>>") {
+		t.Fatalf("game.ts не вложен: %q", got)
+	}
+	if strings.Count(got, "<<<FILE ") != 1 {
+		t.Fatalf("вложено не ровно один файл: %q", got)
+	}
+	if !strings.Contains(got, "Not embedded") || !strings.Contains(got, "web/src/big.ts") {
+		t.Fatalf("большой файл не назван: %q", got)
+	}
+	if strings.Contains(got, "passwd") || strings.Contains(got, "PNG") {
+		t.Fatalf("лишнее в секции: %q", got)
+	}
+	if filesSection(wt, "план без путей") != "" {
+		t.Fatal("секция без файлов должна быть пустой")
+	}
+}
