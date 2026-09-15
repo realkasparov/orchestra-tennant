@@ -21,8 +21,8 @@ jobs:
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Build
@@ -36,7 +36,7 @@ jobs:
           go build -trimpath -ldflags "-s -w -X github.com/realkasparov/orchestra-tennant/executor.Version=${GITHUB_REF_NAME#v}" \
             -o "dist/$name/orchestra-tennant" ./cmd/orchestra-tennant
           tar -C "dist/$name" -czf "dist/$name.tar.gz" orchestra-tennant
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.goos }}_${{ matrix.goarch }}
           path: dist/*.tar.gz
@@ -45,8 +45,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v6
         with:
           path: dist
           merge-multiple: true
