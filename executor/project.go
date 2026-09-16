@@ -72,15 +72,16 @@ func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	if other := e.folderHolder(path, 0); other != 0 {
 		return &protocol.ProjectResult{Error: fmt.Sprintf("папка проекта занята таской #%d, которая сейчас идёт прямо в ней; дождитесь её или остановите", other)}
 	}
+	// Ветка уже выставлена в папке (таска шла прямо в ней): отсоединять её
+	// нечего — папка и так показывает этот код, а ветку можно продолжать;
+	// незакоммиченные правки человека этому не помеха.
+	if cur, err := gitops.CurrentBranch(path); err == nil && cur == spec.Branch {
+		return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
+	}
 	if dirty, err := gitops.DirtyFiles(path); err != nil {
 		return &protocol.ProjectResult{Error: err.Error()}
 	} else if len(dirty) > 0 {
 		return &protocol.ProjectResult{Error: "в папке проекта незакоммиченные изменения (" + strings.Join(dirty, ", ") + ") — закоммитьте или спрячьте их (git stash)"}
-	}
-	// Ветка уже выставлена в папке (таска шла прямо в ней): отсоединять её
-	// нечего — папка и так показывает этот код, а ветку можно продолжать.
-	if cur, err := gitops.CurrentBranch(path); err == nil && cur == spec.Branch {
-		return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
 	}
 	var err error
 	if spec.Branch == spec.BaseBranch {
@@ -108,7 +109,7 @@ func (e *Executor) folderHolder(path string, except int64) int64 {
 		// Таска «в папке» держит папку с момента приёма задания, а не с
 		// этапа branch: иначе в окне до него вторая такая же таска или
 		// просмотр переключили бы папку у неё под ногами.
-		if j.Plan.Workspace == "folder" && filepath.Clean(j.Plan.Project.Path) == clean {
+		if j.Plan.Workspace == "folder" && hasStage(j.Plan, "branch") && filepath.Clean(j.Plan.Project.Path) == clean {
 			return j.Plan.TaskID
 		}
 		if filepath.Clean(j.worktreeDir()) == clean {
@@ -333,4 +334,15 @@ func (p *Pipeline) ensureProjectIndex(ctx context.Context, id int64, path string
 	if _, err := p.Index.Ensure(ctx, id, path, spec.IndexMode, codeindex.ExcludeList(spec.IndexExclude)); err != nil && p.Log != nil {
 		p.Log("индекс проекта %d: %v", id, err)
 	}
+}
+
+// hasStage — есть ли этап key в плане задания (таска без branch папку не
+// трогает и не держит).
+func hasStage(plan *protocol.Plan, key string) bool {
+	for _, s := range plan.Stages {
+		if s.Key == key {
+			return true
+		}
+	}
+	return false
 }

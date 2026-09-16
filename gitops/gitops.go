@@ -134,7 +134,13 @@ func CheckoutDetached(dir, branch string) error {
 	if err := CheckRef(branch); err != nil {
 		return err
 	}
-	_, err := run(dir, "checkout", "--detach", branch)
+	ref := branch
+	if _, err := run(dir, "rev-parse", "--verify", "refs/heads/"+branch); err != nil {
+		// Ветка только на origin: с --detach git не заводит локальную,
+		// поэтому отсоединяемся прямо на удалённую.
+		ref = "refs/remotes/origin/" + branch
+	}
+	_, err := run(dir, "checkout", "--detach", ref)
 	return err
 }
 

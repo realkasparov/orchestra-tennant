@@ -75,7 +75,9 @@ func describeEvent(ev *protocol.Event) string {
 	case "task_status":
 		return "Таска: " + statusTitle(str(p, "status"))
 	case "log":
-		return stage + str(p, "text")
+		// Продолжения многострочного текста (вывод тестов) — с отступом:
+		// строка без префикса таски выпала бы из фильтра log -project.
+		return stage + strings.ReplaceAll(strings.TrimRight(str(p, "text"), "\n"), "\n", "\n    ")
 	case "stage_status":
 		if _, hasUsage := p["usage"]; hasUsage {
 			return "" // расход — в чате; журналу хватает статусов

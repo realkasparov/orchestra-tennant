@@ -112,10 +112,30 @@ func uninstallService(p paths) error {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return errors.New("служба не установлена")
 	}
-	if err := stopService(path); err != nil {
+	// Незагруженная служба (bootstrap не удался, сняли вручную): bootout
+	// отвечает «No such process» — файл всё равно нужно убрать, иначе
+	// служба поднимется при следующем входе.
+	if err := stopService(path); err != nil && serviceLoaded() {
 		return err
 	}
 	return os.Remove(path)
+}
+
+// serviceLoaded — известна ли служба менеджеру служб сейчас.
+func serviceLoaded() bool {
+	switch runtime.GOOS {
+	case "darwin":
+		return run("launchctl", "print", launchdTarget()+"/"+launchdLabel) == nil
+	case "linux":
+		return run("systemctl", "--user", "is-enabled", systemdUnit) == nil || run("systemctl", "--user", "is-active", systemdUnit) == nil
+	}
+	return false
+}
+
+// unitQuote — значение для systemd unit: путь с пробелом в кавычках,
+// «%» удвоен (спецификатор).
+func unitQuote(s string) string {
+	return `"` + strings.ReplaceAll(s, "%", "%%") + `"`
 }
 
 func launchdPlist(exe string, p paths) string {
@@ -153,8 +173,8 @@ Description=orchestra-tennant — исполнитель тасок оркест
 After=network.target
 
 [Service]
-ExecStart=` + exe + ` run -home ` + p.home + `
-WorkingDirectory=` + p.home + `
+ExecStart=` + unitQuote(exe) + ` run -home ` + unitQuote(p.home) + `
+WorkingDirectory=` + unitQuote(p.home) + `
 Restart=always
 RestartSec=5
 Environment=PATH=` + servicePATH() + `

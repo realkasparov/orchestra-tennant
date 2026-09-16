@@ -344,7 +344,7 @@ func TestServiceFiles(t *testing.T) {
 		}
 	}
 	unit := systemdUnitFile("/opt/bin/orchestra-tennant", p)
-	for _, want := range []string{"ExecStart=/opt/bin/orchestra-tennant run -home /Users/me/.orchestra-tennant", "Restart=always", "WantedBy=default.target"} {
+	for _, want := range []string{`ExecStart="/opt/bin/orchestra-tennant" run -home "/Users/me/.orchestra-tennant"`, "Restart=always", "WantedBy=default.target"} {
 		if !strings.Contains(unit, want) {
 			t.Errorf("unit без %q", want)
 		}
