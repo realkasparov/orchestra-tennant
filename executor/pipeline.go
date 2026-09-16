@@ -79,6 +79,9 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	if m := r.plan.Message; m != nil {
 		r.handleMessage(ctx, m.Text, m.Mode)
 		if r.change.take() {
+			if err := r.checkWorkspace(); err != nil {
+				return r.failRound(err)
+			}
 			if err := r.startChangeRound(); err != nil {
 				return r.failRound(err)
 			}
@@ -97,6 +100,11 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 				r.answerQueued(ctx)
 			}
 			return status, err
+		}
+		// Папка проверяется до архивации артефактов: отказ не должен
+		// оставлять пустой раунд с перенесёнными файлами прошлого.
+		if err := r.checkWorkspace(); err != nil {
+			return r.failRound(err)
 		}
 		if err := r.startChangeRound(); err != nil {
 			return r.failRound(err)
@@ -636,6 +644,9 @@ func (r *run) checkWorkspace() error {
 	if err != nil {
 		return err
 	}
+	if cur == "HEAD" {
+		return fmt.Errorf("папка проекта в отсоединённом состоянии (detached HEAD), а таска ждёт свою ветку «%s» — выполните git checkout %s", r.st.BranchName, r.st.BranchName)
+	}
 	if cur != r.st.BranchName {
 		return fmt.Errorf("в папке проекта сейчас ветка «%s», а таска ждёт свою «%s» — переключите ветку или откройте таску в папке проекта", cur, r.st.BranchName)
 	}
@@ -670,7 +681,9 @@ func (r *run) setupWorktree() error {
 		}
 		r.log("", "Worktree создан: "+dir+" (база "+short(sha)+")")
 	}
+	r.job.mu.Lock()
 	r.st.WorktreeDir, r.st.BranchName, r.st.BaseCommit, r.st.RoundBase = dir, branch, sha, sha
+	r.job.mu.Unlock()
 	r.job.Emit("", "task_field", map[string]any{
 		"worktree_dir": dir, "branch_name": branch, "base_commit": sha, "round_base": sha,
 	})

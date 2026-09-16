@@ -144,7 +144,7 @@ func (r *run) repoMapSection() string {
 var roundStepFiles = []string{"step02-analyze.md", "step03-refined-plan.md", "step04-execution.md", "step05-review.md", "step06-handoff.md"}
 
 // archiveRound переносит файлы шагов раунда n в TASK_DIR/round<n>/.
-func archiveRound(taskDir string, n int) {
+func archiveRound(taskDir string, n int) error {
 	dir := filepath.Join(taskDir, fmt.Sprintf("round%d", n))
 	for _, name := range roundStepFiles {
 		src := filepath.Join(taskDir, name)
@@ -152,10 +152,13 @@ func archiveRound(taskDir string, n int) {
 			continue
 		}
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return
+			return err
 		}
-		_ = os.Rename(src, filepath.Join(dir, name))
+		if err := os.Rename(src, filepath.Join(dir, name)); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // roundDir — папка артефактов раунда n, если она есть.
@@ -205,6 +208,10 @@ var planPathRe = regexp.MustCompile("`([A-Za-z0-9_][A-Za-z0-9_./-]*\\.[A-Za-z0-9
 // planFiles — файлы, которые план называет, в порядке первого упоминания,
 // без повторов; только те, что есть в рабочей копии и не выходят из неё.
 func planFiles(worktree, plan string) []string {
+	root, err := filepath.EvalSymlinks(worktree)
+	if err != nil {
+		return nil
+	}
 	seen := map[string]bool{}
 	var out []string
 	for _, m := range planPathRe.FindAllStringSubmatch(plan, -1) {
@@ -213,7 +220,13 @@ func planFiles(worktree, plan string) []string {
 			continue
 		}
 		seen[rel] = true
-		if fi, err := os.Stat(filepath.Join(worktree, rel)); err != nil || !fi.Mode().IsRegular() {
+		// Символическая ссылка наружу (config -> /etc/…) в промпт не идёт:
+		// сравнивается настоящий путь, а не имя.
+		real, err := filepath.EvalSymlinks(filepath.Join(worktree, rel))
+		if err != nil || !strings.HasPrefix(real, root+string(filepath.Separator)) {
+			continue
+		}
+		if fi, err := os.Stat(real); err != nil || !fi.Mode().IsRegular() {
 			continue
 		}
 		out = append(out, rel)

@@ -121,12 +121,9 @@ func Checkout(dir, branch string) error {
 	if err := CheckRef(branch); err != nil {
 		return err
 	}
-	_, err := run(dir, "checkout", "--", branch)
-	if err != nil {
-		// «--» после имени ветки git читает как разделитель путей; форма
-		// без него — на случай старых версий.
-		_, err = run(dir, "checkout", branch)
-	}
+	// «--» после имени: иначе git прочтёт имя как путь, и при папке с
+	// таким же именем «переключение» молча ничего не сделает.
+	_, err := run(dir, "checkout", branch, "--")
 	return err
 }
 
@@ -169,14 +166,23 @@ func IsClean(dir string) (bool, error) {
 // DirtyFiles — незакоммиченные пути (изменённые, добавленные, неотслеживаемые):
 // ошибка «дерево не чистое» должна называть, что именно.
 func DirtyFiles(dir string) ([]string, error) {
-	out, err := run(dir, "status", "--porcelain")
+	// -z: записи через NUL, без обрезки — у строки « M path» ведущий пробел
+	// значим, TrimSpace из run() съедал бы его вместе с первым символом пути.
+	cmd := exec.Command("git", "-C", dir, "status", "--porcelain", "-z")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("git status: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	var files []string
-	for _, line := range strings.Split(out, "\n") {
-		if len(line) > 3 {
-			files = append(files, strings.TrimSpace(line[3:]))
+	entries := strings.Split(string(out), "\x00")
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		if len(entry) <= 3 {
+			continue
+		}
+		files = append(files, entry[3:])
+		if entry[0] == 'R' || entry[0] == 'C' {
+			i++ // у переименования следом идёт старый путь отдельной записью
 		}
 	}
 	return files, nil

@@ -235,13 +235,20 @@ func (r *run) startChangeRound() error {
 		return nil
 	}
 	if r.st.WorktreeDir != "" {
-		if dirty, err := gitops.DirtyFiles(r.st.WorktreeDir); err == nil && len(dirty) > 0 {
+		dirty, err := gitops.DirtyFiles(r.st.WorktreeDir)
+		if err != nil {
+			return fmt.Errorf("проверка рабочей копии: %w", err)
+		}
+		if len(dirty) > 0 {
 			return fmt.Errorf("в рабочей копии есть незакоммиченные изменения (%s) — закоммитьте, спрячьте (git stash) или отмените их и повторите правку", strings.Join(dirty, ", "))
 		}
 	}
 	// Артефакты прошлого раунда — в его папку: этапы нового раунда должны
-	// видеть свои step-файлы, а не прошлогодний план.
-	archiveRound(r.st.TaskDir, r.st.round())
+	// видеть свои step-файлы, а не прошлогодний план. Не перенеслись —
+	// раунд не начинается: иначе выполнение взяло бы прошлый план.
+	if err := archiveRound(r.st.TaskDir, r.st.round()); err != nil {
+		return fmt.Errorf("перенос артефактов прошлого раунда: %w", err)
+	}
 	round := r.st.addRound(keys)
 	if r.st.WorktreeDir != "" {
 		if head, err := gitops.HeadSHA(r.st.WorktreeDir); err == nil {

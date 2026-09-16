@@ -188,6 +188,16 @@ func (j *Job) finish(status, reason string) {
 	j.mu.Unlock()
 }
 
+// worktreeDir — рабочая копия таски из состояния; пусто до этапа branch.
+func (j *Job) worktreeDir() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.State == nil {
+		return ""
+	}
+	return j.State.WorktreeDir
+}
+
 func (j *Job) isFinished() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()

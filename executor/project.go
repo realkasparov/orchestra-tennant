@@ -77,6 +77,11 @@ func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	} else if len(dirty) > 0 {
 		return &protocol.ProjectResult{Error: "в папке проекта незакоммиченные изменения (" + strings.Join(dirty, ", ") + ") — закоммитьте или спрячьте их (git stash)"}
 	}
+	// Ветка уже выставлена в папке (таска шла прямо в ней): отсоединять её
+	// нечего — папка и так показывает этот код, а ветку можно продолжать.
+	if cur, err := gitops.CurrentBranch(path); err == nil && cur == spec.Branch {
+		return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
+	}
 	var err error
 	if spec.Branch == spec.BaseBranch {
 		err = gitops.Checkout(path, spec.Branch)
@@ -95,11 +100,18 @@ func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 func (e *Executor) folderHolder(path string, except int64) int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	clean := filepath.Clean(path)
 	for _, j := range e.jobs {
-		if j.orphan || j.State == nil || j.Plan.TaskID == except || j.isFinished() {
+		if j.orphan || j.Plan.TaskID == except || j.isFinished() {
 			continue
 		}
-		if filepath.Clean(j.State.WorktreeDir) == filepath.Clean(path) {
+		// Таска «в папке» держит папку с момента приёма задания, а не с
+		// этапа branch: иначе в окне до него вторая такая же таска или
+		// просмотр переключили бы папку у неё под ногами.
+		if j.Plan.Workspace == "folder" && filepath.Clean(j.Plan.Project.Path) == clean {
+			return j.Plan.TaskID
+		}
+		if filepath.Clean(j.worktreeDir()) == clean {
 			return j.Plan.TaskID
 		}
 	}
