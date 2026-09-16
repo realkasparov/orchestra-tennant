@@ -209,6 +209,13 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 				e.forget(id)
 				continue
 			}
+			if j.isFinished() {
+				// Итог (пауза, ошибка) не дошёл до оркестратора — задание
+				// закончилось, но так и не встало на парковку; stop ему
+				// уже ничего не сделает. Память остаётся для возобновления.
+				e.park(id)
+				continue
+			}
 			j.stop(cancelReassigned)
 		}
 	}
@@ -362,16 +369,24 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	}
 	e.mu.Lock()
 	existing := e.jobs[offer.JobID]
+	adopted := ""
+	if existing != nil && !existing.orphan && existing.isFinished() {
+		// То же задание предложено снова, а прошлый прогон закончился, но
+		// итог не дошёл: это не повторная доставка, а возобновление — его
+		// память берём как у припаркованного.
+		adopted = offer.JobID
+	}
 	// Память таски переживает и смену идентификатора задания: после ошибки
 	// или перезапуска оркестратора «Возобновить» ставит новое задание той же
 	// таски, а рабочая копия и сессии агента остались здесь под прежним.
-	adopted := ""
 	if existing == nil {
 		for id, j := range e.jobs {
 			if j.Plan.TaskID != offer.Plan.TaskID {
 				continue
 			}
-			if j.orphan {
+			if j.orphan || j.isFinished() {
+				// Закончившееся задание, чей итог не дошёл, — та же
+				// память прошлого прогона, что и припаркованное.
 				existing, adopted = j, id
 				break
 			}
@@ -396,7 +411,7 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 			return
 		}
 	}
-	if existing != nil && !existing.orphan {
+	if existing != nil && !existing.orphan && adopted == "" {
 		// Повторная доставка уже принятого: подтверждаем тем же
 		// идентификатором, второго исполнения не начинаем.
 		e.mu.Unlock()

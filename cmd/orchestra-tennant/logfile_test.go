@@ -26,4 +26,10 @@ func TestLogFilter(t *testing.T) {
 	if p, id, ok := parseTaskLine(shop3); !ok || p != "my shop" || id != 3 {
 		t.Errorf("разбор строки: %q %d %v", p, id, ok)
 	}
+	// Продолжения многострочной записи (с отступом) идут за своей первой
+	// строкой: после строки чужого проекта отсеиваются, после своей — нет.
+	cont := logFilter("snake", 3)
+	if !cont(snake3) || !cont("    --- FAIL: TestX") || cont(shop3) || cont("    --- FAIL: TestY") {
+		t.Error("продолжения многострочной записи")
+	}
 }

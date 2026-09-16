@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -361,7 +360,6 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, prompt, cwd str
 	st.Status = "running"
 	r.emitStage(st, "running")
 
-	var all strings.Builder
 	resume := ""
 	if st.SessionID != "" && (prev == "paused" || prev == "waiting_user") && st.CurrentPass == pass {
 		resume = st.SessionID
@@ -375,6 +373,14 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, prompt, cwd str
 			prompt = continuationPrompt
 		}
 	}
+	return r.runAgentSession(ctx, st, prompt, cwd, resume, pass)
+}
+
+// runAgentSession — прогон агента этапа; resume — сессия, которую надо
+// продолжить (пусто — новая). Отдельно от runAgentStage: автопочинка после
+// тест-гейта продолжает сессию реализации, хотя этап и не прерывался.
+func (r *run) runAgentSession(ctx context.Context, st *StageState, prompt, cwd, resume string, pass int) (string, error) {
+	var all strings.Builder
 	for {
 		if err := r.checkBudget(); err != nil {
 			return all.String(), err
@@ -689,8 +695,9 @@ func (r *run) setupWorktree() error {
 	})
 	r.job.SaveState()
 	if proj.PostCreate != "" {
-		cmd := exec.Command("/bin/sh", "-c", proj.PostCreate)
-		cmd.Dir = dir
+		hctx, cancel := context.WithTimeout(context.Background(), gateTimeout)
+		defer cancel()
+		cmd := shellCommand(hctx, proj.PostCreate, dir)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("post-create hook: %s: %w", strings.TrimSpace(string(out)), err)
 		}

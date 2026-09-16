@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/realkasparov/orchestra-tennant/agent"
@@ -409,6 +410,11 @@ func (r *run) stageBranch(st *StageState) error {
 	if r.st.BranchName == final {
 		return r.finishStage(st)
 	}
+	// Ветка с таким именем уже есть (та же задача импортирована повторно,
+	// прежняя ветка сохранена): берём следующий свободный суффикс.
+	for i := 2; gitops.HasRef(r.st.WorktreeDir, final); i++ {
+		final = fmt.Sprintf("%s-%s-%d", ref, slug, i)
+	}
 	if err := gitops.RenameBranch(r.st.WorktreeDir, r.st.BranchName, final); err != nil {
 		return fmt.Errorf("переименование ветки: %w", err)
 	}
@@ -517,13 +523,25 @@ func (r *run) skill(key, fallback string) string {
 
 // --- тест-гейт ---
 
+// shellCommand — команда проекта в своей группе процессов: по отмене или
+// таймауту убивается вся группа, а не один /bin/sh — иначе дочерние
+// процессы (node, go test) держали бы вывод, и CombinedOutput ждал бы их
+// бесконечно.
+func shellCommand(ctx context.Context, cmd, dir string) *exec.Cmd {
+	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
+	c.Dir = dir
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c.WaitDelay = 5 * time.Second
+	return c
+}
+
 const gateTimeout = 10 * time.Minute
 
 func runTestGate(ctx context.Context, cmd, dir string) (string, error) {
 	gctx, cancel := context.WithTimeout(ctx, gateTimeout)
 	defer cancel()
-	c := exec.CommandContext(gctx, "/bin/sh", "-c", cmd)
-	c.Dir = dir
+	c := shellCommand(gctx, cmd, dir)
 	out, err := c.CombinedOutput()
 	tail := string(out)
 	if len(tail) > 4000 {
@@ -556,7 +574,8 @@ func (r *run) testGate(ctx context.Context, st *StageState) error {
 		"Почини причину падения, прогони команду сам до зелёного статуса и закоммить правку "+
 		"(commit message: %s: fix tests). Не отключай и не ослабляй сами тесты без веской причины — если тест "+
 		"устарел по сути задачи, объясни это в step04-execution.md.", cmd, out, r.st.Reference)
-	if _, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, st.CurrentPass); err != nil {
+	// Той же сессией, что делала реализацию: агент помнит, что менял.
+	if _, err := r.runAgentSession(ctx, st, prompt, r.st.WorktreeDir, st.SessionID, st.CurrentPass); err != nil {
 		return err
 	}
 	out2, gerr2 := runTestGate(ctx, cmd, r.st.WorktreeDir)

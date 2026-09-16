@@ -115,12 +115,16 @@ func logFilter(project string, task int64) func(string) bool {
 		return func(string) bool { return true }
 	}
 	want := strings.ToLower(strings.TrimSpace(project))
+	last := false
 	return func(line string) bool {
-		proj, id, ok := parseTaskLine(line)
-		if !ok || strings.ToLower(proj) != want {
-			return false
+		// Продолжение многострочной записи (вывод тестов, с отступом) идёт
+		// вместе со своей первой строкой.
+		if line != "" && (line[0] == ' ' || line[0] == '\t') {
+			return last
 		}
-		return task == 0 || id == task
+		proj, id, ok := parseTaskLine(line)
+		last = ok && strings.ToLower(proj) == want && (task == 0 || id == task)
+		return last
 	}
 }
 

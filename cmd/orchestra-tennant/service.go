@@ -132,8 +132,9 @@ func serviceLoaded() bool {
 	return false
 }
 
-// unitQuote — значение для systemd unit: путь с пробелом в кавычках,
-// «%» удвоен (спецификатор).
+// unitQuote — слово для ExecStart/Environment: в кавычках (пробелы), «%»
+// удвоен (спецификатор). WorkingDirectory кавычек не понимает — там путь
+// как есть.
 func unitQuote(s string) string {
 	return `"` + strings.ReplaceAll(s, "%", "%%") + `"`
 }
@@ -174,10 +175,10 @@ After=network.target
 
 [Service]
 ExecStart=` + unitQuote(exe) + ` run -home ` + unitQuote(p.home) + `
-WorkingDirectory=` + unitQuote(p.home) + `
+WorkingDirectory=` + strings.ReplaceAll(p.home, "%", "%%") + `
 Restart=always
 RestartSec=5
-Environment=PATH=` + servicePATH() + `
+Environment=` + unitQuote("PATH="+servicePATH()) + `
 
 [Install]
 WantedBy=default.target
