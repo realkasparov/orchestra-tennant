@@ -115,9 +115,9 @@ func (j *Job) flush() {
 	if finished && !gone {
 		if err := j.ex.send(protocol.MsgDone, j.ID, protocol.Done{JobID: j.ID, Status: status, Reason: reason}); err == nil {
 			if j.keepsState() {
-				j.ex.park(j.ID)
+				j.ex.parkJob(j)
 			} else {
-				j.ex.forget(j.ID)
+				j.ex.forgetJob(j)
 			}
 		}
 	}

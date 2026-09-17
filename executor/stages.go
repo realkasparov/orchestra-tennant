@@ -407,7 +407,9 @@ func (r *run) stageBranch(st *StageState) error {
 		}
 	}
 	final := ref + "-" + slug
-	if r.st.BranchName == final {
+	// Ветка уже переименована в прошлом раунде — своё имя (с суффиксом или
+	// без) занятым не считается.
+	if r.st.BranchName == final || strings.HasPrefix(r.st.BranchName, final+"-") {
 		return r.finishStage(st)
 	}
 	// Ветка с таким именем уже есть (та же задача импортирована повторно,
@@ -453,6 +455,16 @@ func (r *run) stageExecute(ctx context.Context, st *StageState) error {
 	}
 	if err := r.testGate(ctx, st); err != nil {
 		return err
+	}
+	// Автопочинка могла закоммитить или оставить правки: проверка дерева и
+	// HEAD — заново, иначе ревью и переиндексация не увидят починку.
+	if dirty, derr := gitops.DirtyFiles(r.st.WorktreeDir); derr != nil {
+		return derr
+	} else if len(dirty) > 0 {
+		return fmt.Errorf("после починки тестов рабочее дерево не чистое: %s", strings.Join(dirty, ", "))
+	}
+	if h, herr := gitops.HeadSHA(r.st.WorktreeDir); herr == nil {
+		head = h
 	}
 	r.reindexChanged(head)
 	r.emitDiff()

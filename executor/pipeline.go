@@ -75,8 +75,13 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
-	if m := r.plan.Message; m != nil {
+	if m := r.plan.Message; m != nil && r.st.MessageJob != job.ID {
 		r.handleMessage(ctx, m.Text, m.Mode)
+		// Отметка — до нового раунда: повторное предложение того же
+		// задания (перезапуск, потерянный итог) не должно разбирать правку
+		// снова и хоронить начатый раунд.
+		r.st.MessageJob = job.ID
+		r.job.SaveState()
 		if r.change.take() {
 			if err := r.checkWorkspace(); err != nil {
 				return r.failRound(err)

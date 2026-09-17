@@ -447,15 +447,21 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 		j.seq, j.lastAck = existing.lastAck, existing.lastAck
 	}
 	j.sent = j.lastAck
-	e.jobs[j.ID] = j
-	if adopted != "" {
+	if adopted != "" && adopted != j.ID {
 		delete(e.jobs, adopted)
 	}
+	e.jobs[j.ID] = j
 	e.mu.Unlock()
 	if adopted != "" {
 		// Прежняя запись снимается с пометкой: запоздавшее подтверждение к
-		// старому заданию не должно воскресить её рядом с новой.
-		existing.retire()
+		// старому заданию не должно воскресить её рядом с новой. При том же
+		// идентификаторе журнал не трогаем — его сейчас перепишет новая.
+		existing.mu.Lock()
+		existing.gone = true
+		existing.mu.Unlock()
+		if adopted != j.ID {
+			_ = e.journal.Remove(adopted)
+		}
 	}
 
 	if err := e.journal.Put(&Record{JobID: j.ID, TaskID: j.Plan.TaskID, Plan: j.Plan, Resume: j.Resume, State: j.State}); err != nil {
@@ -604,6 +610,19 @@ func (e *Executor) park(id string) {
 	}
 }
 
+// parkJob — парковка именно этого задания: под тем же идентификатором уже
+// может идти новое (возобновление), и его трогать нельзя.
+func (e *Executor) parkJob(j *Job) {
+	e.mu.Lock()
+	if e.jobs[j.ID] != j {
+		e.mu.Unlock()
+		return
+	}
+	j.orphan = true
+	e.mu.Unlock()
+	j.SaveState()
+}
+
 func (e *Executor) forget(id string) {
 	e.mu.Lock()
 	j := e.jobs[id]
@@ -614,6 +633,18 @@ func (e *Executor) forget(id string) {
 	} else {
 		_ = e.journal.Remove(id)
 	}
+}
+
+// forgetJob — снятие именно этого задания (см. parkJob).
+func (e *Executor) forgetJob(j *Job) {
+	e.mu.Lock()
+	if e.jobs[j.ID] != j {
+		e.mu.Unlock()
+		return
+	}
+	delete(e.jobs, j.ID)
+	e.mu.Unlock()
+	j.retire()
 }
 
 // runningIDs — что исполнитель действительно ведёт. Задания из журнала
