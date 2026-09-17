@@ -24,6 +24,9 @@ type changeRequest struct {
 	mu      sync.Mutex
 	pending bool
 	cancel  context.CancelFunc // прерывает текущий этап, не всё задание
+	// notify будит ожидание «Возобновить»: этап не идёт, отменять нечего,
+	// а правка не должна ждать нажатия человека.
+	notify chan struct{}
 }
 
 func (c *changeRequest) request() bool {
@@ -36,7 +39,24 @@ func (c *changeRequest) request() bool {
 	if c.cancel != nil {
 		c.cancel()
 	}
+	if c.notify == nil {
+		c.notify = make(chan struct{}, 1)
+	}
+	select {
+	case c.notify <- struct{}{}:
+	default:
+	}
 	return true
+}
+
+// wake — канал с буфером на одно уведомление о принятой правке.
+func (c *changeRequest) wake() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.notify == nil {
+		c.notify = make(chan struct{}, 1)
+	}
+	return c.notify
 }
 
 func (c *changeRequest) take() bool {
@@ -210,6 +230,13 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 func (r *run) requestChange(text string, pending protocol.Usage) {
 	path := filepath.Join(r.st.TaskDir, "user-feedback.md")
 	entry := "\n## Правка от пользователя\n" + strings.TrimSpace(text) + "\n"
+	// Повторный разбор (раунд не завёлся, задание возобновили) не дублирует
+	// запись, которая уже стоит последней.
+	if prev, err := os.ReadFile(path); err == nil && strings.HasSuffix(string(prev), entry) {
+		r.pendingUsage = r.pendingUsage.Add(pending)
+		r.change.request()
+		return
+	}
 	if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 		_, _ = f.WriteString(entry)
 		_ = f.Close()

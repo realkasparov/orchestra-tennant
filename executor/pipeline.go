@@ -77,11 +77,13 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	// ответ в чате.
 	if m := r.plan.Message; m != nil && r.st.MessageJob != job.ID {
 		r.handleMessage(ctx, m.Text, m.Mode)
-		// Отметка — до нового раунда: повторное предложение того же
-		// задания (перезапуск, потерянный итог) не должно разбирать правку
-		// снова и хоронить начатый раунд.
-		r.st.MessageJob = job.ID
-		r.job.SaveState()
+		if ctx.Err() != nil {
+			// Пауза посреди разбора: сообщение не отмечено — при
+			// возобновлении оно разберётся заново, а не пропадёт.
+			r.change.take()
+			r.markPaused("")
+			return "paused", nil
+		}
 		if r.change.take() {
 			if err := r.checkWorkspace(); err != nil {
 				return r.failRound(err)
@@ -89,12 +91,18 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			if err := r.startChangeRound(); err != nil {
 				return r.failRound(err)
 			}
-		} else if r.allStagesDone() {
-			// Вопрос к готовой таске: ответ дан, этапам делать нечего —
-			// гонять их цикл значило бы мигать «выполняется → готово».
-			r.answerQueued(ctx)
-			return "done", nil
 		}
+		// Отметка — после того, как раунд заведён или ответ дан: повторное
+		// предложение того же задания (перезапуск, потерянный итог) не
+		// разбирает сообщение снова и не хоронит начатый раунд.
+		r.st.MessageJob = job.ID
+		r.job.SaveState()
+	}
+	if r.allStagesDone() {
+		// Вопрос к готовой таске (или его повтор): ответ дан, этапам делать
+		// нечего — гонять их цикл значило бы мигать «выполняется → готово».
+		r.answerQueued(ctx)
+		return "done", nil
 	}
 	for {
 		status, err, restart := r.pipeline(ctx)
@@ -340,6 +348,12 @@ func (r *run) waitContinue(ctx context.Context, key string) (paused bool) {
 			return false
 		case q := <-r.questions:
 			r.answerQuestionRound(ctx, q.text, q.usage)
+		case <-r.change.wake():
+			// Правка во время ожидания: новый раунд начинается сам, цикл
+			// этапов заберёт её через take().
+			r.st.AwaitContinue = ""
+			r.job.SaveState()
+			return false
 		case <-ctx.Done():
 			// Остановили человеком: его «Возобновить» после паузы и есть
 			// ответ на это ожидание, второй раз спрашивать не нужно.
