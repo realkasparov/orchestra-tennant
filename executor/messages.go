@@ -27,6 +27,9 @@ type changeRequest struct {
 	// notify будит ожидание «Возобновить»: этап не идёт, отменять нечего,
 	// а правка не должна ждать нажатия человека.
 	notify chan struct{}
+	// usage — расход триажа правок до того, как заведён этап, куда его
+	// отнести; пишется из горутины сообщений, читается циклом этапов.
+	usage protocol.Usage
 }
 
 func (c *changeRequest) request() bool {
@@ -64,7 +67,30 @@ func (c *changeRequest) take() bool {
 	defer c.mu.Unlock()
 	p := c.pending
 	c.pending = false
+	// Токен пробуждения снимается вместе с правкой: иначе следующее
+	// ожидание «Возобновить» проснулось бы от него без правки.
+	if c.notify != nil {
+		select {
+		case <-c.notify:
+		default:
+		}
+	}
 	return p
+}
+
+// addUsage копит расход триажа; takeUsage отдаёт накопленное и обнуляет.
+func (c *changeRequest) addUsage(u protocol.Usage) {
+	c.mu.Lock()
+	c.usage = c.usage.Add(u)
+	c.mu.Unlock()
+}
+
+func (c *changeRequest) takeUsage() protocol.Usage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	u := c.usage
+	c.usage = protocol.Usage{}
+	return u
 }
 
 func (c *changeRequest) arm(cancel context.CancelFunc) {
@@ -233,7 +259,7 @@ func (r *run) requestChange(text string, pending protocol.Usage) {
 	// Повторный разбор (раунд не завёлся, задание возобновили) не дублирует
 	// запись, которая уже стоит последней.
 	if prev, err := os.ReadFile(path); err == nil && strings.HasSuffix(string(prev), entry) {
-		r.pendingUsage = r.pendingUsage.Add(pending)
+		r.change.addUsage(pending)
 		r.change.request()
 		return
 	}
@@ -241,7 +267,7 @@ func (r *run) requestChange(text string, pending protocol.Usage) {
 		_, _ = f.WriteString(entry)
 		_ = f.Close()
 	}
-	r.pendingUsage = r.pendingUsage.Add(pending)
+	r.change.addUsage(pending)
 	if r.change.request() {
 		r.log("", "Правка принята — текущий этап прерван, начинаю новый раунд с «Анализа задачи».")
 	}
@@ -287,11 +313,10 @@ func (r *run) startChangeRound() error {
 		r.emitStage(r.st.stage(key), "pending")
 	}
 	// Расход триажа — на первый этап нового раунда.
-	if !r.pendingUsage.Zero() {
+	if u := r.change.takeUsage(); !u.Zero() {
 		if st := r.st.stage(keys[0]); st != nil {
-			st.Usage = st.Usage.Add(r.pendingUsage)
+			st.Usage = st.Usage.Add(u)
 		}
-		r.pendingUsage = protocol.Usage{}
 	}
 	r.log("", fmt.Sprintf("Правка принята — раунд %d: продолжаю с этапа «Анализ задачи».", round))
 	r.job.SaveState()

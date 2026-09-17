@@ -46,8 +46,7 @@ type run struct {
 	plan *protocol.Plan
 	st   *TaskState
 
-	change       changeRequest
-	pendingUsage protocol.Usage // расход триажа до того, как заведён этап, куда его отнести
+	change changeRequest
 	// questions — вопросы человека, ждущие границы этапа: отвечает цикл
 	// этапов, а не горутина сообщений.
 	questions chan question
@@ -98,9 +97,11 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 		r.st.MessageJob = job.ID
 		r.job.SaveState()
 	}
-	if r.allStagesDone() {
+	if r.plan.Message != nil && r.allStagesDone() {
 		// Вопрос к готовой таске (или его повтор): ответ дан, этапам делать
 		// нечего — гонять их цикл значило бы мигать «выполняется → готово».
+		// Задание без сообщения идёт через цикл: он дожидается «Возобновить»
+		// и шлёт итоговые события.
 		r.answerQueued(ctx)
 		return "done", nil
 	}
