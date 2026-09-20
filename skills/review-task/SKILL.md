@@ -9,7 +9,7 @@ description: Review a completed task branch — the full diff against the base b
 
 ## Inputs (provided in the prompt)
 
-- `TASK_DIR` — contains `step01-import.md` (requirements), the plan (`step03-refined-plan.md` if it exists, else `step02-analyze.md`), and `step04-execution.md`
+- `TASK_DIR` — contains `step01-import.md` (requirements — only if the import stage ran; otherwise they are the task text in `task.md`), the plan (`step03-refined-plan.md` if it exists, else `step02-analyze.md`), and `step04-execution.md`
 - `REFERENCE` — e.g. `tn/core/tradernet#42546`
 - `BASE_COMMIT` — the base SHA recorded by the orchestrator at worktree creation; the diff is computed against it (the local base branch in the worktree may be stale — do not diff against a branch name)
 - `MODE` — `report-only` | `autofix`

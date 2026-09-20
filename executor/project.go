@@ -36,6 +36,11 @@ func (e *Executor) handleProject(ctx context.Context, env *protocol.Envelope) {
 		res := &protocol.ProjectResult{ReqID: req.ReqID}
 		h, ok := e.runner.(ProjectHandler)
 		switch {
+		case req.Action == protocol.ProjectView:
+			// Показ смотрит на идущие задания, поэтому его ведёт сам
+			// исполнитель, а не конвейер.
+			res = e.view(&req.Spec)
+			res.ReqID = req.ReqID
 		case !ok:
 			res.Error = "исполнитель не умеет заводить проекты"
 		case e.cfg.ProjectsDir == "":
@@ -48,6 +53,70 @@ func (e *Executor) handleProject(ctx context.Context, env *protocol.Envelope) {
 			e.logf("ответ на задание о проекте %s: %v", req.ReqID, err)
 		}
 	}()
+}
+
+// view показывает ветку в папке проекта. Ветка таски выкладывается
+// отсоединённым HEAD на её коммите: сама ветка остаётся в worktree, и
+// таска продолжает работать; человек смотрит код в редакторе. Базовая
+// ветка выкладывается как есть — так папку возвращают в исходное
+// состояние. Отказы: папка занята идущей в ней таской, незакоммиченные
+// изменения, ветки нет.
+func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
+	path := strings.TrimSpace(spec.Dir)
+	if path == "" || !isRepo(path) {
+		return &protocol.ProjectResult{Error: "папка проекта не является git-репозиторием: " + path}
+	}
+	if spec.Branch == "" || !gitops.HasRef(path, spec.Branch) {
+		return &protocol.ProjectResult{Error: "ветки «" + spec.Branch + "» нет в репозитории"}
+	}
+	if other := e.folderHolder(path, 0); other != 0 {
+		return &protocol.ProjectResult{Error: fmt.Sprintf("папка проекта занята таской #%d, которая сейчас идёт прямо в ней; дождитесь её или остановите", other)}
+	}
+	// Ветка уже выставлена в папке (таска шла прямо в ней): отсоединять её
+	// нечего — папка и так показывает этот код, а ветку можно продолжать;
+	// незакоммиченные правки человека этому не помеха.
+	if cur, err := gitops.CurrentBranch(path); err == nil && cur == spec.Branch {
+		return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
+	}
+	if dirty, err := gitops.DirtyFiles(path); err != nil {
+		return &protocol.ProjectResult{Error: err.Error()}
+	} else if len(dirty) > 0 {
+		return &protocol.ProjectResult{Error: "в папке проекта незакоммиченные изменения (" + strings.Join(dirty, ", ") + ") — закоммитьте или спрячьте их (git stash)"}
+	}
+	var err error
+	if spec.Branch == spec.BaseBranch {
+		err = gitops.Checkout(path, spec.Branch)
+	} else {
+		err = gitops.CheckoutDetached(path, spec.Branch)
+	}
+	if err != nil {
+		return &protocol.ProjectResult{Error: "переключить папку: " + err.Error()}
+	}
+	return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
+}
+
+// folderHolder — идущая таска, чья рабочая копия — сама папка проекта
+// (режим «в папке»); 0, если такой нет. except — таска, для которой
+// спрашивают: её собственное задание не считается.
+func (e *Executor) folderHolder(path string, except int64) int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	clean := filepath.Clean(path)
+	for _, j := range e.jobs {
+		if j.orphan || j.Plan.TaskID == except || j.isFinished() {
+			continue
+		}
+		// Таска «в папке» держит папку с момента приёма задания, а не с
+		// этапа branch: иначе в окне до него вторая такая же таска или
+		// просмотр переключили бы папку у неё под ногами.
+		if j.Plan.Workspace == "folder" && hasStage(j.Plan, "branch") && filepath.Clean(j.Plan.Project.Path) == clean {
+			return j.Plan.TaskID
+		}
+		if filepath.Clean(j.worktreeDir()) == clean {
+			return j.Plan.TaskID
+		}
+	}
+	return 0
 }
 
 // Project — реализация задания на проект у Pipeline.
@@ -109,16 +178,25 @@ func (p *Pipeline) projectPath(dir string) (string, error) {
 // checkProject — сухая проверка: чек-лист без изменений на диске. Та же
 // логика, что у создания, чтобы «Валидировать» и «Создать» не расходились.
 func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResult {
-	res := &protocol.ProjectResult{OK: true, Path: path}
+	res := &protocol.ProjectResult{OK: true, Path: path, Repo: isRepo(path)}
 	add := func(name, detail, level string) {
 		res.Checks = append(res.Checks, protocol.ProjectCheckItem{Name: name, Detail: detail, Level: level})
 	}
 	if strings.TrimSpace(spec.Name) == "" {
-		add("Название проекта", "Не заполнено — подставится имя папки", "warn")
+		add("Название проекта", "Не заполнено — введите название", "err")
 	} else {
 		add("Название проекта", "Заполнено", "ok")
 	}
+	// Репозиторий уже есть: его ветки — единственный источник правды о
+	// базовой. Ветка по умолчанию подставляется, когда человек не выбрал.
+	if res.Repo {
+		res.Branches, _ = gitops.Branches(path)
+		res.BaseBranch, _ = gitops.DefaultBranch(path)
+	}
 	branch := spec.BaseBranch
+	if branch == "" {
+		branch = res.BaseBranch
+	}
 	if branch == "" {
 		branch = "develop"
 	}
@@ -127,13 +205,29 @@ func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResu
 		add("Базовая ветка", "Не задана — возьмётся ветка по умолчанию репозитория после клона", "ok")
 	case gitops.CheckRef(branch) != nil:
 		add("Базовая ветка", "Недопустимое имя ветки: "+branch, "err")
+	case res.Repo && spec.BaseBranch == "":
+		add("Базовая ветка", "Не задана — возьмётся главная ветка репозитория «"+branch+"»", "ok")
 	default:
 		add("Базовая ветка", branch, "ok")
 	}
 	if spec.Repo != nil {
-		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+		if res.Repo {
+			// Репозиторий уже на месте: если это тот же проект хоста, клон
+			// не нужен — проект привязывается к нему как есть.
+			if origin := gitops.OriginURL(path); gitops.SameRepo(origin, spec.Repo.HostURL, spec.Repo.RepoPath) {
+				if gitops.HasRef(path, branch) {
+					add("Папка", "Git-репозиторий уже связан с "+spec.Repo.RepoPath+" — клон не нужен, ветка «"+branch+"» на месте", "ok")
+				} else {
+					add("Папка", "Git-репозиторий уже связан с "+spec.Repo.RepoPath+", но ветки «"+branch+"» нет ни локально, ни в origin", "err")
+				}
+			} else if origin == "" {
+				add("Папка", "В папке репозиторий без origin — привязать к "+spec.Repo.RepoPath+" нельзя: добавьте origin или выберите другую папку", "err")
+			} else {
+				add("Папка", "В папке другой репозиторий (origin: "+origin+") — выберите другую папку", "err")
+			}
+		} else if fi, err := os.Stat(path); err == nil && fi.IsDir() {
 			if entries, _ := os.ReadDir(path); len(entries) > 0 {
-				add("Папка", "Папка непуста — клонировать в неё нельзя: "+path, "err")
+				add("Папка", "Папка непуста и не является git-репозиторием — клонировать в неё нельзя: "+path, "err")
 			} else {
 				add("Папка", "Пуста — репозиторий будет клонирован сюда: "+path, "ok")
 			}
@@ -174,7 +268,7 @@ func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResu
 // существующего репозитория. Непустую папку без .git не трогает — опечатка в
 // имени не должна молча заводить репозиторий поверх чужих файлов.
 func createProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResult {
-	res := &protocol.ProjectResult{Path: path}
+	res := &protocol.ProjectResult{Path: path, Repo: isRepo(path)}
 	branch := spec.BaseBranch
 	if branch == "" {
 		branch = "develop"
@@ -183,39 +277,82 @@ func createProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectRes
 		res.Error = "недопустимая базовая ветка: " + branch
 		return res
 	}
+	if spec.Repo != nil && res.Repo {
+		// Репозиторий этого же хоста уже в папке (проект вёлся локально и
+		// на хосте): привязываем без клона, как существующий.
+		origin := gitops.OriginURL(path)
+		if !gitops.SameRepo(origin, spec.Repo.HostURL, spec.Repo.RepoPath) {
+			if origin == "" {
+				res.Error = "в папке репозиторий без origin — привязать к " + spec.Repo.RepoPath + " нельзя"
+			} else {
+				res.Error = "в папке другой репозиторий (origin: " + origin + ")"
+			}
+			return res
+		}
+		res.Attached = true
+		spec = &protocol.ProjectSpec{BaseBranch: spec.BaseBranch}
+	}
 	if spec.Repo != nil {
 		if err := gitops.CloneRepo(spec.Repo.HostURL, spec.Repo.Token, spec.Repo.RepoPath, path); err != nil {
 			res.Error = "клонирование не удалось: " + err.Error()
 			return res
 		}
-		res.Cloned = true
 		if spec.BaseBranch == "" {
 			if def, derr := gitops.DefaultBranch(path); derr == nil && def != "" {
 				branch = def
 			}
+		} else if !gitops.HasRef(path, branch) {
+			// Названной ветки на хосте нет: клон убирается, иначе непустая
+			// папка помешала бы повторить с правильной веткой.
+			_ = os.RemoveAll(path)
+			res.Error = "в репозитории нет ветки «" + branch + "» — проверьте имя на хосте"
+			return res
+		}
+		res.OK, res.Cloned, res.BaseBranch = true, true, branch
+		return res
+	}
+	if res.Repo {
+		// Регистрация существующего репозитория: без явной ветки — его
+		// главная; названная должна существовать, иначе первая же таска
+		// упадёт на checkout — лучше отказать сейчас.
+		if spec.BaseBranch == "" {
+			def, derr := gitops.DefaultBranch(path)
+			if derr != nil {
+				res.Error = "не удалось определить главную ветку репозитория: " + derr.Error()
+				return res
+			}
+			branch = def
+		}
+		if !gitops.HasRef(path, branch) {
+			res.Error = "в репозитории нет ветки «" + branch + "» ни локально, ни в origin"
+			return res
 		}
 		res.OK, res.BaseBranch = true, branch
 		return res
 	}
-	if fi, err := os.Stat(filepath.Join(path, ".git")); err != nil || !fi.IsDir() {
-		entries, rerr := os.ReadDir(path)
-		dirMissing := rerr != nil && os.IsNotExist(rerr)
-		if rerr != nil && !dirMissing {
-			res.Error = "папка недоступна: " + path
-			return res
-		}
-		if !dirMissing && len(entries) > 0 {
-			res.Error = "папка не является git-репозиторием: " + path
-			return res
-		}
-		if err := gitops.InitRepo(path, branch); err != nil {
-			res.Error = "не удалось инициализировать репозиторий: " + err.Error()
-			return res
-		}
-		res.Initialized = true
+	entries, rerr := os.ReadDir(path)
+	dirMissing := rerr != nil && os.IsNotExist(rerr)
+	if rerr != nil && !dirMissing {
+		res.Error = "папка недоступна: " + path
+		return res
 	}
+	if !dirMissing && len(entries) > 0 {
+		res.Error = "папка не является git-репозиторием: " + path
+		return res
+	}
+	if err := gitops.InitRepo(path, branch); err != nil {
+		res.Error = "не удалось инициализировать репозиторий: " + err.Error()
+		return res
+	}
+	res.Initialized = true
 	res.OK, res.BaseBranch = true, branch
 	return res
+}
+
+// isRepo — в папке есть git-репозиторий.
+func isRepo(path string) bool {
+	fi, err := os.Stat(filepath.Join(path, ".git"))
+	return err == nil && fi.IsDir()
 }
 
 // ensureProjectIndex применяет настройки индексации проекта.
@@ -226,4 +363,15 @@ func (p *Pipeline) ensureProjectIndex(ctx context.Context, id int64, path string
 	if _, err := p.Index.Ensure(ctx, id, path, spec.IndexMode, codeindex.ExcludeList(spec.IndexExclude)); err != nil && p.Log != nil {
 		p.Log("индекс проекта %d: %v", id, err)
 	}
+}
+
+// hasStage — есть ли этап key в плане задания (таска без branch папку не
+// трогает и не держит).
+func hasStage(plan *protocol.Plan, key string) bool {
+	for _, s := range plan.Stages {
+		if s.Key == key {
+			return true
+		}
+	}
+	return false
 }

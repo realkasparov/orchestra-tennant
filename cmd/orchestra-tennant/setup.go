@@ -1,68 +1,15 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
-
-// prompter — вопросы человеку в терминале. Без терминала (служба, скрипт)
-// вопросов не задаёт: берёт значение из флага или падает с объяснением.
-type prompter struct {
-	in          *bufio.Reader
-	out         io.Writer
-	interactive bool
-	yes         bool // -yes: молча брать значения по умолчанию
-}
-
-func (p *prompter) ask(label, def string) (string, error) {
-	if p.yes || !p.interactive {
-		if def != "" || p.yes {
-			return def, nil
-		}
-		return "", fmt.Errorf("нужно значение «%s», а терминала нет — задайте его флагом", label)
-	}
-	if def != "" {
-		fmt.Fprintf(p.out, "  %s [%s]: ", label, def)
-	} else {
-		fmt.Fprintf(p.out, "  %s: ", label)
-	}
-	line, err := p.in.ReadString('\n')
-	if err != nil && line == "" {
-		return "", errors.New("ввод прерван")
-	}
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return def, nil
-	}
-	return line, nil
-}
-
-func (p *prompter) confirm(label string, def bool) (bool, error) {
-	d := "y/N"
-	if def {
-		d = "Y/n"
-	}
-	s, err := p.ask(label, d)
-	if err != nil {
-		return false, err
-	}
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "y", "yes", "д", "да":
-		return true, nil
-	case "n", "no", "н", "нет":
-		return false, nil
-	}
-	return def, nil
-}
 
 // cmdSetup — интерактивная настройка. Все шаги можно задать флагами: так
 // настройка воспроизводится скриптом и проверяется тестом.
@@ -79,8 +26,10 @@ func cmdSetup(args []string) error {
 	_ = fs.Parse(args)
 
 	p := paths{*home}
-	pr := &prompter{in: bufio.NewReader(os.Stdin), out: os.Stdout, yes: *yes,
-		interactive: isTerminal(os.Stdin)}
+	var pr asker = silent{yes: *yes}
+	if !*yes && isTerminal(os.Stdin) && isTerminal(os.Stdout) {
+		pr = tui{}
+	}
 	ctx, cancel := signalContext()
 	defer cancel()
 	out := os.Stdout
@@ -93,7 +42,9 @@ func cmdSetup(args []string) error {
 	if cfg == nil {
 		cfg = &Config{}
 	}
-	cfg.Configured = false
+	// Признак «настроен» не сбрасывается заранее: прерванный на середине
+	// повторный setup (Ctrl+C на выборе моделей) не должен превращать
+	// работающего демона в ненастроенного. Его выставят самопроверки в конце.
 
 	// 1. Оркестратор.
 	fmt.Fprintln(out, "1/5 Оркестратор")
@@ -103,7 +54,10 @@ func cmdSetup(args []string) error {
 		if def == "" {
 			def = "http://127.0.0.1:8765"
 		}
-		if addr, err = pr.ask("Адрес оркестратора", def); err != nil {
+		if addr, err = pr.text("Адрес оркестратора", def, func(v string) error {
+			_, err := normalizeAddr(v)
+			return err
+		}); err != nil {
 			return err
 		}
 	}
@@ -112,6 +66,7 @@ func cmdSetup(args []string) error {
 	}
 	cfg.Remote = !isLocalAddr(cfg.Orchestrator)
 	if cfg.Remote {
+		cfg.Configured = false
 		fmt.Fprintf(out, "  Адрес %s не на этой машине. Адрес сохранён, но транспорта для удалённого\n"+
 			"  оркестратора в этой версии нет: демон умеет подключаться только к сокету на своей машине.\n"+
 			"  Настройка не завершена.\n", cfg.Orchestrator)
@@ -145,7 +100,12 @@ func cmdSetup(args []string) error {
 	if !keep {
 		key := *pairKey
 		if key == "" {
-			if key, err = pr.ask("Ключ подключения (из панели «Добавить устройство»)", ""); err != nil {
+			if key, err = pr.text("Ключ подключения (из панели «Добавить устройство»)", "", func(v string) error {
+				if strings.TrimSpace(v) == "" {
+					return errors.New("без ключа подключиться нечем")
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
 		}
@@ -185,7 +145,7 @@ func cmdSetup(args []string) error {
 	if *models != "" {
 		cfg.Models, err = parseModels(*models, usable)
 	} else {
-		cfg.Models, err = chooseModels(pr, usable, cfg.Models)
+		cfg.Models, err = pr.multi("Какие модели использовать", usable, intersect(cfg.Models, usable))
 	}
 	if err != nil {
 		return err
@@ -200,7 +160,16 @@ func cmdSetup(args []string) error {
 		if def == 0 {
 			def = 2
 		}
-		s, err := pr.ask("Сколько заданий вести одновременно", strconv.Itoa(def))
+		s, err := pr.text("Сколько заданий вести одновременно", strconv.Itoa(def), func(v string) error {
+			k, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				return fmt.Errorf("нужно целое число, а не %q", strings.TrimSpace(v))
+			}
+			if k < 1 || k > 100 {
+				return fmt.Errorf("число заданий %d вне диапазона 1..100", k)
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
@@ -222,7 +191,7 @@ func cmdSetup(args []string) error {
 		if def == "" {
 			def = filepath.Join(userHome(), "orchestra-projects")
 		}
-		if dir, err = pr.ask("Папка, в которой лежат и будут создаваться проекты", def); err != nil {
+		if dir, err = pr.path("Папка, в которой лежат и будут создаваться проекты", def); err != nil {
 			return err
 		}
 	}
@@ -279,49 +248,19 @@ func cmdSetup(args []string) error {
 	return nil
 }
 
-// chooseModels — мультиселект номерами через запятую.
-func chooseModels(pr *prompter, usable, prev []string) ([]string, error) {
-	for i, m := range usable {
-		fmt.Fprintf(pr.out, "    %d) %s\n", i+1, m)
-	}
-	def := "все"
-	if len(prev) > 0 {
-		var nums []string
-		for _, m := range prev {
-			for i, u := range usable {
-				if u == m {
-					nums = append(nums, strconv.Itoa(i+1))
-				}
+// intersect — прежний выбор, ограниченный тем, что есть сейчас: модели,
+// которых больше нет на машине, отмечать нечего.
+func intersect(prev, usable []string) []string {
+	var out []string
+	for _, m := range prev {
+		for _, u := range usable {
+			if u == m {
+				out = append(out, m)
+				break
 			}
 		}
-		if len(nums) > 0 {
-			def = strings.Join(nums, ",")
-		}
 	}
-	s, err := pr.ask("Какие модели использовать (номера через запятую)", def)
-	if err != nil {
-		return nil, err
-	}
-	if s == "все" || s == "all" || s == "*" {
-		return append([]string(nil), usable...), nil
-	}
-	var picked []int
-	for _, part := range strings.Split(s, ",") {
-		n, err := strconv.Atoi(strings.TrimSpace(part))
-		if err != nil || n < 1 || n > len(usable) {
-			return nil, fmt.Errorf("номер %q не из списка", strings.TrimSpace(part))
-		}
-		picked = append(picked, n-1)
-	}
-	sort.Ints(picked)
-	var out []string
-	for i, idx := range picked {
-		if i > 0 && picked[i-1] == idx {
-			continue
-		}
-		out = append(out, usable[idx])
-	}
-	return out, nil
+	return out
 }
 
 // parseModels разбирает список из флага и сверяет с найденным.

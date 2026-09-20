@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -208,6 +209,13 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 				e.forget(id)
 				continue
 			}
+			if j.isFinished() {
+				// Итог (пауза, ошибка) не дошёл до оркестратора — задание
+				// закончилось, но так и не встало на парковку; stop ему
+				// уже ничего не сделает. Память остаётся для возобновления.
+				e.park(id)
+				continue
+			}
 			j.stop(cancelReassigned)
 		}
 	}
@@ -361,16 +369,24 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	}
 	e.mu.Lock()
 	existing := e.jobs[offer.JobID]
+	adopted := ""
+	if existing != nil && !existing.orphan && existing.isFinished() {
+		// То же задание предложено снова, а прошлый прогон закончился, но
+		// итог не дошёл: это не повторная доставка, а возобновление — его
+		// память берём как у припаркованного.
+		adopted = offer.JobID
+	}
 	// Память таски переживает и смену идентификатора задания: после ошибки
 	// или перезапуска оркестратора «Возобновить» ставит новое задание той же
 	// таски, а рабочая копия и сессии агента остались здесь под прежним.
-	adopted := ""
 	if existing == nil {
 		for id, j := range e.jobs {
 			if j.Plan.TaskID != offer.Plan.TaskID {
 				continue
 			}
-			if j.orphan {
+			if j.orphan || j.isFinished() {
+				// Закончившееся задание, чей итог не дошёл, — та же
+				// память прошлого прогона, что и припаркованное.
 				existing, adopted = j, id
 				break
 			}
@@ -395,7 +411,7 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 			return
 		}
 	}
-	if existing != nil && !existing.orphan {
+	if existing != nil && !existing.orphan && adopted == "" {
 		// Повторная доставка уже принятого: подтверждаем тем же
 		// идентификатором, второго исполнения не начинаем.
 		e.mu.Unlock()
@@ -416,6 +432,11 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 		// возобновление начинало бы этап заново, не зная, что можно продолжить.
 		j.State = existing.State
 	}
+	if j.State == nil {
+		// Состояние заводится до публикации задания: worktreeDir() читает
+		// его из другой горутины.
+		j.State = &TaskState{}
+	}
 	// Нумерация продолжается с того, что оркестратор уже видел, а не с
 	// единицы: иначе новые события отбрасывались бы как дубли. Своя память
 	// о подтверждениях (из журнала) — нижняя граница, оркестратор — верхняя.
@@ -426,15 +447,21 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 		j.seq, j.lastAck = existing.lastAck, existing.lastAck
 	}
 	j.sent = j.lastAck
-	e.jobs[j.ID] = j
-	if adopted != "" {
+	if adopted != "" && adopted != j.ID {
 		delete(e.jobs, adopted)
 	}
+	e.jobs[j.ID] = j
 	e.mu.Unlock()
 	if adopted != "" {
 		// Прежняя запись снимается с пометкой: запоздавшее подтверждение к
-		// старому заданию не должно воскресить её рядом с новой.
-		existing.retire()
+		// старому заданию не должно воскресить её рядом с новой. При том же
+		// идентификаторе журнал не трогаем — его сейчас перепишет новая.
+		existing.mu.Lock()
+		existing.gone = true
+		existing.mu.Unlock()
+		if adopted != j.ID {
+			_ = e.journal.Remove(adopted)
+		}
 	}
 
 	if err := e.journal.Put(&Record{JobID: j.ID, TaskID: j.Plan.TaskID, Plan: j.Plan, Resume: j.Resume, State: j.State}); err != nil {
@@ -451,6 +478,11 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	if err := e.send(protocol.MsgAccept, j.ID, nil); err != nil {
 		e.logf("accept %s: %v", j.ID, err)
 	}
+	var keys []string
+	for _, s := range j.Plan.Stages {
+		keys = append(keys, stageTitle(s.Key))
+	}
+	e.taskNote(j, "Задание принято: %s; рабочая область — %s; папка проекта %s", strings.Join(keys, " → "), j.Plan.Workspace, j.Plan.Project.Path)
 	go e.run(jctx, j)
 }
 
@@ -487,6 +519,11 @@ func (e *Executor) run(ctx context.Context, j *Job) {
 	}
 	if status == "" {
 		status = "done"
+	}
+	if reason != "" {
+		e.taskNote(j, "Итог: %s — %s", statusTitle(status), reason)
+	} else {
+		e.taskNote(j, "Итог: %s", statusTitle(status))
 	}
 	j.finish(status, reason)
 	j.flush()
@@ -573,6 +610,19 @@ func (e *Executor) park(id string) {
 	}
 }
 
+// parkJob — парковка именно этого задания: под тем же идентификатором уже
+// может идти новое (возобновление), и его трогать нельзя.
+func (e *Executor) parkJob(j *Job) {
+	e.mu.Lock()
+	if e.jobs[j.ID] != j {
+		e.mu.Unlock()
+		return
+	}
+	j.orphan = true
+	e.mu.Unlock()
+	j.SaveState()
+}
+
 func (e *Executor) forget(id string) {
 	e.mu.Lock()
 	j := e.jobs[id]
@@ -583,6 +633,18 @@ func (e *Executor) forget(id string) {
 	} else {
 		_ = e.journal.Remove(id)
 	}
+}
+
+// forgetJob — снятие именно этого задания (см. parkJob).
+func (e *Executor) forgetJob(j *Job) {
+	e.mu.Lock()
+	if e.jobs[j.ID] != j {
+		e.mu.Unlock()
+		return
+	}
+	delete(e.jobs, j.ID)
+	e.mu.Unlock()
+	j.retire()
 }
 
 // runningIDs — что исполнитель действительно ведёт. Задания из журнала

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/realkasparov/orchestra-tennant/gitops"
 	"testing"
 
 	"github.com/realkasparov/orchestra-tennant/protocol"
@@ -278,5 +280,87 @@ func TestStateSurvivesJournal(t *testing.T) {
 	}
 	if len(back.Questions) != 1 || back.Questions[0].Status != "open" || back.NextQuestion != 1 {
 		t.Errorf("вопросы потеряны: %+v", back.Questions)
+	}
+}
+
+// Новый раунд: артефакты прошлого уходят в round<N>/, а грязная рабочая
+// копия — отказ до первого этапа, с именами файлов.
+func TestChangeRoundArchivesAndRefusesDirty(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	r.st.addRound(r.stageKeys())
+	for i := range r.st.Stages {
+		r.st.Stages[i].Status = "done"
+	}
+	for _, name := range []string{"step02-analyze.md", "step03-refined-plan.md", "task.md"} {
+		if err := os.WriteFile(filepath.Join(r.st.TaskDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repo := t.TempDir()
+	if err := gitops.InitRepo(repo, "main"); err != nil {
+		t.Fatal(err)
+	}
+	r.st.WorktreeDir = repo
+	if err := os.WriteFile(filepath.Join(repo, "snake"), []byte("bin"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := r.startChangeRound()
+	if err == nil || !strings.Contains(err.Error(), "snake") {
+		t.Fatalf("грязная копия не остановила раунд: %v", err)
+	}
+	if r.st.round() != 1 {
+		t.Fatalf("раунд заведён несмотря на отказ: %d", r.st.round())
+	}
+	if _, serr := os.Stat(filepath.Join(r.st.TaskDir, "step02-analyze.md")); serr != nil {
+		t.Fatal("артефакты перенесены до отказа")
+	}
+	_ = os.Remove(filepath.Join(repo, "snake"))
+	if err := r.startChangeRound(); err != nil {
+		t.Fatal(err)
+	}
+	if r.st.round() != 2 {
+		t.Fatalf("раунд %d", r.st.round())
+	}
+	if _, serr := os.Stat(filepath.Join(r.st.TaskDir, "round1", "step03-refined-plan.md")); serr != nil {
+		t.Fatal("план прошлого раунда не в round1/")
+	}
+	if _, serr := os.Stat(filepath.Join(r.st.TaskDir, "step03-refined-plan.md")); serr == nil {
+		t.Fatal("план прошлого раунда остался наверху — execute взял бы его вместо нового")
+	}
+	if _, serr := os.Stat(filepath.Join(r.st.TaskDir, "task.md")); serr != nil {
+		t.Fatal("task.md не должен переезжать")
+	}
+	if roundDir(r.st.TaskDir, 1) == "" || roundDir(r.st.TaskDir, 2) != "" {
+		t.Fatal("roundDir")
+	}
+}
+
+// Файлы плана вкладываются в промпт: только существующие, без повторов, в
+// бюджет; бинарные и не влезающие — пропущены, последние названы.
+func TestFilesSection(t *testing.T) {
+	wt := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(wt, "web/src"), 0o755)
+	_ = os.WriteFile(filepath.Join(wt, "web/src/game.ts"), []byte("export const GRID_W = 28;\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(wt, "web/src/big.ts"), []byte(strings.Repeat("x", 40<<10)), 0o644)
+	_ = os.WriteFile(filepath.Join(wt, "logo.png"), []byte("\x89PNG\x00\x00"), 0o644)
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	_ = os.WriteFile(outside, []byte("SECRET"), 0o644)
+	_ = os.Symlink(outside, filepath.Join(wt, "link.txt"))
+	plan := "## Affected files\n- `web/src/game.ts:67` — граница\n- `web/src/game.ts` ещё раз\n- `web/src/missing.ts`\n- `../etc/passwd`\n- `web/src/big.ts`\n- `logo.png`\n- `link.txt`\n"
+	got := filesSection(wt, plan)
+	if !strings.Contains(got, "<<<FILE web/src/game.ts\nexport const GRID_W = 28;\nFILE>>>") {
+		t.Fatalf("game.ts не вложен: %q", got)
+	}
+	if strings.Count(got, "<<<FILE ") != 1 {
+		t.Fatalf("вложено не ровно один файл: %q", got)
+	}
+	if !strings.Contains(got, "Not embedded") || !strings.Contains(got, "web/src/big.ts") {
+		t.Fatalf("большой файл не назван: %q", got)
+	}
+	if strings.Contains(got, "passwd") || strings.Contains(got, "PNG") || strings.Contains(got, "SECRET") || strings.Contains(got, "link.txt") {
+		t.Fatalf("лишнее в секции: %q", got)
+	}
+	if filesSection(wt, "план без путей") != "" {
+		t.Fatal("секция без файлов должна быть пустой")
 	}
 }

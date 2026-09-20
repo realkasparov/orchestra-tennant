@@ -47,7 +47,7 @@ func cmdRun(args []string) error {
 	// Второй демон с тем же ключом не помощник: оркестратор держит одну
 	// сессию на машину, и два процесса выбивали бы друг друга по кругу.
 	if pid := runningDaemon(p); pid != 0 {
-		return fmt.Errorf("демон уже запущен (pid %d) — остановите его или службу: orchestra-tennant service uninstall", pid)
+		return fmt.Errorf("демон уже запущен (pid %d) — остановите его или выключите службу: orchestra-tennant service disable", pid)
 	}
 	logw, err := openLog(p.log())
 	if err != nil {
@@ -79,7 +79,9 @@ func cmdRun(args []string) error {
 	ex, err := executor.New(executor.Config{
 		DeviceKey: cfg.DeviceKey, Hostname: host, OS: osVer, Version: version,
 		Slots: cfg.Slots, Models: modelIDs(cfg.Models), Skills: executor.StageSkills, ProjectsDir: cfg.ProjectsDir,
-		JournalDir: p.journal(), Log: logf, Trace: true,
+		// Трассировка пакетов — только по просьбе: журнал читают люди, и в нём
+		// должны быть события тасок словами, а не «→ event <id>».
+		JournalDir: p.journal(), Log: logf, Trace: os.Getenv("ORCHESTRA_TENNANT_TRACE") == "1",
 	}, &executor.Pipeline{DataDir: p.home, ProjectsDir: cfg.ProjectsDir, Index: index, EnsureIndex: true, Log: logf})
 	if err != nil {
 		return err

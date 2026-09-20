@@ -13,6 +13,7 @@ description: Analyze an imported task and produce a solution plan (step02-analyz
 - Task text — in the prompt and/or in `TASK_DIR/step01-import.md` (at least one is always present)
 - `DECOMPOSE` — whether the decomposition pass is enabled (`yes`/`no`)
 - `REVISION` — `yes` when this is a re-run triggered by user feedback (`no` on the first pass)
+- `PREVIOUS_ROUND` — in revision mode: the folder with the previous round's artifacts (`step02-analyze.md`, `step03-refined-plan.md`, `step04-execution.md`, `step05-review.md`); the top-level `TASK_DIR` holds only the current round's files
 - `REPO MAP` — may be present: a ranked map of the repository's files and their declared symbols, ordered by how often other files reference them. Use it to orient yourself instead of spending turns on exploratory `Grep`/`Glob`. It is a **starting point, not ground truth** — it lists top-level declarations only, may be truncated on large repos, and says nothing about behaviour: verify every file you intend to touch with `Read`/`Grep` before claiming anything about it in the plan.
 - `code_search` — may be available (large indexed repositories only): semantic search over the project's code index. Use it for conceptual questions ("where are refunds handled") or when you don't know the exact identifier; prefer `Grep` when you do. Results marked `stale` are older than the working tree — re-read those files.
 - CWD — the task's git worktree (checked out from the fresh base branch). **Read-only**: do not modify project files at this stage; the only files you write live in `TASK_DIR`.
@@ -21,7 +22,7 @@ description: Analyze an imported task and produce a solution plan (step02-analyz
 
 The task was already solved once and the user asked for changes. Do NOT re-derive everything from the import artifacts. Instead:
 
-1. Read `TASK_DIR/user-feedback.md` (the user's requested changes — the newest entry at the bottom is the current request) and the existing `TASK_DIR/task.md`, `step02-analyze.md`, `step03-refined-plan.md`, `step04-execution.md` if present, plus the already-produced code changes in the worktree (`git diff <base>...HEAD`).
+1. Read `TASK_DIR/user-feedback.md` (the user's requested changes — the newest entry at the bottom is the current request) and the existing `TASK_DIR/task.md`, then the previous round's `step02-analyze.md`, `step03-refined-plan.md`, `step04-execution.md` from `PREVIOUS_ROUND` if present, plus the already-produced code changes in the worktree (`git diff <base>...HEAD`).
 2. Treat the prior solution as the starting point. Produce an **incremental** plan in `step02-analyze.md` focused on what must change to satisfy the feedback — keep what already works, list only the deltas. Skim import artifacts only to resolve a specific question the feedback raises.
 
 ## Process (first pass, `REVISION: no`)

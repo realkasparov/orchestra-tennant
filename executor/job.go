@@ -75,6 +75,7 @@ func (j *Job) Emit(stage, typ string, payload map[string]any) {
 	ev := &protocol.Event{Seq: j.seq, TaskID: j.Plan.TaskID, Stage: stage, Type: typ, Payload: payload}
 	j.pending = append(j.pending, ev)
 	j.mu.Unlock()
+	j.ex.taskLog(j, ev)
 	j.flush()
 }
 
@@ -114,9 +115,9 @@ func (j *Job) flush() {
 	if finished && !gone {
 		if err := j.ex.send(protocol.MsgDone, j.ID, protocol.Done{JobID: j.ID, Status: status, Reason: reason}); err == nil {
 			if j.keepsState() {
-				j.ex.park(j.ID)
+				j.ex.parkJob(j)
 			} else {
-				j.ex.forget(j.ID)
+				j.ex.forgetJob(j)
 			}
 		}
 	}
@@ -185,6 +186,16 @@ func (j *Job) finish(status, reason string) {
 	j.mu.Lock()
 	j.finished, j.status, j.reason = true, status, reason
 	j.mu.Unlock()
+}
+
+// worktreeDir — рабочая копия таски из состояния; пусто до этапа branch.
+func (j *Job) worktreeDir() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.State == nil {
+		return ""
+	}
+	return j.State.WorktreeDir
 }
 
 func (j *Job) isFinished() bool {

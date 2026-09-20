@@ -36,23 +36,23 @@ func cmdService(args []string) error {
 	p := paths{*home}
 	rest := fs.Args()
 	if len(rest) != 1 {
-		return errors.New("использование: orchestra-tennant service install | uninstall")
+		return errors.New("использование: orchestra-tennant service enable | disable")
 	}
 	switch rest[0] {
-	case "install":
+	case "enable", "install":
 		if _, err := readyConfig(p); err != nil {
 			return err
 		}
 		if err := installService(p); err != nil {
 			return err
 		}
-		fmt.Println("служба установлена и запущена")
+		fmt.Println("фоновая служба включена: запущена сейчас и будет запускаться при входе в систему")
 		return nil
-	case "uninstall":
+	case "disable", "uninstall":
 		if err := uninstallService(p); err != nil {
 			return err
 		}
-		fmt.Println("служба остановлена и удалена")
+		fmt.Println("фоновая служба выключена: остановлена и не будет запускаться при входе")
 		return nil
 	}
 	return fmt.Errorf("неизвестное действие %q", rest[0])
@@ -112,10 +112,31 @@ func uninstallService(p paths) error {
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return errors.New("служба не установлена")
 	}
-	if err := stopService(path); err != nil {
+	// Незагруженная служба (bootstrap не удался, сняли вручную): bootout
+	// отвечает «No such process» — файл всё равно нужно убрать, иначе
+	// служба поднимется при следующем входе.
+	if err := stopService(path); err != nil && serviceLoaded() {
 		return err
 	}
 	return os.Remove(path)
+}
+
+// serviceLoaded — известна ли служба менеджеру служб сейчас.
+func serviceLoaded() bool {
+	switch runtime.GOOS {
+	case "darwin":
+		return run("launchctl", "print", launchdTarget()+"/"+launchdLabel) == nil
+	case "linux":
+		return run("systemctl", "--user", "is-enabled", systemdUnit) == nil || run("systemctl", "--user", "is-active", systemdUnit) == nil
+	}
+	return false
+}
+
+// unitQuote — слово для ExecStart/Environment: в кавычках (пробелы), «%»
+// удвоен (спецификатор). WorkingDirectory кавычек не понимает — там путь
+// как есть.
+func unitQuote(s string) string {
+	return `"` + strings.ReplaceAll(s, "%", "%%") + `"`
 }
 
 func launchdPlist(exe string, p paths) string {
@@ -153,11 +174,11 @@ Description=orchestra-tennant — исполнитель тасок оркест
 After=network.target
 
 [Service]
-ExecStart=` + exe + ` run -home ` + p.home + `
-WorkingDirectory=` + p.home + `
+ExecStart=` + unitQuote(exe) + ` run -home ` + unitQuote(p.home) + `
+WorkingDirectory=` + strings.ReplaceAll(p.home, "%", "%%") + `
 Restart=always
 RestartSec=5
-Environment=PATH=` + servicePATH() + `
+Environment=` + unitQuote("PATH="+servicePATH()) + `
 
 [Install]
 WantedBy=default.target

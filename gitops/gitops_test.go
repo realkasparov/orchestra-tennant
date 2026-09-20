@@ -131,3 +131,80 @@ func TestDiff(t *testing.T) {
 		t.Error("expected rejection of option-like base ref")
 	}
 }
+
+func TestDirtyFilesAndCheckout(t *testing.T) {
+	dir, _ := initRepo(t)
+	const base = "main"
+	// Изменённый отслеживаемый файл с именем в один символ: у « M a» ведущий
+	// пробел значим, и такая запись не должна теряться.
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(dir, "add", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(dir, "commit", "-m", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dirty, err := DirtyFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(dirty, ",") != "a,new.txt" {
+		t.Fatalf("dirty = %v", dirty)
+	}
+	if _, err := run(dir, "checkout", "."); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(filepath.Join(dir, "new.txt"))
+
+	// Папка с именем базовой ветки: checkout должен переключать ветку, а не
+	// трактовать имя как путь.
+	if _, err := run(dir, "checkout", "-b", "feature"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, base), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, base, "f"), []byte("f"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(dir, "add", "."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(dir, "commit", "-m", "dir"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Checkout(dir, base); err != nil {
+		t.Fatal(err)
+	}
+	if cur, _ := CurrentBranch(dir); cur != base {
+		t.Fatalf("branch = %q, want %q", cur, base)
+	}
+}
+
+func TestSameRepo(t *testing.T) {
+	cases := []struct {
+		remote, host, path string
+		want               bool
+	}{
+		{"git@gitlab.com:nov_aleks/snake-game.git", "https://gitlab.com", "nov_aleks/snake-game", true},
+		{"https://gitlab.com/nov_aleks/snake-game.git", "https://gitlab.com/", "/nov_aleks/snake-game/", true},
+		{"ssh://git@gitlab.com:2222/nov_aleks/snake-game", "https://gitlab.com", "Nov_Aleks/Snake-Game", true},
+		{"https://oauth2:tok@gitlab.com/nov_aleks/snake-game.git", "https://gitlab.com", "nov_aleks/snake-game", true},
+		{"git@github.com:nov_aleks/snake-game.git", "https://gitlab.com", "nov_aleks/snake-game", false},
+		{"git@gitlab.com:nov_aleks/other.git", "https://gitlab.com", "nov_aleks/snake-game", false},
+		{"", "https://gitlab.com", "nov_aleks/snake-game", false},
+	}
+	for _, c := range cases {
+		if got := SameRepo(c.remote, c.host, c.path); got != c.want {
+			t.Errorf("SameRepo(%q, %q, %q) = %v, want %v", c.remote, c.host, c.path, got, c.want)
+		}
+	}
+}

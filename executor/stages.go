@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/realkasparov/orchestra-tennant/agent"
@@ -60,8 +61,12 @@ func (r *run) stageAnalyze(ctx context.Context, st *StageState) error {
 	// Правка: если человек оставил отзыв, это повторный прогон — строить на
 	// существующем плане и уже написанном коде, а не выводить всё заново.
 	revision := "no"
+	prevRound := ""
 	if _, err := os.Stat(filepath.Join(r.st.TaskDir, "user-feedback.md")); err == nil {
 		revision = "yes"
+		if dir := roundDir(r.st.TaskDir, r.st.round()-1); dir != "" {
+			prevRound = "\nPREVIOUS_ROUND: " + dir
+		}
 	}
 	projectCtx := ""
 	if r.plan.Project.Stack != "" {
@@ -70,8 +75,8 @@ func (r *run) stageAnalyze(ctx context.Context, st *StageState) error {
 	if r.plan.Project.Description != "" {
 		projectCtx += "\nProject description (from the user):\n" + r.plan.Project.Description
 	}
-	prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nDECOMPOSE: %s\nREVISION: %s%s%s\n\nTask text from the user:\n%s",
-		r.skill("analyze", "analyze-task"), r.st.TaskDir, decompose, revision, projectCtx, r.repoMapSection(), r.plan.Prompt)
+	prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nDECOMPOSE: %s\nREVISION: %s%s%s%s\n\nTask text from the user:\n%s",
+		r.skill("analyze", "analyze-task"), r.st.TaskDir, decompose, revision, prevRound, projectCtx, r.repoMapSection(), r.plan.Prompt)
 	text, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, 1)
 	if err != nil {
 		return err
@@ -134,6 +139,52 @@ func (r *run) repoMapSection() string {
 	return "\n\n" + rendered
 }
 
+// roundStepFiles — артефакты этапов одного раунда: в новом раунде они
+// уходят в подпапку, чтобы «step03, если есть» означало план этого
+// раунда, а не прошлого.
+var roundStepFiles = []string{"step02-analyze.md", "step03-refined-plan.md", "step04-execution.md", "step05-review.md", "step06-handoff.md"}
+
+// archiveRound переносит файлы шагов раунда n в TASK_DIR/round<n>/.
+func archiveRound(taskDir string, n int) error {
+	dir := filepath.Join(taskDir, fmt.Sprintf("round%d", n))
+	for _, name := range roundStepFiles {
+		src := filepath.Join(taskDir, name)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if err := os.Rename(src, filepath.Join(dir, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// roundDir — папка артефактов раунда n, если она есть.
+func roundDir(taskDir string, n int) string {
+	if n < 1 {
+		return ""
+	}
+	dir := filepath.Join(taskDir, fmt.Sprintf("round%d", n))
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		return ""
+	}
+	return dir
+}
+
+// planText — текст актуального плана: step03, если ревью плана прошло,
+// иначе step02.
+func planText(taskDir string) string {
+	for _, name := range []string{"step03-refined-plan.md", "step02-analyze.md"} {
+		if data, err := os.ReadFile(filepath.Join(taskDir, name)); err == nil {
+			return string(data)
+		}
+	}
+	return ""
+}
+
 // planSection — секция с текстом актуального плана. Большой план (>24К)
 // агент прочитает сам.
 func planSection(taskDir string) string {
@@ -148,6 +199,76 @@ func planSection(taskDir string) string {
 		return fmt.Sprintf("\n\nPLAN (current contents of %s, embedded for convenience — no need to Read it; edits still go to the file):\n<<<PLAN\n%s\nPLAN>>>", name, data)
 	}
 	return ""
+}
+
+// planPathRe — путь к файлу в обратных кавычках, как их пишет план:
+// `web/src/game.ts`, `web/src/game.ts:67`. Кавычки отсекают прозу и
+// команды; расширение — каталоги.
+var planPathRe = regexp.MustCompile("`([A-Za-z0-9_][A-Za-z0-9_./-]*\\.[A-Za-z0-9]{1,8})(?::\\d+(?:-\\d+)?)?`")
+
+// planFiles — файлы, которые план называет, в порядке первого упоминания,
+// без повторов; только те, что есть в рабочей копии и не выходят из неё.
+func planFiles(worktree, plan string) []string {
+	root, err := filepath.EvalSymlinks(worktree)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range planPathRe.FindAllStringSubmatch(plan, -1) {
+		rel := filepath.Clean(m[1])
+		if seen[rel] || rel == "." || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		seen[rel] = true
+		// Символическая ссылка наружу (config -> /etc/…) в промпт не идёт:
+		// сравнивается настоящий путь, а не имя.
+		real, err := filepath.EvalSymlinks(filepath.Join(worktree, rel))
+		if err != nil || !strings.HasPrefix(real, root+string(filepath.Separator)) {
+			continue
+		}
+		if fi, err := os.Stat(real); err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		out = append(out, rel)
+	}
+	return out
+}
+
+// filesSection — содержимое файлов плана в промпт: свежий контекст этапа
+// иначе читает те же файлы заново, по одному вызову на каждый. Бюджет — как
+// у диффа; файл, не влезающий в остаток, пропускается и назван, чтобы агент
+// прочитал его сам. Бинарные файлы не вкладываются.
+func filesSection(worktree, plan string) string {
+	const budget = 60 << 10
+	const perFile = 32 << 10
+	files := planFiles(worktree, plan)
+	if len(files) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	var skipped []string
+	used := 0
+	for _, rel := range files {
+		data, err := os.ReadFile(filepath.Join(worktree, rel))
+		if err != nil || len(data) == 0 || strings.IndexByte(string(data[:min(len(data), 8<<10)]), 0) >= 0 {
+			continue
+		}
+		if len(data) > perFile || used+len(data) > budget {
+			skipped = append(skipped, rel)
+			continue
+		}
+		used += len(data)
+		fmt.Fprintf(&sb, "<<<FILE %s\n%s\nFILE>>>\n", rel, strings.TrimRight(string(data), "\n"))
+	}
+	if sb.Len() == 0 && len(skipped) == 0 {
+		return ""
+	}
+	out := "\n\nFILES (current contents of the files the plan names, as they are in the checkout now — embedded for convenience, no need to Read them; a file you have edited must be re-read before further edits):\n" + sb.String()
+	if len(skipped) > 0 {
+		out += "Not embedded (too large for the prompt — Read them yourself): " + strings.Join(skipped, ", ") + "\n"
+	}
+	return out
 }
 
 // diffSection — готовый дифф ветки для ревью: список файлов всегда, патчи —
@@ -213,7 +334,7 @@ func (r *run) stageErrWork(ctx context.Context, st *StageState) error {
 			scope = "\nSCOPE: delta — проверяй правки прошлого прогона и изменённые секции плана, не повторяй полную проверку (см. Pass scope в скилле)."
 		}
 		prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nPASS_NUMBER: %d%s%s",
-			r.skill("err_work", "plan-review"), r.st.TaskDir, pass, scope, planSection(r.st.TaskDir))
+			r.skill("err_work", "plan-review"), r.st.TaskDir, pass, scope, planSection(r.st.TaskDir)+filesSection(r.st.WorktreeDir, planText(r.st.TaskDir)))
 		text, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, pass)
 		if err != nil {
 			return err
@@ -286,8 +407,15 @@ func (r *run) stageBranch(st *StageState) error {
 		}
 	}
 	final := ref + "-" + slug
-	if r.st.BranchName == final {
+	// Ветка уже переименована в прошлом раунде — своё имя (с суффиксом или
+	// без) занятым не считается.
+	if r.st.BranchName == final || strings.HasPrefix(r.st.BranchName, final+"-") {
 		return r.finishStage(st)
+	}
+	// Ветка с таким именем уже есть (та же задача импортирована повторно,
+	// прежняя ветка сохранена): берём следующий свободный суффикс.
+	for i := 2; gitops.HasRef(r.st.WorktreeDir, final); i++ {
+		final = fmt.Sprintf("%s-%s-%d", ref, slug, i)
 	}
 	if err := gitops.RenameBranch(r.st.WorktreeDir, r.st.BranchName, final); err != nil {
 		return fmt.Errorf("переименование ветки: %w", err)
@@ -304,7 +432,7 @@ func (r *run) stageExecute(ctx context.Context, st *StageState) error {
 		title = r.st.Title
 	}
 	prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nREFERENCE: %s\nTITLE: %s\nBASE: %s%s",
-		r.skill("execute", "execute-plan"), r.st.TaskDir, r.st.Reference, title, r.st.BaseCommit, planSection(r.st.TaskDir))
+		r.skill("execute", "execute-plan"), r.st.TaskDir, r.st.Reference, title, r.st.BaseCommit, planSection(r.st.TaskDir)+filesSection(r.st.WorktreeDir, planText(r.st.TaskDir)))
 	if _, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, 1); err != nil {
 		return err
 	}
@@ -317,18 +445,26 @@ func (r *run) stageExecute(ctx context.Context, st *StageState) error {
 	if head == r.roundBase() {
 		return fmt.Errorf("выполнение не создало ни одного коммита")
 	}
-	clean, err := gitops.IsClean(r.st.WorktreeDir)
-	if err != nil {
-		return err
-	}
-	if !clean {
-		return fmt.Errorf("после выполнения рабочее дерево не чистое")
+	if dirty, derr := gitops.DirtyFiles(r.st.WorktreeDir); derr != nil {
+		return derr
+	} else if len(dirty) > 0 {
+		return fmt.Errorf("после выполнения рабочее дерево не чистое: %s", strings.Join(dirty, ", "))
 	}
 	if _, err := os.Stat(filepath.Join(r.st.TaskDir, "step04-execution.md")); err != nil {
 		return fmt.Errorf("выполнение не создало step04-execution.md")
 	}
 	if err := r.testGate(ctx, st); err != nil {
 		return err
+	}
+	// Автопочинка могла закоммитить или оставить правки: проверка дерева и
+	// HEAD — заново, иначе ревью и переиндексация не увидят починку.
+	if dirty, derr := gitops.DirtyFiles(r.st.WorktreeDir); derr != nil {
+		return derr
+	} else if len(dirty) > 0 {
+		return fmt.Errorf("после починки тестов рабочее дерево не чистое: %s", strings.Join(dirty, ", "))
+	}
+	if h, herr := gitops.HeadSHA(r.st.WorktreeDir); herr == nil {
+		head = h
 	}
 	r.reindexChanged(head)
 	r.emitDiff()
@@ -371,6 +507,23 @@ func (r *run) stageReview(ctx context.Context, st *StageState) error {
 	return r.finishStage(st)
 }
 
+// stageHandoff — последний этап: инструкция, как запустить, установить или
+// проверить результат. Код не трогает; пишет step06-handoff.md. Самая
+// частая беда после готовой таски — человек смотрит на старую сборку, и
+// этап существует ровно затем, чтобы сказать, что пересобрать.
+func (r *run) stageHandoff(ctx context.Context, st *StageState) error {
+	prompt := fmt.Sprintf("Use the %s skill.\nTASK_DIR: %s\nREFERENCE: %s\nBRANCH: %s\nBASE_COMMIT: %s\nWORKSPACE: %s\nWORKTREE_DIR: %s\nTEST_CMD: %s",
+		r.skill("handoff", "handoff-notes"), r.st.TaskDir, r.st.Reference, r.st.BranchName, r.st.BaseCommit,
+		r.plan.Workspace, r.st.WorktreeDir, r.plan.Project.TestCmd)
+	if _, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, 1); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(r.st.TaskDir, "step06-handoff.md")); err != nil {
+		return fmt.Errorf("этап не создал step06-handoff.md")
+	}
+	return r.finishStage(st)
+}
+
 // skill — имя скилла этапа из плана; запасное — если план старой схемы его
 // не назвал.
 func (r *run) skill(key, fallback string) string {
@@ -382,13 +535,25 @@ func (r *run) skill(key, fallback string) string {
 
 // --- тест-гейт ---
 
+// shellCommand — команда проекта в своей группе процессов: по отмене или
+// таймауту убивается вся группа, а не один /bin/sh — иначе дочерние
+// процессы (node, go test) держали бы вывод, и CombinedOutput ждал бы их
+// бесконечно.
+func shellCommand(ctx context.Context, cmd, dir string) *exec.Cmd {
+	c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
+	c.Dir = dir
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c.WaitDelay = 5 * time.Second
+	return c
+}
+
 const gateTimeout = 10 * time.Minute
 
 func runTestGate(ctx context.Context, cmd, dir string) (string, error) {
 	gctx, cancel := context.WithTimeout(ctx, gateTimeout)
 	defer cancel()
-	c := exec.CommandContext(gctx, "/bin/sh", "-c", cmd)
-	c.Dir = dir
+	c := shellCommand(gctx, cmd, dir)
 	out, err := c.CombinedOutput()
 	tail := string(out)
 	if len(tail) > 4000 {
@@ -421,7 +586,8 @@ func (r *run) testGate(ctx context.Context, st *StageState) error {
 		"Почини причину падения, прогони команду сам до зелёного статуса и закоммить правку "+
 		"(commit message: %s: fix tests). Не отключай и не ослабляй сами тесты без веской причины — если тест "+
 		"устарел по сути задачи, объясни это в step04-execution.md.", cmd, out, r.st.Reference)
-	if _, err := r.runAgentStage(ctx, st, prompt, r.st.WorktreeDir, st.CurrentPass); err != nil {
+	// Той же сессией, что делала реализацию: агент помнит, что менял.
+	if _, err := r.runAgentSession(ctx, st, prompt, r.st.WorktreeDir, st.SessionID, st.CurrentPass); err != nil {
 		return err
 	}
 	out2, gerr2 := runTestGate(ctx, cmd, r.st.WorktreeDir)

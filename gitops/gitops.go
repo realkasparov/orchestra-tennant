@@ -2,10 +2,12 @@ package gitops
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"github.com/realkasparov/orchestra-tennant/protocol"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -23,6 +25,54 @@ func run(dir string, args ...string) (string, error) {
 // and base-ref names, a leading '-' would be parsed by git as an option
 // (argument injection). Reject it before the name reaches an argv slot.
 func CheckRef(name string) error { return protocol.CheckRef(name) }
+
+// HasRemote — у репозитория настроен remote с таким именем.
+func HasRemote(repo, name string) bool {
+	_, err := run(repo, "remote", "get-url", name)
+	return err == nil
+}
+
+// OriginURL — адрес remote origin; пусто, если origin не настроен.
+func OriginURL(repo string) string {
+	out, err := run(repo, "remote", "get-url", "origin")
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// SameRepo — указывает ли адрес remote на репозиторий repoPath хоста
+// hostURL: формы git@host:path.git, ssh://git@host/path и https://host/path
+// считаются одним репозиторием.
+func SameRepo(remote, hostURL, repoPath string) bool {
+	rh, rp := splitRemote(remote)
+	hh, _ := splitRemote(hostURL)
+	return rh != "" && rh == hh && rp == normRepoPath(repoPath)
+}
+
+func splitRemote(u string) (host, path string) {
+	u = strings.TrimSpace(u)
+	if i := strings.Index(u, "://"); i >= 0 {
+		u = u[i+3:]
+	} else if i := strings.Index(u, ":"); i >= 0 && !strings.Contains(u[:i], "/") {
+		// scp-форма git@host:path
+		u = u[:i] + "/" + u[i+1:]
+	}
+	if i := strings.Index(u, "@"); i >= 0 && (strings.Index(u, "/") < 0 || i < strings.Index(u, "/")) {
+		u = u[i+1:]
+	}
+	host, path, _ = strings.Cut(u, "/")
+	if i := strings.Index(host, ":"); i >= 0 {
+		host = host[:i] // порт не различает репозитории
+	}
+	return strings.ToLower(host), normRepoPath(path)
+}
+
+func normRepoPath(p string) string {
+	p = strings.Trim(strings.TrimSpace(p), "/")
+	p = strings.TrimSuffix(p, ".git")
+	return strings.ToLower(strings.Trim(p, "/"))
+}
 
 // FetchBase fetches the base branch from origin.
 func FetchBase(repo, baseBranch string) error {
@@ -102,6 +152,40 @@ func RemoveWorktree(repo, dir string) error {
 	return err
 }
 
+// CurrentBranch — ветка, выставленная в рабочей копии ("HEAD" при
+// отсоединённом HEAD).
+func CurrentBranch(dir string) (string, error) {
+	return run(dir, "rev-parse", "--abbrev-ref", "HEAD")
+}
+
+// Checkout выставляет существующую ветку в рабочей копии.
+func Checkout(dir, branch string) error {
+	if err := CheckRef(branch); err != nil {
+		return err
+	}
+	// «--» после имени: иначе git прочтёт имя как путь, и при папке с
+	// таким же именем «переключение» молча ничего не сделает.
+	_, err := run(dir, "checkout", branch, "--")
+	return err
+}
+
+// CheckoutDetached выставляет коммит ветки отсоединённым HEAD: папка
+// показывает код ветки, а сама ветка остаётся там, где выложена (в
+// worktree таски), и её можно продолжать.
+func CheckoutDetached(dir, branch string) error {
+	if err := CheckRef(branch); err != nil {
+		return err
+	}
+	ref := branch
+	if _, err := run(dir, "rev-parse", "--verify", "refs/heads/"+branch); err != nil {
+		// Ветка только на origin: с --detach git не заводит локальную,
+		// поэтому отсоединяемся прямо на удалённую.
+		ref = "refs/remotes/origin/" + branch
+	}
+	_, err := run(dir, "checkout", "--detach", ref)
+	return err
+}
+
 // PruneWorktrees снимает записи о рабочих копиях, папок которых больше нет.
 func PruneWorktrees(repo string) error {
 	_, err := run(repo, "worktree", "prune")
@@ -125,6 +209,31 @@ func HasRef(dir, branch string) bool {
 func IsClean(dir string) (bool, error) {
 	out, err := run(dir, "status", "--porcelain")
 	return out == "", err
+}
+
+// DirtyFiles — незакоммиченные пути (изменённые, добавленные, неотслеживаемые):
+// ошибка «дерево не чистое» должна называть, что именно.
+func DirtyFiles(dir string) ([]string, error) {
+	// -z: записи через NUL, без обрезки — у строки « M path» ведущий пробел
+	// значим, TrimSpace из run() съедал бы его вместе с первым символом пути.
+	cmd := exec.Command("git", "-C", dir, "status", "--porcelain", "-z")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("git status: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var files []string
+	entries := strings.Split(string(out), "\x00")
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		if len(entry) <= 3 {
+			continue
+		}
+		files = append(files, entry[3:])
+		if entry[0] == 'R' || entry[0] == 'C' {
+			i++ // у переименования следом идёт старый путь отдельной записью
+		}
+	}
+	return files, nil
 }
 
 // InitRepo creates dir (if needed) and initializes a git repository on the
@@ -245,10 +354,54 @@ func CloneRepo(hostURL, token, repoPath, dst string) error {
 	return nil
 }
 
-// DefaultBranch возвращает текущую ветку свежего клона (ветку по умолчанию).
+// DefaultBranch — главная ветка репозитория: та, на которую указывает
+// origin/HEAD; без origin — текущая ветка; при отсоединённом HEAD — первая
+// из веток репозитория. У свежего клона это ветка по умолчанию хоста.
 func DefaultBranch(dir string) (string, error) {
+	if out, err := run(dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		// origin/HEAD может указывать на ветку, которой уже нет (её удалили
+		// на хосте и вычистили локально) — такая главной не считается.
+		if b := strings.TrimPrefix(out, "origin/"); b != "" && HasRef(dir, b) {
+			return b, nil
+		}
+	}
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output()
-	return strings.TrimSpace(string(out)), err
+	if err != nil {
+		return "", err
+	}
+	if cur := strings.TrimSpace(string(out)); cur != "" && cur != "HEAD" {
+		return cur, nil
+	}
+	if bs, berr := Branches(dir); berr == nil && len(bs) > 0 {
+		return bs[0], nil
+	}
+	return "", errors.New("в репозитории нет ни одной ветки")
+}
+
+// Branches — ветки репозитория: локальные и из origin, без дублей и без
+// служебной origin/HEAD, в алфавитном порядке. По ним человек выбирает
+// базовую ветку проекта, поэтому список должен быть тем, что есть на
+// самом деле, а не тем, что он помнит.
+func Branches(dir string) ([]string, error) {
+	out, err := run(dir, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin")
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var list []string
+	for _, line := range strings.Split(out, "\n") {
+		name := strings.TrimSpace(line)
+		if strings.HasPrefix(name, "origin/") {
+			name = strings.TrimPrefix(name, "origin/")
+		}
+		if name == "" || name == "HEAD" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		list = append(list, name)
+	}
+	sort.Strings(list)
+	return list, nil
 }
 
 // ChangedFiles возвращает пути файлов, изменившихся между двумя коммитами

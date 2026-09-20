@@ -24,6 +24,12 @@ type changeRequest struct {
 	mu      sync.Mutex
 	pending bool
 	cancel  context.CancelFunc // прерывает текущий этап, не всё задание
+	// notify будит ожидание «Возобновить»: этап не идёт, отменять нечего,
+	// а правка не должна ждать нажатия человека.
+	notify chan struct{}
+	// usage — расход триажа правок до того, как заведён этап, куда его
+	// отнести; пишется из горутины сообщений, читается циклом этапов.
+	usage protocol.Usage
 }
 
 func (c *changeRequest) request() bool {
@@ -36,7 +42,24 @@ func (c *changeRequest) request() bool {
 	if c.cancel != nil {
 		c.cancel()
 	}
+	if c.notify == nil {
+		c.notify = make(chan struct{}, 1)
+	}
+	select {
+	case c.notify <- struct{}{}:
+	default:
+	}
 	return true
+}
+
+// wake — канал с буфером на одно уведомление о принятой правке.
+func (c *changeRequest) wake() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.notify == nil {
+		c.notify = make(chan struct{}, 1)
+	}
+	return c.notify
 }
 
 func (c *changeRequest) take() bool {
@@ -44,7 +67,30 @@ func (c *changeRequest) take() bool {
 	defer c.mu.Unlock()
 	p := c.pending
 	c.pending = false
+	// Токен пробуждения снимается вместе с правкой: иначе следующее
+	// ожидание «Возобновить» проснулось бы от него без правки.
+	if c.notify != nil {
+		select {
+		case <-c.notify:
+		default:
+		}
+	}
 	return p
+}
+
+// addUsage копит расход триажа; takeUsage отдаёт накопленное и обнуляет.
+func (c *changeRequest) addUsage(u protocol.Usage) {
+	c.mu.Lock()
+	c.usage = c.usage.Add(u)
+	c.mu.Unlock()
+}
+
+func (c *changeRequest) takeUsage() protocol.Usage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	u := c.usage
+	c.usage = protocol.Usage{}
+	return u
 }
 
 func (c *changeRequest) arm(cancel context.CancelFunc) {
@@ -210,11 +256,18 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 func (r *run) requestChange(text string, pending protocol.Usage) {
 	path := filepath.Join(r.st.TaskDir, "user-feedback.md")
 	entry := "\n## Правка от пользователя\n" + strings.TrimSpace(text) + "\n"
+	// Повторный разбор (раунд не завёлся, задание возобновили) не дублирует
+	// запись, которая уже стоит последней.
+	if prev, err := os.ReadFile(path); err == nil && strings.HasSuffix(string(prev), entry) {
+		r.change.addUsage(pending)
+		r.change.request()
+		return
+	}
 	if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 		_, _ = f.WriteString(entry)
 		_ = f.Close()
 	}
-	r.pendingUsage = r.pendingUsage.Add(pending)
+	r.change.addUsage(pending)
 	if r.change.request() {
 		r.log("", "Правка принята — текущий этап прерван, начинаю новый раунд с «Анализа задачи».")
 	}
@@ -222,7 +275,9 @@ func (r *run) requestChange(text string, pending protocol.Usage) {
 
 // startChangeRound заводит новый раунд: все этапы плана, кроме импорта.
 // База раунда — текущий HEAD, иначе пустой раунд прошёл бы проверку.
-func (r *run) startChangeRound() {
+// Незакоммиченные изменения в рабочей копии — отказ до первого этапа:
+// иначе они всплыли бы после выполнения, когда анализ уже оплачен.
+func (r *run) startChangeRound() error {
 	var keys []string
 	for _, s := range r.plan.Stages {
 		if s.Key != "import" {
@@ -230,7 +285,22 @@ func (r *run) startChangeRound() {
 		}
 	}
 	if len(keys) == 0 {
-		return
+		return nil
+	}
+	if r.st.WorktreeDir != "" {
+		dirty, err := gitops.DirtyFiles(r.st.WorktreeDir)
+		if err != nil {
+			return fmt.Errorf("проверка рабочей копии: %w", err)
+		}
+		if len(dirty) > 0 {
+			return fmt.Errorf("в рабочей копии есть незакоммиченные изменения (%s) — закоммитьте, спрячьте (git stash) или отмените их и повторите правку", strings.Join(dirty, ", "))
+		}
+	}
+	// Артефакты прошлого раунда — в его папку: этапы нового раунда должны
+	// видеть свои step-файлы, а не прошлогодний план. Не перенеслись —
+	// раунд не начинается: иначе выполнение взяло бы прошлый план.
+	if err := archiveRound(r.st.TaskDir, r.st.round()); err != nil {
+		return fmt.Errorf("перенос артефактов прошлого раунда: %w", err)
 	}
 	round := r.st.addRound(keys)
 	if r.st.WorktreeDir != "" {
@@ -243,12 +313,12 @@ func (r *run) startChangeRound() {
 		r.emitStage(r.st.stage(key), "pending")
 	}
 	// Расход триажа — на первый этап нового раунда.
-	if !r.pendingUsage.Zero() {
+	if u := r.change.takeUsage(); !u.Zero() {
 		if st := r.st.stage(keys[0]); st != nil {
-			st.Usage = st.Usage.Add(r.pendingUsage)
+			st.Usage = st.Usage.Add(u)
 		}
-		r.pendingUsage = protocol.Usage{}
 	}
 	r.log("", fmt.Sprintf("Правка принята — раунд %d: продолжаю с этапа «Анализ задачи».", round))
 	r.job.SaveState()
+	return nil
 }

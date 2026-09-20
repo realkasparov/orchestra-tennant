@@ -53,17 +53,32 @@ func normalizeAddr(s string) (string, error) {
 }
 
 // isLocalAddr — адрес на этой машине: только такой демон умеет обслуживать.
+// Кроме localhost и loopback-адресов это любое имя вида *.localhost (RFC
+// 6761: такие имена всегда означают эту машину — так оркестратор живёт за
+// локальным reverse-proxy) и любое имя, которое резолвится только в loopback
+// (алиас в /etc/hosts).
 func isLocalAddr(base string) bool {
 	u, err := url.Parse(base)
 	if err != nil {
 		return false
 	}
 	host := u.Hostname()
-	if host == "localhost" {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return true
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		if !ip.IsLoopback() {
+			return false
+		}
+	}
+	return true
 }
 
 // reachable — оркестратор отвечает по адресу. Открытый маршрут без сессии.

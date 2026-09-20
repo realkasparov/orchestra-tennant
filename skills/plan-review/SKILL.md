@@ -11,7 +11,7 @@ You are an independent reviewer with a clean context: you did NOT write this pla
 
 ## Inputs (provided in the prompt)
 
-- `TASK_DIR` — contains `step01-import.md` (requirements) and the plan: `step02-analyze.md` (from the analysis stage). On pass 2+ a `step03-refined-plan.md` from the previous pass already exists — refine that one.
+- `TASK_DIR` — contains `step01-import.md` (requirements — only if the import stage ran; otherwise the requirements are the task text in `task.md`) and the plan: `step02-analyze.md` (from the analysis stage). On pass 2+ a `step03-refined-plan.md` from the previous pass already exists — refine that one.
 - `PASS_NUMBER` — which pass this is (1..N)
 - CWD — the task's git worktree (checked out from the fresh base branch). Read-only, except `TASK_DIR/step03-refined-plan.md` (the file you produce).
 
@@ -30,7 +30,7 @@ This stage produces `TASK_DIR/step03-refined-plan.md` — the corrected plan. On
 
 ## Process
 
-1. Read the requirements first (`step01-import.md` + attachments if referenced), then the plan. The prompt may already contain the current plan text in a `<<<PLAN ... PLAN>>>` section — use it instead of reading the plan file (your edits still go to `step03-refined-plan.md`).
+1. Read the requirements first (`step01-import.md` + attachments if referenced), then the plan. The prompt may already contain the current plan text in a `<<<PLAN ... PLAN>>>` section — use it instead of reading the plan file (your edits still go to `step03-refined-plan.md`) — and the current contents of the files the plan names in a `FILES` section (`<<<FILE path ... FILE>>>` blocks): verify the plan's claims against those blocks first, and Read only what the plan does not name or what is marked as not embedded.
 2. Check the plan against the requirements: does it actually solve the task? Anything missing, anything invented that wasn't asked for?
 3. Verify every factual claim against the real codebase: each listed file exists and does what the plan says it does; each claimed dependency is real; the steps are implementable in the stated order. Cite evidence as `file:line`.
 4. Compile the top ~8 errors, risks, or omissions (fewer if fewer genuinely exist — do not pad). Each finding: the plan section/claim + the contradicting evidence.

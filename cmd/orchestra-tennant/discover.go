@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +25,36 @@ type provider struct {
 // один с agent.ModelID: ключ, которого там нет, свёлся бы к дефолту молча.
 var claudeModels = []string{"fable", "opus", "sonnet", "haiku"}
 
+// fable51MinCLI — с этой версии Claude Code принимает claude-fable-5-1;
+// старая отвечает 400, поэтому машине со старым CLI ключ не предлагается.
+var fable51MinCLI = [3]int{2, 1, 251}
+
+// cliAtLeast — версия вида «2.1.272 (Claude Code)» не ниже min.
+func cliAtLeast(version string, min [3]int) bool {
+	fields := strings.Fields(version)
+	if len(fields) == 0 {
+		return false
+	}
+	parts := strings.Split(fields[0], ".")
+	if len(parts) < 3 {
+		return false
+	}
+	var v [3]int
+	for i := range v {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil {
+			return false
+		}
+		v[i] = n
+	}
+	for i := range v {
+		if v[i] != min[i] {
+			return v[i] > min[i]
+		}
+	}
+	return true
+}
+
 // discover ищет способы обращения к моделям: подписочные CLI, локальный
 // ollama, ключи в окружении. Ничего не выбирается само — только предлагается.
 func discover(ctx context.Context) []provider {
@@ -32,6 +63,11 @@ func discover(ctx context.Context) []provider {
 		p := provider{Key: "claude", Title: "claude CLI", Detail: path, Models: claudeModels}
 		if v := cliVersion(ctx, path); v != "" {
 			p.Detail = v + " · " + path
+			if cliAtLeast(v, fable51MinCLI) {
+				p.Models = append(append([]string(nil), claudeModels...), "fable51")
+			} else {
+				p.Detail += " — Fable 5.1 недоступна: нужен Claude Code ≥ 2.1.251 (claude update)"
+			}
 		}
 		out = append(out, p)
 	}

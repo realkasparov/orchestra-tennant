@@ -14,7 +14,7 @@ var Version = "0.3.0"
 
 // StageSkills — скиллы, которые зовут этапы плана. Исполнитель объявляет их в
 // hello, и оркестратор не предложит ему план с незнакомым скиллом.
-var StageSkills = []string{"import-gitlab", "analyze-task", "plan-review", "execute-plan", "review-task"}
+var StageSkills = []string{"import-gitlab", "analyze-task", "plan-review", "execute-plan", "review-task", "handoff-notes"}
 
 // InstallSkills делает скиллы из src видимыми headless-запускам claude:
 // симлинки в ~/.claude/skills. Это работа исполнителя, а не оркестратора —

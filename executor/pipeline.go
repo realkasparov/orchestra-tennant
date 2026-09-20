@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -47,8 +46,7 @@ type run struct {
 	plan *protocol.Plan
 	st   *TaskState
 
-	change       changeRequest
-	pendingUsage protocol.Usage // расход триажа до того, как заведён этап, куда его отнести
+	change changeRequest
 	// questions — вопросы человека, ждущие границы этапа: отвечает цикл
 	// этапов, а не горутина сообщений.
 	questions chan question
@@ -76,16 +74,36 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
-	if m := r.plan.Message; m != nil {
+	if m := r.plan.Message; m != nil && r.st.MessageJob != job.ID {
 		r.handleMessage(ctx, m.Text, m.Mode)
-		if r.change.take() {
-			r.startChangeRound()
-		} else if r.allStagesDone() {
-			// Вопрос к готовой таске: ответ дан, этапам делать нечего —
-			// гонять их цикл значило бы мигать «выполняется → готово».
-			r.answerQueued(ctx)
-			return "done", nil
+		if ctx.Err() != nil {
+			// Пауза посреди разбора: сообщение не отмечено — при
+			// возобновлении оно разберётся заново, а не пропадёт.
+			r.change.take()
+			r.markPaused("")
+			return "paused", nil
 		}
+		if r.change.take() {
+			if err := r.checkWorkspace(); err != nil {
+				return r.failRound(err)
+			}
+			if err := r.startChangeRound(); err != nil {
+				return r.failRound(err)
+			}
+		}
+		// Отметка — после того, как раунд заведён или ответ дан: повторное
+		// предложение того же задания (перезапуск, потерянный итог) не
+		// разбирает сообщение снова и не хоронит начатый раунд.
+		r.st.MessageJob = job.ID
+		r.job.SaveState()
+	}
+	if r.plan.Message != nil && r.allStagesDone() {
+		// Вопрос к готовой таске (или его повтор): ответ дан, этапам делать
+		// нечего — гонять их цикл значило бы мигать «выполняется → готово».
+		// Задание без сообщения идёт через цикл: он дожидается «Возобновить»
+		// и шлёт итоговые события.
+		r.answerQueued(ctx)
+		return "done", nil
 	}
 	for {
 		status, err, restart := r.pipeline(ctx)
@@ -96,8 +114,23 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			}
 			return status, err
 		}
-		r.startChangeRound()
+		// Папка проверяется до архивации артефактов: отказ не должен
+		// оставлять пустой раунд с перенесёнными файлами прошлого.
+		if err := r.checkWorkspace(); err != nil {
+			return r.failRound(err)
+		}
+		if err := r.startChangeRound(); err != nil {
+			return r.failRound(err)
+		}
 	}
+}
+
+// failRound — новый раунд не начался (грязная рабочая копия): ошибка в
+// журнал и статус задания, этапы не тронуты.
+func (r *run) failRound(err error) (string, error) {
+	r.log("", "Ошибка: "+err.Error())
+	r.taskStatus("error")
+	return "error", err
 }
 
 // allStagesDone — в последнем раунде не осталось этапов, которым есть что
@@ -178,6 +211,11 @@ func (r *run) stageKeys() []string {
 // прислал правку: раунд нужно завести заново и пройти снова.
 func (r *run) pipeline(ctx context.Context) (status string, err error, restart bool) {
 	r.taskStatus("running")
+	if err := r.checkWorkspace(); err != nil {
+		r.log("", "Ошибка: "+err.Error())
+		r.taskStatus("error")
+		return "error", err, false
+	}
 
 	fail := func(stage string, err error) (string, error, bool) {
 		if ctx.Err() != nil { // пауза или остановка, не провал
@@ -248,6 +286,8 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 			err = r.stageExecute(sctx, st)
 		case "review":
 			err = r.stageReview(sctx, st)
+		case "handoff":
+			err = r.stageHandoff(sctx, st)
 		default:
 			err = fmt.Errorf("неизвестный этап %q", key)
 		}
@@ -309,6 +349,12 @@ func (r *run) waitContinue(ctx context.Context, key string) (paused bool) {
 			return false
 		case q := <-r.questions:
 			r.answerQuestionRound(ctx, q.text, q.usage)
+		case <-r.change.wake():
+			// Правка во время ожидания: новый раунд начинается сам, цикл
+			// этапов заберёт её через take().
+			r.st.AwaitContinue = ""
+			r.job.SaveState()
+			return false
 		case <-ctx.Done():
 			// Остановили человеком: его «Возобновить» после паузы и есть
 			// ответ на это ожидание, второй раз спрашивать не нужно.
@@ -334,7 +380,6 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, prompt, cwd str
 	st.Status = "running"
 	r.emitStage(st, "running")
 
-	var all strings.Builder
 	resume := ""
 	if st.SessionID != "" && (prev == "paused" || prev == "waiting_user") && st.CurrentPass == pass {
 		resume = st.SessionID
@@ -348,6 +393,14 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, prompt, cwd str
 			prompt = continuationPrompt
 		}
 	}
+	return r.runAgentSession(ctx, st, prompt, cwd, resume, pass)
+}
+
+// runAgentSession — прогон агента этапа; resume — сессия, которую надо
+// продолжить (пусто — новая). Отдельно от runAgentStage: автопочинка после
+// тест-гейта продолжает сессию реализации, хотя этап и не прерывался.
+func (r *run) runAgentSession(ctx context.Context, st *StageState, prompt, cwd, resume string, pass int) (string, error) {
+	var all strings.Builder
 	for {
 		if err := r.checkBudget(); err != nil {
 			return all.String(), err
@@ -599,9 +652,40 @@ func (r *run) emitDiff() {
 
 // --- рабочая копия ---
 
+// checkWorkspace — рабочая копия в папке проекта всё ещё наша: там наша
+// ветка и в ней не идёт другая таска. Иначе продолжение легло бы в чужую
+// ветку.
+func (r *run) checkWorkspace() error {
+	proj := r.plan.Project
+	if r.plan.Workspace != "folder" {
+		return nil
+	}
+	if other := r.job.ex.folderHolder(proj.Path, r.plan.TaskID); other != 0 {
+		return fmt.Errorf("папка проекта занята таской #%d, которая сейчас идёт в ней — запустите эту таску в режиме git worktree или дождитесь той", other)
+	}
+	if r.st.WorktreeDir == "" || r.st.BranchName == "" {
+		return nil
+	}
+	cur, err := gitops.CurrentBranch(r.st.WorktreeDir)
+	if err != nil {
+		return err
+	}
+	if cur == "HEAD" {
+		return fmt.Errorf("папка проекта в отсоединённом состоянии (detached HEAD), а таска ждёт свою ветку «%s» — выполните git checkout %s", r.st.BranchName, r.st.BranchName)
+	}
+	if cur != r.st.BranchName {
+		return fmt.Errorf("в папке проекта сейчас ветка «%s», а таска ждёт свою «%s» — переключите ветку или откройте таску в папке проекта", cur, r.st.BranchName)
+	}
+	return nil
+}
+
 func (r *run) setupWorktree() error {
 	proj := r.plan.Project
-	if err := gitops.FetchBase(proj.Path, proj.BaseBranch); err != nil {
+	// Репозиторий без origin — обычное дело для локального проекта: базу
+	// берём как есть, без «не удался» в журнале каждой таски.
+	if !gitops.HasRemote(proj.Path, "origin") {
+		r.log("", "У репозитория нет origin — база берётся из локальной ветки "+proj.BaseBranch+".")
+	} else if err := gitops.FetchBase(proj.Path, proj.BaseBranch); err != nil {
 		r.log("", "fetch origin не удался (продолжаю от локальной базы): "+err.Error())
 	}
 	branch := fmt.Sprintf("task/%d-wip", r.plan.TaskID)
@@ -623,14 +707,17 @@ func (r *run) setupWorktree() error {
 		}
 		r.log("", "Worktree создан: "+dir+" (база "+short(sha)+")")
 	}
+	r.job.mu.Lock()
 	r.st.WorktreeDir, r.st.BranchName, r.st.BaseCommit, r.st.RoundBase = dir, branch, sha, sha
+	r.job.mu.Unlock()
 	r.job.Emit("", "task_field", map[string]any{
 		"worktree_dir": dir, "branch_name": branch, "base_commit": sha, "round_base": sha,
 	})
 	r.job.SaveState()
 	if proj.PostCreate != "" {
-		cmd := exec.Command("/bin/sh", "-c", proj.PostCreate)
-		cmd.Dir = dir
+		hctx, cancel := context.WithTimeout(context.Background(), gateTimeout)
+		defer cancel()
+		cmd := shellCommand(hctx, proj.PostCreate, dir)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("post-create hook: %s: %w", strings.TrimSpace(string(out)), err)
 		}

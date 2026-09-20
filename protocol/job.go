@@ -245,6 +245,11 @@ const (
 	ProjectCheck  = "check"  // сухая проверка: чек-лист, диск не трогается
 	ProjectCreate = "create" // клон, init или регистрация существующей папки
 	ProjectUpdate = "update" // настройки изменились: индекс, хук
+	// ProjectView — показать ветку в папке проекта: папка переключается на
+	// её коммит в отсоединённом состоянии, сама ветка остаётся в worktree,
+	// и таска продолжает работать. Ветка, равная базовой, выкладывается
+	// как есть — это «вернуть папку на основную ветку».
+	ProjectView = "view"
 )
 
 // ProjectSpec — описание проекта, как план таски: что нужно, а не как
@@ -258,7 +263,9 @@ type ProjectSpec struct {
 	// Repo — откуда клонировать; пусто — папка существует или инициализируется.
 	Repo *ProjectRepo `json:"repo,omitempty"`
 
-	BaseBranch   string `json:"base_branch"`
+	BaseBranch string `json:"base_branch"`
+	// Branch — для view: какую ветку показать в папке проекта.
+	Branch       string `json:"branch,omitempty"`
 	PostCreate   string `json:"post_create_hook,omitempty"`
 	Description  string `json:"description,omitempty"`
 	Stack        string `json:"stack,omitempty"`
@@ -299,9 +306,20 @@ type ProjectResult struct {
 	Path string `json:"path,omitempty"`
 	// BaseBranch — базовая ветка, которой проект заведён: у клона без явной
 	// ветки это ветка по умолчанию репозитория, которую знает только машина.
-	BaseBranch  string             `json:"base_branch,omitempty"`
-	Cloned      bool               `json:"cloned,omitempty"`
-	Initialized bool               `json:"initialized,omitempty"`
-	Checks      []ProjectCheckItem `json:"checks,omitempty"`
-	Verdict     string             `json:"verdict,omitempty"` // ok | warn | err
+	BaseBranch  string `json:"base_branch,omitempty"`
+	Cloned      bool   `json:"cloned,omitempty"`
+	Initialized bool   `json:"initialized,omitempty"`
+	// Attached — в папке уже был репозиторий этого же хоста: клона не было,
+	// проект привязан к нему.
+	Attached bool `json:"attached,omitempty"`
+	// Repo — в папке уже есть git-репозиторий (до задания). Переезд проекта
+	// на другую машину разрешён только в такую папку: заводить пустой
+	// репозиторий вместо перенесённого кода — не переезд, а потеря.
+	Repo bool `json:"repo,omitempty"`
+	// Branches — ветки найденного репозитория (локальные и origin): из них
+	// человек выбирает базовую, а BaseBranch у проверки — главная ветка
+	// репозитория, которая подставится, если он не выбрал сам.
+	Branches []string           `json:"branches,omitempty"`
+	Checks   []ProjectCheckItem `json:"checks,omitempty"`
+	Verdict  string             `json:"verdict,omitempty"` // ok | warn | err
 }

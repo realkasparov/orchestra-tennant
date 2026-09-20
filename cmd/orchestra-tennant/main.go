@@ -24,8 +24,10 @@ const usage = `orchestra-tennant — исполнитель тасок орке�
   setup     настроить: оркестратор, ключ подключения, модели, число заданий; самопроверки; служба
   run       работать (в терминале; служба вызывает то же самое)
   status    настроен ли, идёт ли служба, на связи ли демон
-  logs      показать журнал; logs -f — следить
-  service   install | uninstall — фоновая служба без повторной настройки
+  log       журнал: последние строки; log -f — следить;
+            log -project snake — только проект; log -project snake -task 2 [-f] — только таска
+  service   enable | disable — включить фоновую службу (запускается сама при входе в систему)
+            или выключить; настройка при этом не трогается
   update    обновиться до последнего релиза с GitHub (update -check — только проверить)
   version   версия
 
@@ -51,8 +53,8 @@ func main() {
 		err = cmdRun(args)
 	case "status":
 		err = cmdStatus(args)
-	case "logs":
-		err = cmdLogs(args)
+	case "log", "logs":
+		err = cmdLog(args)
 	case "service":
 		err = cmdService(args)
 	case "update":
