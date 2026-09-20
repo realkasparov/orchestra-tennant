@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/realkasparov/orchestra-tennant/agent"
@@ -58,16 +59,30 @@ func runChecks(ctx context.Context, cfg *Config, w io.Writer, modelCheck func(co
 	if len(cfg.Models) == 0 {
 		checks[2].Err = errors.New("не выбрано ни одной модели")
 	} else {
+		// Каждую модель спрашиваем настоящим запросом к claude — это самая
+		// долгая часть настройки, поэтому все модели опрашиваются разом.
+		fmt.Fprintf(w, "  … модели отвечают? спрашиваю %s — короткий запрос к claude по каждой, около 10 с\n", strings.Join(cfg.Models, ", "))
+		start := time.Now()
+		errs := make([]error, len(cfg.Models))
+		var wg sync.WaitGroup
+		for i, m := range cfg.Models {
+			wg.Add(1)
+			go func(i int, m string) {
+				defer wg.Done()
+				errs[i] = modelCheck(ctx, m)
+			}(i, m)
+		}
+		wg.Wait()
 		var failed []string
-		for _, m := range cfg.Models {
-			if err := modelCheck(ctx, m); err != nil {
-				failed = append(failed, m+": "+firstLine(err.Error()))
+		for i, m := range cfg.Models {
+			if errs[i] != nil {
+				failed = append(failed, m+": "+firstLine(errs[i].Error()))
 			}
 		}
 		if len(failed) > 0 {
 			checks[2].Err = errors.New(strings.Join(failed, "; ") + " — доставьте claude CLI и войдите в подписку (claude login)")
 		} else {
-			checks[2].Detail = strings.Join(cfg.Models, ", ")
+			checks[2].Detail = strings.Join(cfg.Models, ", ") + " · " + time.Since(start).Round(time.Second).String()
 		}
 	}
 
