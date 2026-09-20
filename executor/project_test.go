@@ -173,3 +173,35 @@ func TestProjectView(t *testing.T) {
 		t.Fatalf("папка не на main: %q", cur)
 	}
 }
+
+func TestCreateProjectAttachesExistingRepo(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "snake")
+	if err := gitops.InitRepo(dir, "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.Command("git", "-C", dir, "remote", "add", "origin", "git@gitlab.com:nov_aleks/snake-game.git").CombinedOutput(); err != nil {
+		t.Fatal(err)
+	}
+	repo := &protocol.ProjectRepo{HostURL: "https://gitlab.com", RepoPath: "nov_aleks/snake-game"}
+	// Проверка: тот же репозиторий — ok, клон не нужен.
+	chk := checkProject(dir, &protocol.ProjectSpec{Name: "snake", Dir: dir, Repo: repo})
+	if chk.Verdict != "ok" {
+		t.Fatalf("check verdict = %s: %+v", chk.Verdict, chk.Checks)
+	}
+	res := createProject(dir, &protocol.ProjectSpec{Name: "snake", Dir: dir, Repo: repo})
+	if !res.OK || !res.Attached || res.Cloned || res.BaseBranch != "main" {
+		t.Fatalf("attach: %+v", res)
+	}
+	// Другой репозиторий того же хоста — отказ и в проверке, и в создании.
+	other := &protocol.ProjectRepo{HostURL: "https://gitlab.com", RepoPath: "nov_aleks/other"}
+	if chk := checkProject(dir, &protocol.ProjectSpec{Name: "snake", Dir: dir, Repo: other}); chk.Verdict != "err" {
+		t.Fatalf("check other verdict = %s", chk.Verdict)
+	}
+	if res := createProject(dir, &protocol.ProjectSpec{Name: "snake", Dir: dir, Repo: other}); res.OK || !strings.Contains(res.Error, "другой репозиторий") {
+		t.Fatalf("other: %+v", res)
+	}
+	// Несуществующая ветка у привязки — отказ.
+	if res := createProject(dir, &protocol.ProjectSpec{Name: "snake", Dir: dir, Repo: repo, BaseBranch: "nope"}); res.OK {
+		t.Fatalf("branch nope accepted: %+v", res)
+	}
+}

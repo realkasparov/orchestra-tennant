@@ -211,9 +211,23 @@ func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResu
 		add("Базовая ветка", branch, "ok")
 	}
 	if spec.Repo != nil {
-		if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+		if res.Repo {
+			// Репозиторий уже на месте: если это тот же проект хоста, клон
+			// не нужен — проект привязывается к нему как есть.
+			if origin := gitops.OriginURL(path); gitops.SameRepo(origin, spec.Repo.HostURL, spec.Repo.RepoPath) {
+				if gitops.HasRef(path, branch) {
+					add("Папка", "Git-репозиторий уже связан с "+spec.Repo.RepoPath+" — клон не нужен, ветка «"+branch+"» на месте", "ok")
+				} else {
+					add("Папка", "Git-репозиторий уже связан с "+spec.Repo.RepoPath+", но ветки «"+branch+"» нет ни локально, ни в origin", "err")
+				}
+			} else if origin == "" {
+				add("Папка", "В папке репозиторий без origin — привязать к "+spec.Repo.RepoPath+" нельзя: добавьте origin или выберите другую папку", "err")
+			} else {
+				add("Папка", "В папке другой репозиторий (origin: "+origin+") — выберите другую папку", "err")
+			}
+		} else if fi, err := os.Stat(path); err == nil && fi.IsDir() {
 			if entries, _ := os.ReadDir(path); len(entries) > 0 {
-				add("Папка", "Папка непуста — клонировать в неё нельзя: "+path, "err")
+				add("Папка", "Папка непуста и не является git-репозиторием — клонировать в неё нельзя: "+path, "err")
 			} else {
 				add("Папка", "Пуста — репозиторий будет клонирован сюда: "+path, "ok")
 			}
@@ -262,6 +276,21 @@ func createProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectRes
 	if err := gitops.CheckRef(branch); err != nil {
 		res.Error = "недопустимая базовая ветка: " + branch
 		return res
+	}
+	if spec.Repo != nil && res.Repo {
+		// Репозиторий этого же хоста уже в папке (проект вёлся локально и
+		// на хосте): привязываем без клона, как существующий.
+		origin := gitops.OriginURL(path)
+		if !gitops.SameRepo(origin, spec.Repo.HostURL, spec.Repo.RepoPath) {
+			if origin == "" {
+				res.Error = "в папке репозиторий без origin — привязать к " + spec.Repo.RepoPath + " нельзя"
+			} else {
+				res.Error = "в папке другой репозиторий (origin: " + origin + ")"
+			}
+			return res
+		}
+		res.Attached = true
+		spec = &protocol.ProjectSpec{BaseBranch: spec.BaseBranch}
 	}
 	if spec.Repo != nil {
 		if err := gitops.CloneRepo(spec.Repo.HostURL, spec.Repo.Token, spec.Repo.RepoPath, path); err != nil {

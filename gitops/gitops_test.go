@@ -188,3 +188,23 @@ func TestDirtyFilesAndCheckout(t *testing.T) {
 		t.Fatalf("branch = %q, want %q", cur, base)
 	}
 }
+
+func TestSameRepo(t *testing.T) {
+	cases := []struct {
+		remote, host, path string
+		want               bool
+	}{
+		{"git@gitlab.com:nov_aleks/snake-game.git", "https://gitlab.com", "nov_aleks/snake-game", true},
+		{"https://gitlab.com/nov_aleks/snake-game.git", "https://gitlab.com/", "/nov_aleks/snake-game/", true},
+		{"ssh://git@gitlab.com:2222/nov_aleks/snake-game", "https://gitlab.com", "Nov_Aleks/Snake-Game", true},
+		{"https://oauth2:tok@gitlab.com/nov_aleks/snake-game.git", "https://gitlab.com", "nov_aleks/snake-game", true},
+		{"git@github.com:nov_aleks/snake-game.git", "https://gitlab.com", "nov_aleks/snake-game", false},
+		{"git@gitlab.com:nov_aleks/other.git", "https://gitlab.com", "nov_aleks/snake-game", false},
+		{"", "https://gitlab.com", "nov_aleks/snake-game", false},
+	}
+	for _, c := range cases {
+		if got := SameRepo(c.remote, c.host, c.path); got != c.want {
+			t.Errorf("SameRepo(%q, %q, %q) = %v, want %v", c.remote, c.host, c.path, got, c.want)
+		}
+	}
+}

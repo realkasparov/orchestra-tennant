@@ -309,6 +309,9 @@ type ProjectResult struct {
 	BaseBranch  string `json:"base_branch,omitempty"`
 	Cloned      bool   `json:"cloned,omitempty"`
 	Initialized bool   `json:"initialized,omitempty"`
+	// Attached — в папке уже был репозиторий этого же хоста: клона не было,
+	// проект привязан к нему.
+	Attached bool `json:"attached,omitempty"`
 	// Repo — в папке уже есть git-репозиторий (до задания). Переезд проекта
 	// на другую машину разрешён только в такую папку: заводить пустой
 	// репозиторий вместо перенесённого кода — не переезд, а потеря.

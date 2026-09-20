@@ -32,6 +32,48 @@ func HasRemote(repo, name string) bool {
 	return err == nil
 }
 
+// OriginURL — адрес remote origin; пусто, если origin не настроен.
+func OriginURL(repo string) string {
+	out, err := run(repo, "remote", "get-url", "origin")
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// SameRepo — указывает ли адрес remote на репозиторий repoPath хоста
+// hostURL: формы git@host:path.git, ssh://git@host/path и https://host/path
+// считаются одним репозиторием.
+func SameRepo(remote, hostURL, repoPath string) bool {
+	rh, rp := splitRemote(remote)
+	hh, _ := splitRemote(hostURL)
+	return rh != "" && rh == hh && rp == normRepoPath(repoPath)
+}
+
+func splitRemote(u string) (host, path string) {
+	u = strings.TrimSpace(u)
+	if i := strings.Index(u, "://"); i >= 0 {
+		u = u[i+3:]
+	} else if i := strings.Index(u, ":"); i >= 0 && !strings.Contains(u[:i], "/") {
+		// scp-форма git@host:path
+		u = u[:i] + "/" + u[i+1:]
+	}
+	if i := strings.Index(u, "@"); i >= 0 && (strings.Index(u, "/") < 0 || i < strings.Index(u, "/")) {
+		u = u[i+1:]
+	}
+	host, path, _ = strings.Cut(u, "/")
+	if i := strings.Index(host, ":"); i >= 0 {
+		host = host[:i] // порт не различает репозитории
+	}
+	return strings.ToLower(host), normRepoPath(path)
+}
+
+func normRepoPath(p string) string {
+	p = strings.Trim(strings.TrimSpace(p), "/")
+	p = strings.TrimSuffix(p, ".git")
+	return strings.ToLower(strings.Trim(p, "/"))
+}
+
 // FetchBase fetches the base branch from origin.
 func FetchBase(repo, baseBranch string) error {
 	if err := CheckRef(baseBranch); err != nil {
