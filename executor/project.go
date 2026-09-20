@@ -183,7 +183,7 @@ func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResu
 		res.Checks = append(res.Checks, protocol.ProjectCheckItem{Name: name, Detail: detail, Level: level})
 	}
 	if strings.TrimSpace(spec.Name) == "" {
-		add("Название проекта", "Не заполнено — подставится имя папки", "warn")
+		add("Название проекта", "Не заполнено — введите название", "err")
 	} else {
 		add("Название проекта", "Заполнено", "ok")
 	}
