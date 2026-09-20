@@ -95,8 +95,11 @@ func describeEvent(ev *protocol.Event) string {
 	case "tool_use":
 		return stage + "Инструмент " + str(p, "name") + ": " + oneLine(str(p, "summary"), 160)
 	case "tool_result":
-		if str(p, "summary") == "error" {
+		switch str(p, "summary") {
+		case "error":
 			return stage + "Инструмент завершился ошибкой"
+		case "interrupted":
+			return stage + "Инструмент прерван — пауза"
 		}
 		return ""
 	case "question":

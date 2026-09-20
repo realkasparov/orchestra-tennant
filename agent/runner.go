@@ -156,6 +156,12 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		if err := json.Unmarshal(line, &msg); err != nil {
 			continue
 		}
+		if ctx.Err() != nil {
+			// После SIGINT CLI отчитывается «инструмент отклонён» и «ошибка
+			// выполнения» — это пауза, а не провал: результат помечается
+			// прерванным, чтобы чат не показывал ошибку.
+			msg["_interrupted"] = true
+		}
 		handleLine(msg, res, &text, onEvent)
 	}
 	select {
@@ -230,6 +236,9 @@ func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent 
 				summary := "ok"
 				if isErr, _ := block["is_error"].(bool); isErr {
 					summary = "error"
+					if msg["_interrupted"] == true {
+						summary = "interrupted"
+					}
 				}
 				onEvent(StreamEvent{Type: "tool_result", Payload: map[string]any{
 					"summary": summary, "detail": truncate(string(detail), 20000),
