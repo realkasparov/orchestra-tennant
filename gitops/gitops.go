@@ -46,23 +46,46 @@ func OriginURL(repo string) string {
 // считаются одним репозиторием.
 func SameRepo(remote, hostURL, repoPath string) bool {
 	rh, rp := splitRemote(remote)
-	hh, _ := splitRemote(hostURL)
-	return rh != "" && rh == hh && rp == normRepoPath(repoPath)
+	// Хост может жить под подпутём (https://example.com/gitlab): клон
+	// лежит по hostURL + repoPath, и сравнивать надо весь путь.
+	hh, hp := splitRemote(hostURL)
+	return rh != "" && rh == hh && rp == normRepoPath(hp+"/"+repoPath)
+}
+
+// RedactRemote — адрес remote без учётных данных: host/path. В сообщениях
+// об ошибках origin с токеном в URL показывать нельзя.
+func RedactRemote(remote string) string {
+	h, p := splitRemote(remote)
+	if h == "" {
+		return remote
+	}
+	return h + "/" + p
 }
 
 func splitRemote(u string) (host, path string) {
 	u = strings.TrimSpace(u)
 	if i := strings.Index(u, "://"); i >= 0 {
 		u = u[i+3:]
-	} else if i := strings.Index(u, ":"); i >= 0 && !strings.Contains(u[:i], "/") {
-		// scp-форма git@host:path
-		u = u[:i] + "/" + u[i+1:]
+	} else {
+		// scp-форма git@host:path; у IPv6 в скобках разделитель — «]:».
+		sep := strings.Index(u, ":")
+		if j := strings.Index(u, "]:"); j >= 0 {
+			sep = j + 1
+		}
+		if sep >= 0 && !strings.Contains(u[:sep], "/") {
+			u = u[:sep] + "/" + u[sep+1:]
+		}
 	}
 	if i := strings.Index(u, "@"); i >= 0 && (strings.Index(u, "/") < 0 || i < strings.Index(u, "/")) {
 		u = u[i+1:]
 	}
 	host, path, _ = strings.Cut(u, "/")
-	if i := strings.Index(host, ":"); i >= 0 {
+	if strings.HasPrefix(host, "[") {
+		// IPv6 в скобках: порт отрезается после «]»
+		if j := strings.Index(host, "]"); j >= 0 {
+			host = host[:j+1]
+		}
+	} else if i := strings.Index(host, ":"); i >= 0 {
 		host = host[:i] // порт не различает репозитории
 	}
 	return strings.ToLower(host), normRepoPath(path)

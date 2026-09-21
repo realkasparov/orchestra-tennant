@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -156,10 +157,11 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		if err := json.Unmarshal(line, &msg); err != nil {
 			continue
 		}
-		if ctx.Err() != nil {
-			// После SIGINT CLI отчитывается «инструмент отклонён» и «ошибка
-			// выполнения» — это пауза, а не провал: результат помечается
-			// прерванным, чтобы чат не показывал ошибку.
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// После SIGINT по паузе CLI отчитывается «инструмент отклонён» и
+			// «ошибка выполнения» — это не провал: результат помечается
+			// прерванным, чтобы чат не показывал ошибку. Лимит времени этапа
+			// (DeadlineExceeded) — провал, и помечать его нечем.
 			msg["_interrupted"] = true
 		}
 		handleLine(msg, res, &text, onEvent)
