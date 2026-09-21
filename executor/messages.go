@@ -233,6 +233,15 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 		AllowedTools: []string{"Read", "Glob", "Grep", "Task", "WebFetch"}, // только чтение
 	}, func(ev agent.StreamEvent) { r.job.Emit("answer", ev.Type, ev.Payload) })
 	r.recordUsage(st, res)
+	if ctx.Err() != nil {
+		// Пауза посреди ответа — не ошибка: этап остаётся на паузе, ответ
+		// дадут заново при возобновлении.
+		r.log("answer", "Ответ прерван: таска на паузе.")
+		st.Status = "paused"
+		r.emitStage(st, "paused")
+		r.job.SaveState()
+		return
+	}
 	if err != nil || res == nil {
 		msg := "не удалось получить ответ"
 		if err != nil {
