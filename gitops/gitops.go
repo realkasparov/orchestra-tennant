@@ -445,3 +445,22 @@ func ChangedFiles(dir, from, to string) ([]string, error) {
 	}
 	return files, nil
 }
+
+// RevParse — SHA по имени ссылки (ветка, тег, HEAD).
+func RevParse(dir, ref string) (string, error) { return run(dir, "rev-parse", "--verify", ref+"^{commit}") }
+
+// CountCommits — сколько коммитов в ref сверх base.
+func CountCommits(dir, base, ref string) (int, error) {
+	out, err := run(dir, "rev-list", "--count", base+".."+ref)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, ch := range strings.TrimSpace(out) {
+		if ch < '0' || ch > '9' {
+			return 0, fmt.Errorf("rev-list: %q", out)
+		}
+		n = n*10 + int(ch-'0')
+	}
+	return n, nil
+}

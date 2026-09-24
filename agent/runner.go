@@ -36,6 +36,9 @@ type RunOpts struct {
 	// MCPConfig — JSON конфигурации MCP-серверов (--mcp-config). Пусто —
 	// внешние инструменты не подключаются.
 	MCPConfig string
+	// Markers — маркеры скилла (с двоеточием, как `RESULT:`): вырезаются из
+	// текста для чата вместе со встроенными.
+	Markers []string
 }
 
 // StreamEvent is one normalized event for the UI log.
@@ -164,7 +167,7 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 			// (DeadlineExceeded) — провал, и помечать его нечем.
 			msg["_interrupted"] = true
 		}
-		handleLine(msg, res, &text, onEvent)
+		handleLine(msg, res, &text, onEvent, opts.Markers)
 	}
 	select {
 	case <-stderrDone:
@@ -195,7 +198,7 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 	return res, nil
 }
 
-func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent func(StreamEvent)) {
+func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent func(StreamEvent), markers []string) {
 	switch msg["type"] {
 	case "system":
 		if msg["subtype"] == "init" {
@@ -217,7 +220,7 @@ func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent 
 				text.WriteString(t + "\n")
 				// В чат — без служебных маркеров (их читает оркестратор из
 				// полного текста выше).
-				if shown := StripMarkers(t); shown != "" {
+				if shown := StripMarkers(t, markers...); shown != "" {
 					onEvent(StreamEvent{Type: "agent_text", Payload: map[string]any{"text": shown}})
 				}
 			case "tool_use":

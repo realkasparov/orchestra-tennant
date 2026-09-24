@@ -1,0 +1,19 @@
+name: plan-review
+title: Ревью плана
+version: 1
+inputs:
+  PASS_NUMBER: { type: text, required: true,  desc: Номер прогона }
+  SCOPE:       { type: text, required: false, desc: Пусто — полная проверка, иначе указание дельта-режима }
+context: [plan, files]
+cwd: worktree
+tools: [Read, Write, Edit, Glob, Grep, Task, WebFetch]
+resumable: true
+outputs:
+  artifacts:
+    - { name: step03-refined-plan.md, title: План (после ревью), type: markdown }
+  markers:
+    PLAN_REVIEW: { type: enum, values: [clean, revised] }
+    PLAN_RESULT: { type: enum, values: [code, no-code] }
+checks:
+  - artifact_exists: step03-refined-plan.md
+model_preference: [sonnet, opus, fable51, fable, haiku]

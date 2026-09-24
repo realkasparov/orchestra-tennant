@@ -99,6 +99,60 @@ func (c *changeRequest) arm(cancel context.CancelFunc) {
 	c.mu.Unlock()
 }
 
+// clarifyRequest — уточнение человека к идущему агентному шагу: прогон
+// прерывается (если скилл умеет продолжать), и та же сессия получает текст
+// уточнения. Новый раунд при этом не заводится — сделанное остаётся.
+type clarifyRequest struct {
+	mu     sync.Mutex
+	text   string
+	cancel context.CancelFunc // прерывает текущий прогон агента
+	// interrupts — скилл объявил resumable: прогон можно прервать; иначе
+	// уточнение ждёт конца прогона.
+	interrupts bool
+	// active — идёт прогон агента: уточнение имеет смысл; иначе сообщение
+	// разбирается как к стоящей таске.
+	active bool
+}
+
+// arm запоминает, как прервать текущий прогон; nil — прогона нет.
+func (c *clarifyRequest) arm(cancel context.CancelFunc, interrupts bool) {
+	c.mu.Lock()
+	c.cancel, c.interrupts, c.active = cancel, interrupts, cancel != nil
+	c.mu.Unlock()
+}
+
+// running — идёт ли сейчас прогон агента.
+func (c *clarifyRequest) running() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.active
+}
+
+// request принимает уточнение: дописывает к ожидающему и прерывает прогон,
+// если скилл умеет продолжить.
+func (c *clarifyRequest) request(text string) {
+	c.mu.Lock()
+	if c.text != "" {
+		c.text += "\n\n" + text
+	} else {
+		c.text = text
+	}
+	cancel, interrupts := c.cancel, c.interrupts
+	c.mu.Unlock()
+	if cancel != nil && interrupts {
+		cancel()
+	}
+}
+
+// take отдаёт накопленное уточнение и очищает его.
+func (c *clarifyRequest) take() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.text
+	c.text = ""
+	return t
+}
+
 // question — вопрос, дождавшийся своей очереди: состояние таски одно, и
 // править его из двух горутин нельзя. Ответ даёт цикл этапов на границе
 // этапа или в ожидании; сюда попадают только распознанные вопросы.
@@ -116,6 +170,14 @@ func (r *run) serveMessages(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case m := <-r.job.Messages():
+			if r.clar.running() {
+				// Идёт агентный шаг: сообщение — уточнение к нему, без
+				// триажа и без нового раунда.
+				r.job.Emit("", "user_message", map[string]any{"text": m.Text})
+				r.clar.request(m.Text)
+				r.log("", "Уточнение принято — передаю агенту в текущую сессию.")
+				continue
+			}
 			mode, pending := r.classify(ctx, m.Text, m.Mode)
 			if mode == "question" {
 				select {
@@ -219,18 +281,30 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 		"по-человечески, по существу, без служебных маркеров и без изменения кода. " +
 		"Опирайся на артефакты задачи (" + r.st.TaskDir + ": task.md, step*.md) и код ветки " + r.st.BranchName + ".\n\n" +
 		"Вопрос пользователя:\n" + text
-	actx, acancel := context.WithTimeout(ctx, r.plan.StageTimeout.Duration())
-	defer acancel()
 	model, effort := "fable", ""
-	if def := r.plan.Stage("answer"); def != nil {
-		model, effort = def.Model, def.Effort
-	} else if def := r.plan.Stage("execute"); def != nil {
+	tools := []string{"Read", "Glob", "Grep", "Task", "WebFetch"} // только чтение
+	if qa := r.plan.QA; qa != nil {
+		// Скилл ответа из плана: промпт по его привязкам и манифесту.
+		model, effort = qa.Model, qa.Effort
+		r.question = text
+		if m := r.manifest(qa.Skill); m != nil {
+			if p, err := r.buildPrompt(qa, m); err == nil {
+				prompt = p
+			}
+			if len(m.Tools) > 0 {
+				tools = m.Tools
+			}
+		}
+		r.question = ""
+	} else if def := r.plan.Step("execute"); def != nil && def.Model != "" {
 		model, effort = def.Model, def.Effort
 	}
+	actx, acancel := context.WithTimeout(ctx, r.plan.StageTimeout.Duration())
+	defer acancel()
 	res, err := agent.Run(actx, agent.RunOpts{
 		Prompt: prompt, Model: agent.ModelID(model), Effort: effort,
 		CWD: cwd, AddDirs: []string{r.st.TaskDir},
-		AllowedTools: []string{"Read", "Glob", "Grep", "Task", "WebFetch"}, // только чтение
+		AllowedTools: tools,
 	}, func(ev agent.StreamEvent) { r.job.Emit("answer", ev.Type, ev.Payload) })
 	r.recordUsage(st, res)
 	if ctx.Err() != nil {
@@ -264,6 +338,7 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 // дойдёт, — заводить его отсюда значило бы гонку с идущим этапом.
 func (r *run) requestChange(text string, pending protocol.Usage) {
 	path := filepath.Join(r.st.TaskDir, "user-feedback.md")
+	r.st.Feedback = strings.TrimSpace(text)
 	entry := "\n## Правка от пользователя\n" + strings.TrimSpace(text) + "\n"
 	// Повторный разбор (раунд не завёлся, задание возобновили) не дублирует
 	// запись, которая уже стоит последней.
@@ -278,21 +353,68 @@ func (r *run) requestChange(text string, pending protocol.Usage) {
 	}
 	r.change.addUsage(pending)
 	if r.change.request() {
-		r.log("", "Правка принята — текущий этап прерван, начинаю новый раунд с «Анализа задачи».")
+		r.log("", "Правка принята — текущий этап прерван, начинаю новый раунд с шага «"+r.reworkTitle()+"».")
 	}
 }
 
-// startChangeRound заводит новый раунд: все этапы плана, кроме импорта.
-// База раунда — текущий HEAD, иначе пустой раунд прошёл бы проверку.
-// Незакоммиченные изменения в рабочей копии — отказ до первого этапа:
-// иначе они всплыли бы после выполнения, когда анализ уже оплачен.
-func (r *run) startChangeRound() error {
+// reworkTitle — заголовок шага, с которого начинается раунд правки.
+func (r *run) reworkTitle() string {
+	if s := r.plan.Step(r.pipe().ReworkKey()); s != nil {
+		return s.Title
+	}
+	return r.pipe().ReworkKey()
+}
+
+// reworkKeys — шаги раунда правки: от шага rework до конца, без финиша.
+func (r *run) reworkKeys() []string {
+	pipe := r.pipe()
+	rework := pipe.ReworkKey()
 	var keys []string
-	for _, s := range r.plan.Stages {
-		if s.Key != "import" {
-			keys = append(keys, s.Key)
+	started := rework == ""
+	for _, s := range r.plan.Steps {
+		if s.Key == rework {
+			started = true
+		}
+		if !started || s.Kind == protocol.KindFinish || strings.HasPrefix(s.Kind, "start.") {
+			continue
+		}
+		keys = append(keys, s.Key)
+	}
+	return keys
+}
+
+// roundArtifacts — файлы, которые пишут скиллы шагов раунда правки: их и
+// уносим в папку прошлого раунда.
+func (r *run) roundArtifacts(keys []string) []string {
+	var names []string
+	seen := map[string]bool{}
+	for _, k := range keys {
+		s := r.plan.Step(k)
+		if s == nil || s.Skill == "" {
+			continue
+		}
+		m := r.manifest(s.Skill)
+		if m == nil {
+			continue
+		}
+		for _, a := range m.Outputs.Artifacts {
+			if !seen[a.Name] {
+				seen[a.Name] = true
+				names = append(names, a.Name)
+			}
 		}
 	}
+	if len(names) == 0 {
+		names = []string{"step02-analyze.md", "step03-refined-plan.md", "step04-execution.md", "step05-review.md", "step06-handoff.md"}
+	}
+	return names
+}
+
+// startChangeRound заводит новый раунд с шага rework. База раунда — текущий
+// HEAD, иначе пустой раунд прошёл бы проверку. Незакоммиченные изменения в
+// рабочей копии — отказ до первого этапа.
+func (r *run) startChangeRound() error {
+	keys := r.reworkKeys()
 	if len(keys) == 0 {
 		return nil
 	}
@@ -308,10 +430,11 @@ func (r *run) startChangeRound() error {
 	// Артефакты прошлого раунда — в его папку: этапы нового раунда должны
 	// видеть свои step-файлы, а не прошлогодний план. Не перенеслись —
 	// раунд не начинается: иначе выполнение взяло бы прошлый план.
-	if err := archiveRound(r.st.TaskDir, r.st.round()); err != nil {
+	if err := archiveRound(r.st.TaskDir, r.st.round(), r.roundArtifacts(keys)); err != nil {
 		return fmt.Errorf("перенос артефактов прошлого раунда: %w", err)
 	}
 	round := r.st.addRound(keys)
+	r.markDisabled()
 	if r.st.WorktreeDir != "" {
 		if head, err := gitops.HeadSHA(r.st.WorktreeDir); err == nil {
 			r.st.RoundBase = head
@@ -327,7 +450,7 @@ func (r *run) startChangeRound() error {
 			st.Usage = st.Usage.Add(u)
 		}
 	}
-	r.log("", fmt.Sprintf("Правка принята — раунд %d: продолжаю с этапа «Анализ задачи».", round))
+	r.log("", fmt.Sprintf("Правка принята — раунд %d: продолжаю с шага «%s».", round, r.reworkTitle()))
 	r.job.SaveState()
 	return nil
 }

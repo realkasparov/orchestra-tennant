@@ -257,6 +257,11 @@ func (j *Job) Messages() <-chan *protocol.Message { return j.messages }
 // или после остановки по бюджету.
 func (j *Job) Continue() <-chan protocol.Continue { return j.cont }
 
+// FetchSkill — скилл по хэшу от оркестратора.
+func (j *Job) FetchSkill(ctx context.Context, hash string) (*protocol.SkillFile, error) {
+	return j.ex.FetchSkill(ctx, hash)
+}
+
 // SaveState записывает состояние таски в журнал.
 func (j *Job) SaveState() {
 	j.mu.Lock()

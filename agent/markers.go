@@ -44,14 +44,19 @@ var markerPrefixes = []string{
 
 // StripMarkers removes marker lines from a chunk of assistant text and trims
 // the blank lines they leave behind. Returns "" if nothing human-readable is
-// left (such a chunk is not worth showing at all).
-func StripMarkers(text string) string {
+// left (such a chunk is not worth showing at all). extra — маркеры манифеста
+// скилла сверх встроенных.
+func StripMarkers(text string, extra ...string) string {
 	lines := strings.Split(text, "\n")
 	kept := make([]string, 0, len(lines))
+	prefixes := markerPrefixes
+	if len(extra) > 0 {
+		prefixes = append(append([]string(nil), markerPrefixes...), extra...)
+	}
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		isMarker := false
-		for _, p := range markerPrefixes {
+		for _, p := range prefixes {
 			if strings.HasPrefix(trimmed, p) {
 				isMarker = true
 				break

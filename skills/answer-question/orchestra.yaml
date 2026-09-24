@@ -1,0 +1,9 @@
+name: answer-question
+title: Ответ на вопрос к готовой таске
+version: 1
+inputs:
+  QUESTION: { type: text,    required: true }
+  BRANCH:   { type: git_ref, required: false, desc: Ветка таски, чей код можно читать }
+cwd: worktree
+tools: [Read, Glob, Grep, Task, WebFetch]
+model_preference: [fable51, fable, opus, sonnet, haiku]

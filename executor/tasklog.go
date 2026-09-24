@@ -19,13 +19,23 @@ func TaskLogPrefix(project string, taskID int64) string {
 	return fmt.Sprintf("Project %s · Task %d · ", project, taskID)
 }
 
+// stageTitles — запасные названия: у плана схемы 2 заголовки шагов свои.
 var stageTitles = map[string]string{
 	"import": "Импорт задачи", "analyze": "Анализ задачи", "decompose": "Декомпозиция",
 	"err_work": "Работа над ошибками", "branch": "Создание ветки", "execute": "Выполнение",
-	"review": "Ревью", "handoff": "Инструкция по проверке", "answer": "Ответ на запрос",
+	"test_gate": "Тест-гейт", "review": "Ревью", "handoff": "Инструкция по проверке", "answer": "Ответ на запрос",
 }
 
-func stageTitle(key string) string {
+// stageTitle — заголовок шага по плану, иначе запасной по ключу.
+func stageTitle(plan *protocol.Plan, key string) string {
+	if plan != nil {
+		if s := plan.Step(key); s != nil && s.Title != "" {
+			return s.Title
+		}
+		if plan.QA != nil && plan.QA.Key == key {
+			return plan.QA.Title
+		}
+	}
 	if t, ok := stageTitles[key]; ok {
 		return t
 	}
@@ -65,11 +75,11 @@ func str(m map[string]any, key string) string {
 
 // describeEvent — событие таски одной строкой; пусто — событие в журнале
 // не нужно (шум вроде результатов инструментов).
-func describeEvent(ev *protocol.Event) string {
+func describeEvent(plan *protocol.Plan, ev *protocol.Event) string {
 	p := ev.Payload
 	stage := ""
 	if ev.Stage != "" {
-		stage = stageTitle(ev.Stage) + ": "
+		stage = stageTitle(plan, ev.Stage) + ": "
 	}
 	switch ev.Type {
 	case "task_status":
@@ -89,7 +99,7 @@ func describeEvent(ev *protocol.Event) string {
 		} else if r, ok := p["round"].(int); ok && r > 1 {
 			round = fmt.Sprintf(" (раунд %d)", r)
 		}
-		return fmt.Sprintf("Этап «%s»%s — %s", stageTitle(str(p, "key")), round, statusTitle(st))
+		return fmt.Sprintf("Этап «%s»%s — %s", stageTitle(plan, str(p, "key")), round, statusTitle(st))
 	case "agent_text":
 		return stage + "Агент: " + oneLine(str(p, "text"), 200)
 	case "tool_use":
@@ -131,7 +141,7 @@ func (e *Executor) taskLog(j *Job, ev *protocol.Event) {
 	if j == nil || j.Plan == nil {
 		return
 	}
-	line := describeEvent(ev)
+	line := describeEvent(j.Plan, ev)
 	if line == "" {
 		return
 	}

@@ -3,15 +3,35 @@ package executor
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/realkasparov/orchestra-tennant/gitops"
 	"testing"
 
+	tennant "github.com/realkasparov/orchestra-tennant"
+	"github.com/realkasparov/orchestra-tennant/gitops"
 	"github.com/realkasparov/orchestra-tennant/protocol"
 )
+
+// testManifests — манифесты встроенных скиллов из бинаря.
+func testManifests(t *testing.T) map[string]*protocol.Manifest {
+	t.Helper()
+	out := map[string]*protocol.Manifest{}
+	for _, name := range protocol.BuiltinSkills {
+		raw, err := fs.ReadFile(tennant.Skills, "skills/"+name+"/orchestra.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := protocol.ParseManifest(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		out[name] = m
+	}
+	return out
+}
 
 // testRun — прогон над заглушкой исполнителя: события копятся в памяти.
 func testRun(t *testing.T, plan *protocol.Plan) (*run, *[]protocol.Event) {
@@ -25,7 +45,8 @@ func testRun(t *testing.T, plan *protocol.Plan) (*run, *[]protocol.Event) {
 		cont: make(chan protocol.Continue, 1), answers: make(chan *protocol.Answer, 8)}
 	// Перехват отправки: соединения нет, и события остаются в pending; читаем
 	// оттуда.
-	r := &run{p: &Pipeline{DataDir: t.TempDir()}, job: j, plan: plan, st: j.State}
+	r := &run{p: &Pipeline{DataDir: t.TempDir()}, job: j, plan: plan, st: j.State,
+		questions: make(chan question, 8), manifests: testManifests(t)}
 	return r, &events
 }
 
@@ -35,10 +56,13 @@ func pending(j *Job) []*protocol.Event {
 	return append([]*protocol.Event(nil), j.pending...)
 }
 
+// fullPlan — план схемы 2 по базовому пайплайну с импортом, как его собрал
+// бы оркестратор из прежних настроек.
 func fullPlan() *protocol.Plan {
-	return &protocol.Plan{
-		SchemaVersion: protocol.SchemaVersion, TaskID: 7, Title: "Змейка", Prompt: "сделай",
-		Project: protocol.Project{ID: 1, Name: "demo", Path: "/repo", BaseBranch: "main"},
+	p := &protocol.Plan{
+		SchemaVersion: 1, TaskID: 7, Title: "Змейка", Prompt: "сделай",
+		SourceURL: "https://gitlab.example/g/p/-/issues/1",
+		Project:   protocol.Project{ID: 1, Name: "demo", Path: "/repo", BaseBranch: "main"},
 		Stages: []protocol.Stage{
 			{Key: "import", Skill: "import-gitlab", Model: "claude-haiku-4-5-20251001", Effort: "low"},
 			{Key: "analyze", Skill: "analyze-task", Model: "claude-fable-5", Effort: "high"},
@@ -50,6 +74,14 @@ func fullPlan() *protocol.Plan {
 		},
 		Continuity: "per_stage", Workspace: "worktree", StageTimeout: protocol.Seconds(1800),
 	}
+	hashes := map[string]string{}
+	for _, n := range protocol.BuiltinSkills {
+		hashes[n] = "h-" + n
+	}
+	if err := p.Upgrade(hashes); err != nil {
+		panic(err)
+	}
+	return p
 }
 
 // Бюджет: до лимита — тихо; на лимите — errBudget; после ack — снова тихо.
@@ -77,29 +109,83 @@ func TestCheckBudget(t *testing.T) {
 	}
 }
 
-// Вердикт no-code пропускает execute/review последнего раунда; code возвращает.
-func TestApplyPlanResult(t *testing.T) {
+// Реакция на маркер: PLAN_RESULT: no-code пропускает execute/review
+// последнего раунда; недопустимое значение enum — ошибка; выключенный
+// (Disabled) шаг сразу skipped.
+func TestApplyMarkers(t *testing.T) {
 	r, _ := testRun(t, fullPlan())
 	r.st.addRound(r.stageKeys())
-	r.applyPlanResult("no-code")
+	r.markDisabled()
+	if r.st.stage("handoff").Status != "skipped" || r.st.stage("test_gate").Status != "pending" {
+		t.Fatalf("выключенные шаги: handoff=%s test_gate=%s", r.st.stage("handoff").Status, r.st.stage("test_gate").Status)
+	}
+	def := r.plan.Step("analyze")
+	m := r.manifest("analyze-task")
+	if _, err := r.applyMarkers(def, m, "план готов\nPLAN_RESULT: maybe\n"); err == nil {
+		t.Fatal("недопустимое значение enum принято")
+	}
+	stop, err := r.applyMarkers(def, m, "BRANCH_DESCRIPTION: Add Health Endpoint!\nPLAN_RESULT: no-code\n")
+	if err != nil || stop {
+		t.Fatalf("маркеры: %v %v", err, stop)
+	}
 	if r.st.stage("execute").Status != "skipped" || r.st.stage("review").Status != "skipped" {
 		t.Fatalf("no-code не пропустил этапы: %+v", r.st.Stages)
 	}
-	r.applyPlanResult("code")
-	if r.st.stage("execute").Status != "pending" || r.st.stage("review").Status != "pending" {
-		t.Fatalf("code не вернул этапы: %+v", r.st.Stages)
+	if r.st.BranchSlug != "add-health-endpoint" || r.st.output("analyze", "PLAN_RESULT") != "no-code" {
+		t.Errorf("emit/выходы: slug=%q out=%q", r.st.BranchSlug, r.st.output("analyze", "PLAN_RESULT"))
 	}
 	// Второй раунд: пропуск касается только последнего раунда.
 	r.st.addRound([]string{"analyze", "execute", "review"})
-	r.applyPlanResult("no-code")
-	first := r.st.Stages[0:7]
-	for _, st := range first {
-		if st.Key == "execute" && st.Status == "skipped" {
-			t.Fatal("пропуск задел прошлый раунд")
+	if _, err := r.applyMarkers(def, m, "PLAN_RESULT: no-code"); err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range r.st.Stages {
+		if st.Round == 1 && st.Key == "execute" && st.Status != "skipped" {
+			t.Fatal("статус прошлого раунда изменён")
 		}
 	}
 	if r.st.stage("execute").Round != 2 || r.st.stage("execute").Status != "skipped" {
 		t.Fatalf("последний раунд не пропущен: %+v", r.st.stage("execute"))
+	}
+	// stop_passes у ревью плана.
+	ew := r.plan.Step("err_work")
+	if stop, err := r.applyMarkers(ew, r.manifest("plan-review"), "PLAN_REVIEW: clean"); err != nil || !stop {
+		t.Errorf("clean не остановил прогоны: %v %v", err, stop)
+	}
+}
+
+// Промпт собирается из привязок в порядке манифеста: короткие входы
+// строками, многострочные секциями, контекст в конце; необязательные
+// пустые входы опускаются.
+func TestBuildPrompt(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	r.plan.Prompt = "сделай\nзмейку"
+	r.plan.Project.Stack = "go"
+	def := r.plan.Step("analyze")
+	prompt, err := r.buildPrompt(def, r.manifest("analyze-task"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := strings.SplitN(prompt, "\n\n", 2)[0]
+	for _, want := range []string{"Use the analyze-task skill.", "TASK_DIR: " + r.st.TaskDir, "DECOMPOSE: yes", "REVISION: no", "PROJECT_STACK: go"} {
+		if !strings.Contains(head, want) {
+			t.Errorf("в шапке нет %q:\n%s", want, head)
+		}
+	}
+	if strings.Contains(head, "PROJECT_DESCRIPTION") || strings.Contains(head, "PREVIOUS_ROUND") {
+		t.Errorf("пустые необязательные входы попали в промпт:\n%s", head)
+	}
+	if !strings.Contains(prompt, "\n\nTASK_TEXT:\nсделай\nзмейку") {
+		t.Errorf("многострочный вход не секцией:\n%s", prompt)
+	}
+	ex := r.plan.Step("execute")
+	r.st.Reference, r.st.BaseCommit, r.st.BranchSlug = "task-7", "abc", "add-health"
+	prompt, err = r.buildPrompt(ex, r.manifest("execute-plan"))
+	if err != nil || !strings.Contains(prompt, "REFERENCE: task-7\nTITLE: Add health\nBASE: abc") {
+		t.Errorf("execute: %v\n%s", err, prompt)
+	}
+	if _, err := r.resolve("$steps.nope.x", nil, ""); err != nil {
+		t.Errorf("неизвестный выход должен давать пусто, не ошибку: %v", err)
 	}
 }
 
@@ -159,8 +245,9 @@ func TestRefValidation(t *testing.T) {
 // Этапы с недоверенным содержимым получают список без Bash в per_stage; в
 // non_stop — без ограничений.
 func TestAllowedToolsScoping(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
 	for _, key := range []string{"analyze", "err_work"} {
-		tools := toolsFor("per_stage", key)
+		tools := r.specFor(r.plan.Step(key)).tools
 		if len(tools) == 0 {
 			t.Errorf("%s: ожидался ограниченный список", key)
 		}
@@ -169,14 +256,18 @@ func TestAllowedToolsScoping(t *testing.T) {
 				t.Errorf("%s: Bash в списке", key)
 			}
 		}
-		if toolsFor("non_stop", key) != nil {
-			t.Errorf("%s в non_stop: ожидалось без ограничений", key)
-		}
 	}
-	for _, key := range []string{"import", "execute", "review"} {
-		if toolsFor("per_stage", key) != nil {
+	for _, key := range []string{"execute", "review"} {
+		if r.specFor(r.plan.Step(key)).tools != nil {
 			t.Errorf("%s: ожидалось без ограничений", key)
 		}
+	}
+	r.plan.Continuity = "non_stop"
+	if r.specFor(r.plan.Step("analyze")).tools != nil {
+		t.Error("в non_stop ожидалось без ограничений")
+	}
+	if sp := r.specFor(r.plan.Step("analyze")); !sp.search || !sp.resume || len(sp.markers) != 3 {
+		t.Errorf("spec анализа: %+v", sp)
 	}
 	if got := withTools([]string{"Read"}, []string{"mcp"}); len(got) != 2 {
 		t.Errorf("withTools = %v", got)

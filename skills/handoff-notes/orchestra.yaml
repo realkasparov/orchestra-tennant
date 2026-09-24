@@ -1,0 +1,19 @@
+name: handoff-notes
+title: Инструкция по проверке
+version: 1
+inputs:
+  REFERENCE:    { type: text,    required: true }
+  BRANCH:       { type: git_ref, required: true }
+  BASE_COMMIT:  { type: git_ref, required: true }
+  WORKSPACE:    { type: enum,    required: true, desc: folder | worktree }
+  WORKTREE_DIR: { type: path,    required: true }
+  TEST_CMD:     { type: text,    required: false }
+cwd: worktree
+tools: unrestricted
+resumable: true
+outputs:
+  artifacts:
+    - { name: step06-handoff.md, title: Как проверить, type: markdown }
+checks:
+  - artifact_exists: step06-handoff.md
+model_preference: [sonnet, haiku, opus, fable51, fable]

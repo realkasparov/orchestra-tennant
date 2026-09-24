@@ -14,7 +14,7 @@ func TestResultUsage(t *testing.T) {
 			"cache_creation_input_tokens": float64(18951),
 			"cache_read_input_tokens":     float64(194459),
 		},
-	}, res, nil, func(StreamEvent) {})
+	}, res, nil, func(StreamEvent) {}, nil)
 	if !res.GotResult {
 		t.Fatal("result event not seen")
 	}
@@ -28,7 +28,7 @@ func TestResultUsage(t *testing.T) {
 
 	// Без usage (обрыв, старый CLI) — нули, а не паника.
 	res2 := &Result{}
-	handleLine(map[string]any{"type": "result"}, res2, nil, func(StreamEvent) {})
+	handleLine(map[string]any{"type": "result"}, res2, nil, func(StreamEvent) {}, nil)
 	if res2.Usage != (Usage{}) {
 		t.Fatalf("expected zero usage, got %+v", res2.Usage)
 	}

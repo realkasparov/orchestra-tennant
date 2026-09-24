@@ -1,0 +1,26 @@
+name: analyze-task
+title: Анализ задачи
+version: 1
+inputs:
+  TASK_TEXT:           { type: text, required: true,  desc: Условие от человека (может быть пустым при импорте) }
+  DECOMPOSE:           { type: enum, required: true,  desc: yes | no — предлагать ли разбиение }
+  REVISION:            { type: enum, required: true,  desc: yes | no — повторный заход по правке }
+  PREVIOUS_ROUND:      { type: path, required: false, desc: Папка артефактов прошлого раунда }
+  PROJECT_STACK:       { type: text, required: false }
+  PROJECT_DESCRIPTION: { type: text, required: false }
+context: [repo_map]
+cwd: worktree
+tools: [Read, Write, Edit, Glob, Grep, Task, WebFetch]
+code_search: true
+questions: true
+resumable: true
+outputs:
+  artifacts:
+    - { name: step02-analyze.md, title: План (анализ), type: markdown }
+  markers:
+    BRANCH_DESCRIPTION: { type: text }
+    DECOMPOSE_RESULT:   { type: enum, values: [no-split] }
+    PLAN_RESULT:        { type: enum, values: [code, no-code] }
+checks:
+  - artifact_exists: step02-analyze.md
+model_preference: [fable51, fable, opus, sonnet, haiku]

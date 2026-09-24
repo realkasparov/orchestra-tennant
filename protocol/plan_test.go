@@ -7,9 +7,11 @@ import (
 	"testing"
 )
 
+// validPlan — план схемы 1: этапы, а не шаги. Схема 1 ещё принимается на
+// переходный релиз, и её проверки не должны сломаться.
 func validPlan() *Plan {
 	return &Plan{
-		SchemaVersion: SchemaVersion,
+		SchemaVersion: 1,
 		TaskID:        7,
 		Title:         "Игра «Змейка»",
 		Prompt:        "сделай змейку",
@@ -159,5 +161,58 @@ func TestNegotiateSchema(t *testing.T) {
 	// Пересечения нет — договориться нельзя, и это отказ, а не тихое согласие.
 	if _, err := NegotiateSchema(SchemaVersion+5, SchemaVersion+9); err == nil {
 		t.Error("непересекающиеся диапазоны сошлись")
+	}
+}
+
+// validPlanV2 — план схемы 2 по базовому пайплайну.
+func validPlanV2() *Plan {
+	p := validPlan()
+	hashes := map[string]string{}
+	for _, n := range BuiltinSkills {
+		hashes[n] = "h-" + n
+	}
+	if err := p.Upgrade(hashes); err != nil {
+		panic(err)
+	}
+	return p
+}
+
+func TestPlanV2RoundTrips(t *testing.T) {
+	p := validPlanV2()
+	raw, err := p.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.SchemaVersion != 2 || len(back.Steps) != len(p.Steps) || len(back.Skills) != len(p.Skills) {
+		t.Fatalf("план схемы 2 изменился при передаче: %+v", back)
+	}
+	if back.Step("execute").Bind["BASE"] != "$task.base_commit" {
+		t.Error("привязки потерялись")
+	}
+}
+
+func TestPlanV2Validation(t *testing.T) {
+	cases := []struct {
+		name string
+		fix  func(*Plan)
+		want string
+	}{
+		{"без шагов", func(p *Plan) { p.Steps = nil }, "ни одного шага"},
+		{"шаг без хэша", func(p *Plan) { p.Steps[1].SkillHash = "" }, "без хэша"},
+		{"без модели", func(p *Plan) { p.Steps[1].Model = "" }, "не указана модель"},
+		{"неизвестный род", func(p *Plan) { p.Steps[2].Kind = "action.deploy" }, "неизвестный род"},
+		{"ссылка вперёд", func(p *Plan) { p.Steps[1].Bind["X"] = "$steps.review.out" }, "нет раньше"},
+	}
+	for _, c := range cases {
+		p := validPlanV2()
+		c.fix(p)
+		err := p.Validate()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: получено %v, ждали %q", c.name, err, c.want)
+		}
 	}
 }

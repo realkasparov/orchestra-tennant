@@ -5,7 +5,7 @@ package tennant
 
 import "embed"
 
-// Skills — скиллы этапов: skills/<name>/SKILL.md.
+// Skills — скиллы этапов: skills/<name>/SKILL.md и orchestra.yaml.
 //
-//go:embed skills/*/SKILL.md
+//go:embed skills/*/SKILL.md skills/*/orchestra.yaml
 var Skills embed.FS

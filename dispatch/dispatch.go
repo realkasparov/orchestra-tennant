@@ -526,15 +526,24 @@ func (d *Dispatcher) MissingFor(deviceID int64, plan *protocol.Plan) []string {
 func (ex *executor) missing(plan *protocol.Plan) []string {
 	var out []string
 	seen := map[string]bool{}
+	model := func(m string) {
+		if m != "" && len(ex.models) > 0 && !ex.models[m] && !seen["model:"+m] {
+			seen["model:"+m] = true
+			out = append(out, "модель "+m)
+		}
+	}
 	for _, s := range plan.Stages {
 		// Этап без агента модели не несёт — и не требует её от машины.
-		if s.Model != "" && len(ex.models) > 0 && !ex.models[s.Model] && !seen["model:"+s.Model] {
-			seen["model:"+s.Model] = true
-			out = append(out, "модель "+s.Model)
-		}
+		model(s.Model)
 		if s.Skill != "" && len(ex.skills) > 0 && !ex.skills[s.Skill] && !seen["skill:"+s.Skill] {
 			seen["skill:"+s.Skill] = true
 			out = append(out, "скилл "+s.Skill)
+		}
+	}
+	// Схема 2: скилл отказом не считается — исполнитель докачает его.
+	for _, s := range plan.Steps {
+		if !s.Disabled {
+			model(s.Model)
 		}
 	}
 	return out

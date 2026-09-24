@@ -1,0 +1,16 @@
+name: import-gitlab
+title: Импорт задачи из GitLab
+version: 1
+inputs:
+  TASK_URL: { type: url, required: true, desc: Ссылка на задачу или work item GitLab }
+cwd: task_dir
+tools: unrestricted
+outputs:
+  artifacts:
+    - { name: step01-import.md, title: Импорт, type: markdown }
+  markers:
+    REFERENCE: { type: text }
+checks:
+  - artifact_exists: step01-import.md
+  - marker_present: REFERENCE
+model_preference: [haiku, sonnet, opus, fable51, fable]
