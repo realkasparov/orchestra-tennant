@@ -88,6 +88,10 @@ type Step struct {
 	Emit map[string]string `json:"emit,omitempty"`
 	// On — маркер → значение → реакция.
 	On map[string]map[string]Reaction `json:"on,omitempty"`
+	// Requires — шаги, без которых этот не имеет смысла: выключить их,
+	// оставив этот включённым, нельзя. Ссылки `$steps.*` в привязках
+	// считаются такими же зависимостями.
+	Requires []string `json:"requires,omitempty"`
 
 	// --- action.test_gate ---
 	// FixWith — агентный шаг, чьей сессией чинить упавшие тесты.
@@ -221,6 +225,12 @@ func (p *Pipeline) Validate(m Manifests) error {
 		for input, src := range s.Bind {
 			if err := checkRef(src, seen); err != nil {
 				return fmt.Errorf("шаг %q, вход %s: %w", s.Key, input, err)
+			}
+		}
+		for _, req := range s.Requires {
+			j, ok := seen[req]
+			if !ok || j >= i {
+				return fmt.Errorf("шаг %q: requires указывает на %q, которого нет раньше по списку", s.Key, req)
 			}
 		}
 		for marker, field := range s.Emit {
@@ -363,4 +373,29 @@ func ParseRef(src string) (scope, name, output string, ok bool) {
 		return "", "", "", false
 	}
 	return m[1], m[2], m[3], true
+}
+
+// Dependencies — шаги, от которых зависит step: явные requires и ссылки
+// `$steps.*` в привязках, без повторов.
+func (s *Step) Dependencies() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(k string) {
+		if k != "" && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for _, r := range s.Requires {
+		add(r)
+	}
+	for _, src := range s.Bind {
+		if scope, name, _, ok := ParseRef(src); ok && scope == "steps" {
+			add(name)
+		}
+	}
+	if s.FixWith != "" {
+		add(s.FixWith)
+	}
+	return out
 }
