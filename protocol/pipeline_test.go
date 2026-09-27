@@ -80,12 +80,12 @@ func TestParseManifest(t *testing.T) {
 
 func TestParseManifestErrors(t *testing.T) {
 	cases := map[string]string{
-		"inputs.X.type":  "name: a\nversion: 1\ninputs:\n  X: {type: number}\n",
-		"schema":         "name: a\nversion: 1\noutputs:\n  artifacts:\n    - {name: f.json, type: json}\n",
-		"неизвестное":    "name: a\nversion: 1\nbogus: 1\n",
-		"не объявлен":    "name: a\nversion: 1\nchecks:\n  - artifact_exists: x.md\n",
-		"has_commits":    "name: a\nversion: 1\noutputs:\n  markers:\n    R: {type: text}\nchecks:\n  - has_commits: {branch: R}\n",
-		"workspace":      "name: a\nversion: 1\nworkspace: shared\n",
+		"inputs.X.type": "name: a\nversion: 1\ninputs:\n  X: {type: number}\n",
+		"schema":        "name: a\nversion: 1\noutputs:\n  artifacts:\n    - {name: f.json, type: json}\n",
+		"неизвестное":   "name: a\nversion: 1\nbogus: 1\n",
+		"не объявлен":   "name: a\nversion: 1\nchecks:\n  - artifact_exists: x.md\n",
+		"has_commits":   "name: a\nversion: 1\noutputs:\n  markers:\n    R: {type: text}\nchecks:\n  - has_commits: {branch: R}\n",
+		"workspace":     "name: a\nversion: 1\nworkspace: shared\n",
 	}
 	for want, raw := range cases {
 		_, err := ParseManifest([]byte(raw))
@@ -138,9 +138,11 @@ func TestPipelineValidateErrors(t *testing.T) {
 		"дважды":            func(p *Pipeline) { p.Steps[0].Key = "solve" },
 		"не найден":         func(p *Pipeline) { p.Steps[1].Skill = "ghost" },
 		"несуществующий":    func(p *Pipeline) { p.Rework = "nope" },
-		"последующие":       func(p *Pipeline) { p.Steps[1].On = map[string]map[string]Reaction{"RESULT": {"done": {Skip: []string{"start"}}}} },
+		"последующие": func(p *Pipeline) {
+			p.Steps[1].On = map[string]map[string]Reaction{"RESULT": {"done": {Skip: []string{"start"}}}}
+		},
 		"не объявляет маркер": func(p *Pipeline) { p.Steps[1].Emit = map[string]string{"NOPE": "title"} },
-		"нельзя записать":   func(p *Pipeline) { p.Steps[1].Emit = map[string]string{"BRANCH": "prompt"} },
+		"нельзя записать":     func(p *Pipeline) { p.Steps[1].Emit = map[string]string{"BRANCH": "prompt"} },
 	}
 	for want, edit := range cases {
 		err := mk(edit).Validate(ms)

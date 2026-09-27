@@ -121,7 +121,7 @@ checks:
 	plan := &protocol.Plan{SchemaVersion: 2, TaskID: 9, Title: "t", Prompt: "x",
 		Project:    protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"},
 		Continuity: "non_stop", Workspace: "folder", StageTimeout: 60,
-		Skills:     []protocol.SkillRef{{Name: "solve-task", Hash: "h"}},
+		Skills: []protocol.SkillRef{{Name: "solve-task", Hash: "h"}},
 		Steps: []protocol.Step{
 			{Key: "start", Kind: protocol.KindStartTask, Title: "Условие"},
 			{Key: "solve", Kind: protocol.KindAgent, Title: "Решение", Skill: "solve-task", SkillHash: "h", Model: "claude-opus-5",

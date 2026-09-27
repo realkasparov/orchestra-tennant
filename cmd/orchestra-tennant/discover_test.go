@@ -12,3 +12,13 @@ func TestCliAtLeast(t *testing.T) {
 		}
 	}
 }
+
+func TestGatedModels(t *testing.T) {
+	// Версия ниже порога Opus 5.5, но выше порога Fable 5.1.
+	if !cliAtLeast("2.1.272 (Claude Code)", gatedModels[0].MinCLI) || cliAtLeast("2.1.272 (Claude Code)", gatedModels[1].MinCLI) {
+		t.Fatal("2.1.272: ожидалось fable51 да, opus55 нет")
+	}
+	if !cliAtLeast("2.1.280 (Claude Code)", gatedModels[1].MinCLI) {
+		t.Fatal("2.1.280: ожидалось opus55 да")
+	}
+}

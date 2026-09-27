@@ -447,7 +447,9 @@ func ChangedFiles(dir, from, to string) ([]string, error) {
 }
 
 // RevParse — SHA по имени ссылки (ветка, тег, HEAD).
-func RevParse(dir, ref string) (string, error) { return run(dir, "rev-parse", "--verify", ref+"^{commit}") }
+func RevParse(dir, ref string) (string, error) {
+	return run(dir, "rev-parse", "--verify", ref+"^{commit}")
+}
 
 // CountCommits — сколько коммитов в ref сверх base.
 func CountCommits(dir, base, ref string) (int, error) {
