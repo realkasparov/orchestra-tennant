@@ -270,7 +270,8 @@ func (r *rig) waitConnected() {
 
 func plan(taskID int64) *protocol.Plan {
 	return &protocol.Plan{
-		SchemaVersion: protocol.SchemaVersion, TaskID: taskID, Title: "таска",
+		// Схема 1: исполнитель переводит её в схему 2 при приёме.
+		SchemaVersion: 1, TaskID: taskID, Title: "таска",
 		Project:    protocol.Project{ID: 1, Name: "demo", Path: "/repo", BaseBranch: "main"},
 		Stages:     []protocol.Stage{{Key: "execute", Skill: "execute-plan", Model: "claude-opus-5", Effort: "high"}},
 		Continuity: "per_stage", Workspace: "worktree", StageTimeout: protocol.Seconds(1800),

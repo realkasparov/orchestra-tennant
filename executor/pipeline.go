@@ -15,9 +15,9 @@ import (
 	"github.com/realkasparov/orchestra-tennant/protocol"
 )
 
-// Pipeline — Runner: ведёт задание по этапам плана. Это перенесённый цикл
-// этапов оркестратора; вместо записи в базу — события, вместо чтения таски из
-// базы — план и собственное состояние.
+// Pipeline — Runner: ведёт задание по шагам плана. Движок не знает ключей
+// шагов: что делать, говорит род шага, что подставить в промпт — манифест
+// скилла и привязки плана, что проверить после прогона — проверки манифеста.
 type Pipeline struct {
 	// DataDir — папка данных исполнителя: здесь папки задач и индекс кода.
 	DataDir string
@@ -29,7 +29,9 @@ type Pipeline struct {
 	// это не нужно: индексы его машины ведёт оркестратор, у которого есть
 	// настройки проектов; демону — некому, кроме него самого.
 	EnsureIndex bool
-	Log         func(format string, args ...any)
+	// Skills — кэш скиллов по хэшу; nil — скиллы не выкладываются (тесты).
+	Skills *SkillCache
+	Log    func(format string, args ...any)
 }
 
 const continuationPrompt = "Сначала прочитай TASK_DIR/task.md — там текущее состояние решения. " +
@@ -47,9 +49,17 @@ type run struct {
 	st   *TaskState
 
 	change changeRequest
+	clar   clarifyRequest
 	// questions — вопросы человека, ждущие границы этапа: отвечает цикл
 	// этапов, а не горутина сообщений.
 	questions chan question
+	// manifests — манифесты скиллов плана по имени скилла.
+	manifests map[string]*protocol.Manifest
+	// question — текст вопроса для системного шага ответа (`$task.question`).
+	question string
+	// pass и passScope — текущий прогон шага для привязок `$task.pass`.
+	pass      int
+	passScope string
 }
 
 // Run исполняет задание. Возвращаемый статус — терминальный статус таски.
@@ -57,9 +67,18 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	if job.State == nil {
 		job.State = &TaskState{}
 	}
-	r := &run{p: p, job: job, plan: job.Plan, st: job.State, questions: make(chan question, 8)}
+	r := &run{p: p, job: job, plan: job.Plan, st: job.State, questions: make(chan question, 8), manifests: map[string]*protocol.Manifest{}}
 	if err := r.prepare(); err != nil {
 		r.log("", "Ошибка: "+err.Error())
+		return "error", err
+	}
+	if err := r.ensureSkills(ctx); err != nil {
+		if ctx.Err() != nil {
+			r.markPaused("")
+			return "paused", nil
+		}
+		r.log("", "Ошибка: "+err.Error())
+		r.taskStatus("error")
 		return "error", err
 	}
 	if p.EnsureIndex && p.Index != nil {
@@ -77,8 +96,6 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	if m := r.plan.Message; m != nil && r.st.MessageJob != job.ID {
 		r.handleMessage(ctx, m.Text, m.Mode)
 		if ctx.Err() != nil {
-			// Пауза посреди разбора: сообщение не отмечено — при
-			// возобновлении оно разберётся заново, а не пропадёт.
 			r.change.take()
 			r.markPaused("")
 			return "paused", nil
@@ -91,17 +108,10 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 				return r.failRound(err)
 			}
 		}
-		// Отметка — после того, как раунд заведён или ответ дан: повторное
-		// предложение того же задания (перезапуск, потерянный итог) не
-		// разбирает сообщение снова и не хоронит начатый раунд.
 		r.st.MessageJob = job.ID
 		r.job.SaveState()
 	}
 	if r.plan.Message != nil && r.allStagesDone() {
-		// Вопрос к готовой таске (или его повтор): ответ дан, этапам делать
-		// нечего — гонять их цикл значило бы мигать «выполняется → готово».
-		// Задание без сообщения идёт через цикл: он дожидается «Возобновить»
-		// и шлёт итоговые события.
 		r.answerQueued(ctx)
 		return "done", nil
 	}
@@ -109,13 +119,10 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 		status, err, restart := r.pipeline(ctx)
 		if !restart {
 			if ctx.Err() == nil {
-				// Вопросы, заданные под конец, не теряются: задание ещё здесь.
 				r.answerQueued(ctx)
 			}
 			return status, err
 		}
-		// Папка проверяется до архивации артефактов: отказ не должен
-		// оставлять пустой раунд с перенесёнными файлами прошлого.
 		if err := r.checkWorkspace(); err != nil {
 			return r.failRound(err)
 		}
@@ -134,14 +141,11 @@ func (r *run) failRound(err error) (string, error) {
 }
 
 // allStagesDone — в последнем раунде не осталось этапов, которым есть что
-// делать (виртуальные не в счёт: ими управляет анализ).
+// делать.
 func (r *run) allStagesDone() bool {
 	for _, key := range r.stageKeys() {
 		st := r.st.stage(key)
 		if st == nil || st.Status == "done" || st.Status == "skipped" {
-			continue
-		}
-		if def := r.plan.Stage(key); def != nil && def.Virtual {
 			continue
 		}
 		return false
@@ -153,10 +157,6 @@ func (r *run) allStagesDone() bool {
 func (r *run) prepare() error {
 	own := filepath.Join(r.p.DataDir, "tasks", strconv.FormatInt(r.plan.TaskID, 10))
 	if r.st.TaskDir == "" && r.plan.TaskDir != "" {
-		// Папка задачи оркестратора — подсказка для машины, где он сам и
-		// живёт: там лежат вложения человека. На другой машине этого пути
-		// может не быть вовсе (чужой домашний каталог), и тогда папка —
-		// своя, а не ошибка на первом же шаге.
 		if err := os.MkdirAll(filepath.Join(r.plan.TaskDir, "attachments", "user"), 0o755); err == nil {
 			r.st.TaskDir = r.plan.TaskDir
 		} else {
@@ -187,8 +187,7 @@ func (r *run) prepare() error {
 	seedTaskMD(r.st.TaskDir, r.st.Title, r.plan.Prompt, r.plan.SourceURL)
 	if len(r.st.Stages) == 0 {
 		r.st.addRound(r.stageKeys())
-		// Этапы, которые оркестратор уже считает выполненными (возобновление
-		// после потери состояния), не переисполняются.
+		r.markDisabled()
 		for _, key := range r.job.Skip {
 			if st := r.st.stage(key); st != nil {
 				st.Status = "done"
@@ -199,15 +198,72 @@ func (r *run) prepare() error {
 	return nil
 }
 
+// stageKeys — ключи шагов, у которых есть строка этапа: без финиша, а
+// стартовый — только если ему есть что импортировать.
 func (r *run) stageKeys() []string {
-	keys := make([]string, 0, len(r.plan.Stages))
-	for _, s := range r.plan.Stages {
-		keys = append(keys, s.Key)
-	}
-	return keys
+	return r.pipe().StepKeys(r.hasImport())
 }
 
-// pipeline — цикл по этапам последнего раунда. restart означает, что человек
+// hasImport — стартовый шаг запускает скилл импорта: есть ссылка и скилл.
+func (r *run) hasImport() bool {
+	if len(r.plan.Steps) == 0 || strings.TrimSpace(r.plan.SourceURL) == "" {
+		return false
+	}
+	return r.plan.Steps[0].Skill != ""
+}
+
+// pipe — шаги плана как пайплайн (для общих методов).
+func (r *run) pipe() *protocol.Pipeline {
+	return &protocol.Pipeline{Schema: protocol.PipelineSchema, Rework: r.plan.Rework, Steps: r.plan.Steps}
+}
+
+// markDisabled помечает выключенные шаги последнего раунда пропущенными.
+func (r *run) markDisabled() {
+	for _, s := range r.plan.Steps {
+		if s.Disabled {
+			if st := r.st.stage(s.Key); st != nil && st.Status == "pending" {
+				st.Status = "skipped"
+			}
+		}
+	}
+}
+
+// ensureSkills докачивает недостающие скиллы плана, читает их манифесты и
+// выкладывает скиллы в папку таски.
+func (r *run) ensureSkills(ctx context.Context) error {
+	if r.p.Skills == nil {
+		return nil
+	}
+	refs := append([]protocol.SkillRef(nil), r.plan.Skills...)
+	for _, ref := range refs {
+		if !r.p.Skills.Has(ref.Hash) {
+			r.log("", "Скилл "+ref.Name+" ещё не на машине — запрашиваю у оркестратора.")
+			f, err := r.job.FetchSkill(ctx, ref.Hash)
+			if err != nil {
+				return fmt.Errorf("скилл %s: %w", ref.Name, err)
+			}
+			if err := r.p.Skills.Put(ref.Hash, ref.Name, []byte(f.SkillMD), []byte(f.Manifest)); err != nil {
+				return err
+			}
+		}
+		m, err := r.p.Skills.Manifest(ref.Hash)
+		if err != nil {
+			return fmt.Errorf("скилл %s: %w", ref.Name, err)
+		}
+		r.manifests[ref.Name] = m
+		if err := r.p.Skills.InstallTo(r.st.TaskDir, ref.Hash, ref.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// manifest — манифест скилла шага; nil, если кэш не подключён (тесты).
+func (r *run) manifest(skill string) *protocol.Manifest {
+	return r.manifests[skill]
+}
+
+// pipeline — цикл по шагам последнего раунда. restart означает, что человек
 // прислал правку: раунд нужно завести заново и пройти снова.
 func (r *run) pipeline(ctx context.Context) (status string, err error, restart bool) {
 	r.taskStatus("running")
@@ -236,8 +292,6 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 		return "error", err, false
 	}
 
-	// Ожидание «Возобновить» пережило перезапуск (демона или оркестратора):
-	// человек его ещё не нажал, и следующий этап не начинается сам.
 	if r.st.AwaitContinue != "" {
 		if paused := r.waitContinue(ctx, r.st.AwaitContinue); paused {
 			return "paused", nil, false
@@ -254,56 +308,44 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 		if st == nil || st.Status == "done" || st.Status == "skipped" {
 			continue
 		}
-		if def := r.plan.Stage(key); def != nil && def.Virtual {
-			continue // декомпозицией управляет анализ
+		def := r.plan.Step(key)
+		if def == nil {
+			return fail(key, fmt.Errorf("в плане нет шага %q", key))
 		}
-		// Граница этапа — точка восстановления: без связи этап доделывается,
-		// но следующий не начинается, пока оркестратор не подтвердит, что
-		// задание всё ещё за нами.
 		if err := r.job.WaitConnected(ctx); err != nil {
 			return fail(key, err)
 		}
-		if key != "import" && r.st.WorktreeDir == "" {
-			if err := r.setupWorktree(); err != nil {
-				return fail(key, err)
-			}
+		if err := r.prepareWorkspace(def); err != nil {
+			return fail(key, err)
 		}
 
-		// Свой контекст на этап: правка прерывает этап, не задание.
 		sctx, scancel := context.WithCancel(ctx)
 		r.change.arm(scancel)
 		var err error
-		switch key {
-		case "import":
-			err = r.stageImport(sctx, st)
-		case "analyze":
-			err = r.stageAnalyze(sctx, st)
-		case "err_work":
-			err = r.stageErrWork(sctx, st)
-		case "branch":
-			err = r.stageBranch(st)
-		case "execute":
-			err = r.stageExecute(sctx, st)
-		case "review":
-			err = r.stageReview(sctx, st)
-		case "handoff":
-			err = r.stageHandoff(sctx, st)
+		switch def.Kind {
+		case protocol.KindStartTask:
+			err = r.stepStart(sctx, st, def)
+		case protocol.KindAgent:
+			err = r.stepAgent(sctx, st, def)
+		case protocol.KindBranch:
+			err = r.stepBranch(st)
+		case protocol.KindTestGate:
+			err = r.stepTestGate(sctx, st, def)
 		default:
-			err = fmt.Errorf("неизвестный этап %q", key)
+			err = fmt.Errorf("неизвестный род шага %q", def.Kind)
 		}
 		r.change.arm(nil)
 		scancel()
 		if err != nil {
 			return fail(key, err)
 		}
-		if r.change.take() { // правка пришла на границе этапа
+		if r.change.take() {
 			return "", nil, true
 		}
 		r.job.SaveState()
 		r.answerQueued(ctx)
 
-		// per_stage: остановиться после этапа и ждать «Возобновить».
-		if r.plan.Continuity == "per_stage" && i != len(keys)-1 {
+		if r.plan.Continuity == "per_stage" && i != len(keys)-1 && r.stepsLeft(keys[i+1:]) {
 			if paused := r.waitContinue(ctx, key); paused {
 				return "paused", nil, false
 			}
@@ -314,11 +356,9 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 		}
 	}
 
-	// Ничего не удаляем: рабочая копия и артефакты остаются до явного
-	// «Удалить» или новой правки.
-	if r.st.WorktreeDir != "" {
+	if r.st.WorktreeDir != "" && r.st.BranchName != "" {
 		where := "worktree сохранён: " + r.st.WorktreeDir
-		if r.plan.Workspace == "folder" {
+		if r.folderMode() {
 			where = "изменения в папке проекта: " + r.st.WorktreeDir
 		}
 		r.log("", "Готово. Ветка: "+r.st.BranchName+". "+where+
@@ -329,10 +369,18 @@ func (r *run) pipeline(ctx context.Context) (status string, err error, restart b
 	return "done", nil, false
 }
 
-// waitContinue ждёт «Возобновить» после этапа key. Ожидание записано в
-// состоянии: после перезапуска оно продолжается, а не пропускается. Пока
-// ждём, отвечаем на вопросы из чата — этап не идёт, момент удобный.
-// Возвращает true, если задание остановили.
+// stepsLeft — среди следующих ключей есть шаг, который будет исполняться:
+// после последнего живого шага останавливаться «между этапами» незачем.
+func (r *run) stepsLeft(keys []string) bool {
+	for _, k := range keys {
+		if st := r.st.stage(k); st != nil && st.Status != "done" && st.Status != "skipped" {
+			return true
+		}
+	}
+	return false
+}
+
+// waitContinue ждёт «Возобновить» после этапа key.
 func (r *run) waitContinue(ctx context.Context, key string) (paused bool) {
 	r.st.AwaitContinue = key
 	r.job.SaveState()
@@ -350,16 +398,10 @@ func (r *run) waitContinue(ctx context.Context, key string) (paused bool) {
 		case q := <-r.questions:
 			r.answerQuestionRound(ctx, q.text, q.usage)
 		case <-r.change.wake():
-			// Правка во время ожидания: новый раунд начинается сам, цикл
-			// этапов заберёт её через take().
 			r.st.AwaitContinue = ""
 			r.job.SaveState()
 			return false
 		case <-ctx.Done():
-			// Остановили человеком: его «Возобновить» после паузы и есть
-			// ответ на это ожидание, второй раз спрашивать не нужно.
-			// Перезапуск демона или оркестратора — не человек: ожидание
-			// остаётся.
 			if r.job.cancelReason() == CancelPause {
 				r.st.AwaitContinue = ""
 			}
@@ -371,11 +413,48 @@ func (r *run) waitContinue(ctx context.Context, key string) (paused bool) {
 
 // --- запуск агента ---
 
+// agentSpec — всё, что нужно для прогона агента шага, собранное из плана и
+// манифеста.
+type agentSpec struct {
+	key     string
+	skill   string
+	model   string
+	effort  string
+	cwd     string
+	tools   []string
+	search  bool
+	markers []string
+	resume  bool // умеет продолжить сессию с уточнением
+}
+
+func (r *run) specFor(def *protocol.Step) agentSpec {
+	m := r.manifest(def.Skill)
+	sp := agentSpec{key: def.Key, skill: def.Skill, model: def.Model, effort: def.Effort, cwd: r.st.WorktreeDir, resume: true}
+	if sp.model == "" {
+		sp.model = "fable"
+	}
+	if sp.cwd == "" {
+		sp.cwd = r.st.TaskDir
+	}
+	if m != nil {
+		if m.CWD == "task_dir" {
+			sp.cwd = r.st.TaskDir
+		}
+		if r.plan.Continuity != "non_stop" {
+			sp.tools = m.Tools
+		}
+		sp.search = m.CodeSearch
+		sp.resume = m.Resumable
+		for _, name := range m.Outputs.MarkerOrder {
+			sp.markers = append(sp.markers, name+":")
+		}
+	}
+	return sp
+}
+
 // runAgentStage — один прогон этапа с циклом вопросов QUESTIONS_JSON.
 // Возвращает склеенный текст ответов агента.
-func (r *run) runAgentStage(ctx context.Context, st *StageState, prompt, cwd string, pass int) (string, error) {
-	// Прежний статус нужен до того, как этап помечен идущим: по нему видно,
-	// что прогон был прерван и его сессию можно продолжить.
+func (r *run) runAgentStage(ctx context.Context, st *StageState, sp agentSpec, prompt string, pass int) (string, error) {
 	prev := st.Status
 	st.Status = "running"
 	r.emitStage(st, "running")
@@ -393,36 +472,33 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, prompt, cwd str
 			prompt = continuationPrompt
 		}
 	}
-	return r.runAgentSession(ctx, st, prompt, cwd, resume, pass)
+	return r.runAgentSession(ctx, st, sp, prompt, resume, pass)
 }
 
 // runAgentSession — прогон агента этапа; resume — сессия, которую надо
-// продолжить (пусто — новая). Отдельно от runAgentStage: автопочинка после
-// тест-гейта продолжает сессию реализации, хотя этап и не прерывался.
-func (r *run) runAgentSession(ctx context.Context, st *StageState, prompt, cwd, resume string, pass int) (string, error) {
+// продолжить (пусто — новая). Уточнение человека посреди прогона прерывает
+// его и продолжает ту же сессию с текстом уточнения.
+func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec, prompt, resume string, pass int) (string, error) {
 	var all strings.Builder
 	for {
 		if err := r.checkBudget(); err != nil {
 			return all.String(), err
 		}
-		// Вотчдог: один прогон не может идти дольше лимита.
 		runCtx, cancel := context.WithTimeout(ctx, r.plan.StageTimeout.Duration())
 		onEvent := func(ev agent.StreamEvent) {
 			r.job.Emit(st.Key, ev.Type, ev.Payload)
 		}
-		mcpCfg, extraTools := r.p.codeSearchFor(r.plan, st.Key)
-		def := r.plan.Stage(st.Key)
-		model, effort := "fable", ""
-		if def != nil {
-			model, effort = def.Model, def.Effort
-		}
+		mcpCfg, extraTools := r.p.codeSearchFor(r.plan, sp.search)
+		r.clar.arm(cancel, sp.resume)
 		res, err := agent.Run(runCtx, agent.RunOpts{
 			Prompt: prompt, Resume: resume,
-			Model: agent.ModelID(model), Effort: effort,
-			CWD: cwd, AddDirs: []string{r.st.TaskDir},
-			AllowedTools: withTools(toolsFor(r.plan.Continuity, st.Key), extraTools),
-			MCPConfig:    mcpCfg,
+			Model: agent.ModelID(sp.model), Effort: sp.effort,
+			CWD: sp.cwd, AddDirs: []string{r.st.TaskDir},
+			AllowedTools: withTools(sp.tools, extraTools),
+			MCPConfig:    mcpCfg, Markers: sp.markers,
 		}, onEvent)
+		r.clar.arm(nil, false)
+		clarified := r.clar.take()
 		timedOut := runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 		cancel()
 		if res != nil && res.SessionID != "" {
@@ -433,11 +509,18 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, prompt, cwd, 
 		if timedOut {
 			return all.String(), fmt.Errorf("этап превысил лимит времени (%s) и был остановлен", r.plan.StageTimeout.Duration())
 		}
-		if err != nil {
+		if err != nil && (clarified == "" || ctx.Err() != nil || res == nil || res.SessionID == "") {
 			return all.String(), err
 		}
-		all.WriteString(res.FullText)
-		resume = res.SessionID
+		if res != nil {
+			all.WriteString(res.FullText)
+			resume = res.SessionID
+		}
+		if clarified != "" {
+			r.log(st.Key, "Уточнение принято — продолжаю ту же сессию.")
+			prompt = "Уточнение пользователя (учти его и продолжи с места остановки):\n" + clarified
+			continue
+		}
 
 		qs, present, qerr := agent.Questions(res.FullText)
 		if qerr != nil {
@@ -456,28 +539,18 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, prompt, cwd, 
 
 // askUser записывает вопросы, ждёт ответов и собирает промпт продолжения.
 func (r *run) askUser(ctx context.Context, st *StageState, qs []agent.QuestionSpec) (string, error) {
-	hasDecompose := false
 	for _, q := range qs {
 		saved := r.st.addQuestion(QuestionState{Stage: st.Key, Type: q.Type, Question: q.Question,
 			Options: q.Options, AllowCustom: q.AllowCustom})
-		if q.Type == "decompose" {
-			hasDecompose = true
-		}
 		r.job.Emit(st.Key, "question", map[string]any{
 			"question_id": saved.ID, "type": q.Type, "question": q.Question,
 			"options": q.Options, "allow_custom": q.AllowCustom,
 		})
 	}
 	r.job.SaveState()
-	if hasDecompose {
-		r.setStageStatus("decompose", "waiting_user")
-	}
 	answers, err := r.waitAndCollectAnswers(ctx, st)
 	if err != nil {
 		return "", err
-	}
-	if hasDecompose {
-		r.setStageStatus("decompose", "done")
 	}
 	if answers == "" {
 		answers = continuationPrompt
@@ -624,7 +697,7 @@ func (r *run) emitArtifacts() {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".md") {
+		if e.IsDir() || !(strings.HasSuffix(name, ".md") || strings.HasSuffix(name, ".json")) || name == "plan.json" {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(r.st.TaskDir, name))
@@ -637,7 +710,7 @@ func (r *run) emitArtifacts() {
 
 // emitDiff отправляет дифф ветки против базы задачи.
 func (r *run) emitDiff() {
-	if r.st.WorktreeDir == "" {
+	if r.st.WorktreeDir == "" || r.st.BaseCommit == "" {
 		return
 	}
 	files, err := gitops.Diff(r.st.WorktreeDir, r.st.BaseCommit)
@@ -652,12 +725,17 @@ func (r *run) emitDiff() {
 
 // --- рабочая копия ---
 
+// folderMode — рабочая копия и есть папка проекта: режим folder или скилл,
+// ведущий git сам.
+func (r *run) folderMode() bool {
+	return r.plan.Workspace == "folder" || r.st.SelfWorkspace
+}
+
 // checkWorkspace — рабочая копия в папке проекта всё ещё наша: там наша
-// ветка и в ней не идёт другая таска. Иначе продолжение легло бы в чужую
-// ветку.
+// ветка и в ней не идёт другая таска.
 func (r *run) checkWorkspace() error {
 	proj := r.plan.Project
-	if r.plan.Workspace != "folder" {
+	if !r.folderMode() {
 		return nil
 	}
 	if other := r.job.ex.folderHolder(proj.Path, r.plan.TaskID); other != 0 {
@@ -679,10 +757,56 @@ func (r *run) checkWorkspace() error {
 	return nil
 }
 
+// prepareWorkspace готовит рабочую копию перед шагом, которому она нужна:
+// для скилла с `workspace: self` — только папка проекта и база, для
+// остальных — worktree и ветка задачи.
+func (r *run) prepareWorkspace(def *protocol.Step) error {
+	if r.st.WorktreeDir != "" {
+		return nil
+	}
+	switch def.Kind {
+	case protocol.KindStartTask:
+		return nil
+	case protocol.KindAgent:
+		if m := r.manifest(def.Skill); m != nil {
+			if m.CWD == "task_dir" {
+				return nil
+			}
+			if m.Workspace == protocol.WorkspaceSelf {
+				return r.setupSelfWorkspace()
+			}
+		}
+	}
+	return r.setupWorktree()
+}
+
+// setupSelfWorkspace — скилл сам заводит ветку: движок лишь фиксирует базу,
+// чтобы после маркера с именем ветки посчитать дифф и правки.
+func (r *run) setupSelfWorkspace() error {
+	proj := r.plan.Project
+	if other := r.job.ex.folderHolder(proj.Path, r.plan.TaskID); other != 0 {
+		return fmt.Errorf("папка проекта занята таской #%d, которая сейчас идёт в ней — дождитесь той", other)
+	}
+	if gitops.HasRemote(proj.Path, "origin") {
+		if err := gitops.FetchBase(proj.Path, proj.BaseBranch); err != nil {
+			r.log("", "fetch origin не удался (продолжаю от локальной базы): "+err.Error())
+		}
+	}
+	sha, err := gitops.RevParse(proj.Path, proj.BaseBranch)
+	if err != nil {
+		return fmt.Errorf("базовая ветка %s: %w", proj.BaseBranch, err)
+	}
+	r.job.mu.Lock()
+	r.st.WorktreeDir, r.st.BaseCommit, r.st.RoundBase, r.st.SelfWorkspace = proj.Path, sha, sha, true
+	r.job.mu.Unlock()
+	r.log("", "Скилл ведёт ветку сам: работа в папке проекта "+proj.Path+" от "+proj.BaseBranch+" ("+short(sha)+")")
+	r.job.Emit("", "task_field", map[string]any{"worktree_dir": proj.Path, "base_commit": sha, "round_base": sha})
+	r.job.SaveState()
+	return nil
+}
+
 func (r *run) setupWorktree() error {
 	proj := r.plan.Project
-	// Репозиторий без origin — обычное дело для локального проекта: базу
-	// берём как есть, без «не удался» в журнале каждой таски.
 	if !gitops.HasRemote(proj.Path, "origin") {
 		r.log("", "У репозитория нет origin — база берётся из локальной ветки "+proj.BaseBranch+".")
 	} else if err := gitops.FetchBase(proj.Path, proj.BaseBranch); err != nil {
@@ -763,11 +887,8 @@ func (p *Pipeline) Cleanup(job *Job) {
 	if st == nil {
 		return
 	}
-	if st.WorktreeDir != "" && job.Plan.Workspace != "folder" {
+	if st.WorktreeDir != "" && job.Plan.Workspace != "folder" && !st.SelfWorkspace {
 		if err := gitops.RemoveWorktree(job.Plan.Project.Path, st.WorktreeDir); err != nil {
-			// Папку могли убрать руками: тогда остаётся только запись в
-			// .git/worktrees, и её снимает prune — иначе git считал бы
-			// путь занятым при следующей таске с тем же номером.
 			if _, statErr := os.Stat(st.WorktreeDir); statErr != nil {
 				_ = gitops.PruneWorktrees(job.Plan.Project.Path)
 			} else {

@@ -32,7 +32,7 @@ func (c *fakeClock) advance(d time.Duration) {
 
 func dispatchPlan(taskID int64) *protocol.Plan {
 	return &protocol.Plan{
-		SchemaVersion: protocol.SchemaVersion,
+		SchemaVersion: 1, // схема 1 принимается на переходный релиз
 		TaskID:        taskID,
 		Title:         "таска",
 		Project:       protocol.Project{ID: 1, Name: "demo", Path: "/repo", BaseBranch: "main"},

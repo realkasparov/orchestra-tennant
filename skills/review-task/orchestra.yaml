@@ -1,0 +1,17 @@
+name: review-task
+title: Ревью кода
+version: 1
+inputs:
+  REFERENCE:   { type: text,    required: true }
+  BASE_COMMIT: { type: git_ref, required: true }
+  MODE:        { type: enum,    required: true, desc: report-only | autofix }
+context: [diff]
+cwd: worktree
+tools: unrestricted
+resumable: true
+outputs:
+  artifacts:
+    - { name: step05-review.md, title: Ревью, type: markdown }
+checks:
+  - artifact_exists: step05-review.md
+model_preference: [sonnet, opus, fable51, fable, haiku]

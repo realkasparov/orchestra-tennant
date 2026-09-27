@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -35,6 +36,9 @@ type RunOpts struct {
 	// MCPConfig — JSON конфигурации MCP-серверов (--mcp-config). Пусто —
 	// внешние инструменты не подключаются.
 	MCPConfig string
+	// Markers — маркеры скилла (с двоеточием, как `RESULT:`): вырезаются из
+	// текста для чата вместе со встроенными.
+	Markers []string
 }
 
 // StreamEvent is one normalized event for the UI log.
@@ -156,7 +160,14 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 		if err := json.Unmarshal(line, &msg); err != nil {
 			continue
 		}
-		handleLine(msg, res, &text, onEvent)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// После SIGINT по паузе CLI отчитывается «инструмент отклонён» и
+			// «ошибка выполнения» — это не провал: результат помечается
+			// прерванным, чтобы чат не показывал ошибку. Лимит времени этапа
+			// (DeadlineExceeded) — провал, и помечать его нечем.
+			msg["_interrupted"] = true
+		}
+		handleLine(msg, res, &text, onEvent, opts.Markers)
 	}
 	select {
 	case <-stderrDone:
@@ -187,7 +198,7 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 	return res, nil
 }
 
-func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent func(StreamEvent)) {
+func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent func(StreamEvent), markers []string) {
 	switch msg["type"] {
 	case "system":
 		if msg["subtype"] == "init" {
@@ -209,7 +220,7 @@ func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent 
 				text.WriteString(t + "\n")
 				// В чат — без служебных маркеров (их читает оркестратор из
 				// полного текста выше).
-				if shown := StripMarkers(t); shown != "" {
+				if shown := StripMarkers(t, markers...); shown != "" {
 					onEvent(StreamEvent{Type: "agent_text", Payload: map[string]any{"text": shown}})
 				}
 			case "tool_use":
@@ -230,6 +241,9 @@ func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent 
 				summary := "ok"
 				if isErr, _ := block["is_error"].(bool); isErr {
 					summary = "error"
+					if msg["_interrupted"] == true {
+						summary = "interrupted"
+					}
 				}
 				onEvent(StreamEvent{Type: "tool_result", Payload: map[string]any{
 					"summary": summary, "detail": truncate(string(detail), 20000),

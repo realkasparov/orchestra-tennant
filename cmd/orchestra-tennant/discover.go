@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,13 +22,24 @@ type provider struct {
 	Models []string
 }
 
-// claudeModels — что умеет запускать исполнитель через claude CLI. Список
-// один с agent.ModelID: ключ, которого там нет, свёлся бы к дефолту молча.
+// claudeModels — что умеет запускать исполнитель через claude CLI любой
+// версии. Список один с agent.ModelID: ключ, которого там нет, свёлся бы к
+// дефолту молча.
 var claudeModels = []string{"fable", "opus", "sonnet", "haiku"}
 
-// fable51MinCLI — с этой версии Claude Code принимает claude-fable-5-1;
-// старая отвечает 400, поэтому машине со старым CLI ключ не предлагается.
-var fable51MinCLI = [3]int{2, 1, 251}
+// gatedModels — модели, которые Claude Code принимает только с некоторой
+// версии; старая отвечает 400, поэтому машине со старым CLI ключ не
+// предлагается, а setup говорит, чего не хватает.
+var gatedModels = []struct {
+	Key, Title string
+	MinCLI     [3]int
+}{
+	{"fable51", "Fable 5.1", [3]int{2, 1, 251}},
+	{"opus55", "Opus 5.5", [3]int{2, 1, 280}},
+}
+
+// fable51MinCLI — с этой версии Claude Code принимает claude-fable-5-1.
+var fable51MinCLI = gatedModels[0].MinCLI
 
 // cliAtLeast — версия вида «2.1.272 (Claude Code)» не ниже min.
 func cliAtLeast(version string, min [3]int) bool {
@@ -63,10 +75,14 @@ func discover(ctx context.Context) []provider {
 		p := provider{Key: "claude", Title: "claude CLI", Detail: path, Models: claudeModels}
 		if v := cliVersion(ctx, path); v != "" {
 			p.Detail = v + " · " + path
-			if cliAtLeast(v, fable51MinCLI) {
-				p.Models = append(append([]string(nil), claudeModels...), "fable51")
-			} else {
-				p.Detail += " — Fable 5.1 недоступна: нужен Claude Code ≥ 2.1.251 (claude update)"
+			p.Models = append([]string(nil), claudeModels...)
+			for _, g := range gatedModels {
+				if cliAtLeast(v, g.MinCLI) {
+					p.Models = append(p.Models, g.Key)
+				} else {
+					p.Detail += fmt.Sprintf(" — %s недоступна: нужен Claude Code ≥ %d.%d.%d (claude update)",
+						g.Title, g.MinCLI[0], g.MinCLI[1], g.MinCLI[2])
+				}
 			}
 		}
 		out = append(out, p)

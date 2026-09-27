@@ -201,10 +201,26 @@ func TestSameRepo(t *testing.T) {
 		{"git@github.com:nov_aleks/snake-game.git", "https://gitlab.com", "nov_aleks/snake-game", false},
 		{"git@gitlab.com:nov_aleks/other.git", "https://gitlab.com", "nov_aleks/snake-game", false},
 		{"", "https://gitlab.com", "nov_aleks/snake-game", false},
+		// Хост под подпутём: клон лежит по hostURL + repoPath.
+		{"https://example.com/gitlab/a/b.git", "https://example.com/gitlab", "a/b", true},
+		{"https://example.com/a/b.git", "https://example.com/gitlab", "a/b", false},
+		// IPv6 в скобках: хосты различаются, порт не мешает.
+		{"https://[::1]:8080/a/b", "https://[::1]", "a/b", true},
+		{"https://[2001:db8::1]/a/b", "https://[::1]", "a/b", false},
+		{"git@[::1]:a/b.git", "https://[::1]", "a/b", true},
 	}
 	for _, c := range cases {
 		if got := SameRepo(c.remote, c.host, c.path); got != c.want {
 			t.Errorf("SameRepo(%q, %q, %q) = %v, want %v", c.remote, c.host, c.path, got, c.want)
 		}
+	}
+}
+
+func TestRedactRemote(t *testing.T) {
+	if got := RedactRemote("https://oauth2:secret@gitlab.com/g/x.git"); got != "gitlab.com/g/x" {
+		t.Fatalf("redact = %q", got)
+	}
+	if got := RedactRemote("git@gitlab.com:g/x.git"); got != "gitlab.com/g/x" {
+		t.Fatalf("redact scp = %q", got)
 	}
 }

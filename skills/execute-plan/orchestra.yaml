@@ -1,0 +1,21 @@
+name: execute-plan
+title: Выполнение плана
+version: 1
+inputs:
+  REFERENCE: { type: text,    required: true }
+  TITLE:     { type: text,    required: true,  desc: Описание ветки обычным предложением — заголовок коммита }
+  BASE:      { type: git_ref, required: true,  desc: Базовый коммит рабочей копии — для squash }
+context: [plan, files]
+cwd: worktree
+tools: unrestricted
+code_search: true
+questions: true
+resumable: true
+outputs:
+  artifacts:
+    - { name: step04-execution.md, title: Выполнение, type: markdown }
+checks:
+  - has_commits
+  - clean_tree
+  - artifact_exists: step04-execution.md
+model_preference: [opus, fable51, fable, sonnet, haiku]

@@ -52,6 +52,15 @@ type TaskState struct {
 	// MessageJob — задание, чьё стартовое сообщение уже разобрано: при
 	// возобновлении того же задания правка не заводит раунд второй раз.
 	MessageJob string `json:"message_job,omitempty"`
+	// Outputs — выходы шагов: ключ шага → имя выхода → значение (маркер —
+	// его значение, артефакт — путь к файлу). По ним шаги ссылаются друг на
+	// друга через `$steps.<ключ>.<выход>`.
+	Outputs map[string]map[string]string `json:"outputs,omitempty"`
+	// Feedback — текст последней правки человека: вход `$task.feedback`.
+	Feedback string `json:"feedback,omitempty"`
+	// SelfWorkspace — рабочую копию ведёт скилл, а не движок: папка проекта
+	// и ветка, названная маркером.
+	SelfWorkspace bool `json:"self_workspace,omitempty"`
 
 	// Stages — указатели намеренно: этап держат в руках всё время его
 	// прогона, а раунды добавляются и посреди него (ответ на вопрос в чате),
@@ -133,4 +142,23 @@ func (s *TaskState) addQuestion(q QuestionState) *QuestionState {
 	q.ID, q.Status = s.NextQuestion, "open"
 	s.Questions = append(s.Questions, q)
 	return &s.Questions[len(s.Questions)-1]
+}
+
+// setOutput запоминает выход шага.
+func (s *TaskState) setOutput(step, name, value string) {
+	if s.Outputs == nil {
+		s.Outputs = map[string]map[string]string{}
+	}
+	if s.Outputs[step] == nil {
+		s.Outputs[step] = map[string]string{}
+	}
+	s.Outputs[step][name] = value
+}
+
+// output — выход шага; пусто, если не записан.
+func (s *TaskState) output(step, name string) string {
+	if s.Outputs == nil || s.Outputs[step] == nil {
+		return ""
+	}
+	return s.Outputs[step][name]
 }

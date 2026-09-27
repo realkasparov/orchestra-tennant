@@ -63,14 +63,14 @@ func cmdRun(args []string) error {
 	logf("orchestra-tennant %s запускается: устройство «%s», оркестратор %s, мест %d, модели %v, проекты в %s",
 		executor.Version, cfg.DeviceName, cfg.Orchestrator, cfg.Slots, cfg.Models, cfg.ProjectsDir)
 
-	// Скиллы — из бинаря: демон на чужой машине не зависит от репозитория.
-	skillsDir, err := executor.MaterializeSkills(tennant.Skills, p.home)
+	// Кэш скиллов по хэшу; встроенные — из бинаря, чтобы планы схемы 1 и
+	// первый запуск без связи с реестром работали без докачки.
+	skills, err := executor.NewSkillCache(p.skills())
 	if err != nil {
 		return err
 	}
-	userHome, _ := os.UserHomeDir()
-	if err := executor.InstallSkills(skillsDir, userHome); err != nil {
-		logf("скиллы: %v", err)
+	if err := skills.SeedEmbedded(tennant.Skills); err != nil {
+		return err
 	}
 
 	index := codeindex.NewManager(p.home)
@@ -78,11 +78,11 @@ func cmdRun(args []string) error {
 	host, osVer, version := identity()
 	ex, err := executor.New(executor.Config{
 		DeviceKey: cfg.DeviceKey, Hostname: host, OS: osVer, Version: version,
-		Slots: cfg.Slots, Models: modelIDs(cfg.Models), Skills: executor.StageSkills, ProjectsDir: cfg.ProjectsDir,
+		Slots: cfg.Slots, Models: modelIDs(cfg.Models), Skills: skills, ProjectsDir: cfg.ProjectsDir,
 		// Трассировка пакетов — только по просьбе: журнал читают люди, и в нём
 		// должны быть события тасок словами, а не «→ event <id>».
 		JournalDir: p.journal(), Log: logf, Trace: os.Getenv("ORCHESTRA_TENNANT_TRACE") == "1",
-	}, &executor.Pipeline{DataDir: p.home, ProjectsDir: cfg.ProjectsDir, Index: index, EnsureIndex: true, Log: logf})
+	}, &executor.Pipeline{DataDir: p.home, ProjectsDir: cfg.ProjectsDir, Index: index, EnsureIndex: true, Skills: skills, Log: logf})
 	if err != nil {
 		return err
 	}

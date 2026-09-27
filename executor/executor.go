@@ -34,7 +34,8 @@ type Config struct {
 	Version   string
 	Slots     int
 	Models    []string
-	Skills    []string
+	// Skills — кэш скиллов; nil — скиллы не объявляются и не докачиваются.
+	Skills *SkillCache
 	// ProjectsDir — папка проектов машины; объявляется в hello.
 	ProjectsDir string
 	// JournalDir — папка журнала незавершённых заданий.
@@ -69,6 +70,8 @@ type Executor struct {
 	// connected закрывается и пересоздаётся при каждом подключении: задания
 	// ждут на нём границу этапа.
 	connected chan struct{}
+	// skillWaits — ожидающие ответа запросы скиллов по хэшу.
+	skillWaits map[string][]chan *protocol.SkillFile
 }
 
 // New создаёт исполнителя. Журнал читается сразу: незавершённые задания
@@ -86,7 +89,7 @@ func New(cfg Config, runner Runner) (*Executor, error) {
 		logf = log.Printf
 	}
 	e := &Executor{cfg: cfg, runner: runner, journal: j, logf: logf,
-		jobs: map[string]*Job{}, connected: make(chan struct{})}
+		jobs: map[string]*Job{}, connected: make(chan struct{}), skillWaits: map[string][]chan *protocol.SkillFile{}}
 	records, errs := j.List()
 	for _, err := range errs {
 		e.logf("журнал: %v", err)
@@ -176,7 +179,13 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 		DeviceKey: e.cfg.DeviceKey, Hostname: e.cfg.Hostname, OS: e.cfg.OS,
 		Version: e.cfg.Version, MinSchema: protocol.MinSchemaVersion,
 		MaxSchema: protocol.SchemaVersion, Slots: e.cfg.Slots, ProjectsDir: e.cfg.ProjectsDir,
-		Models: e.cfg.Models, Skills: e.cfg.Skills, Running: e.runningIDs(), Parked: e.parkedJobs(),
+		Models: e.cfg.Models, Running: e.runningIDs(), Parked: e.parkedJobs(),
+	}
+	if e.cfg.Skills != nil {
+		hello.SkillHashes = e.cfg.Skills.Hashes()
+		for name := range e.cfg.Skills.BuiltinHashes() {
+			hello.Skills = append(hello.Skills, name)
+		}
 	}
 	e.trace("→", protocol.MsgHello, "")
 	if err := send(conn, protocol.MsgHello, "", hello); err != nil {
@@ -344,6 +353,11 @@ func (e *Executor) handle(ctx context.Context, env *protocol.Envelope) {
 		}
 	case protocol.MsgProject:
 		e.handleProject(ctx, env)
+	case protocol.MsgSkill:
+		var f protocol.SkillFile
+		if err := json.Unmarshal(env.Body, &f); err == nil {
+			e.deliverSkill(&f)
+		}
 	case protocol.MsgAck:
 		var a protocol.Ack
 		if err := json.Unmarshal(env.Body, &a); err == nil {
@@ -359,6 +373,23 @@ func (e *Executor) handle(ctx context.Context, env *protocol.Envelope) {
 // accept принимает или отвергает предложение. Отказ всегда с причиной и с
 // признаком, стоит ли предлагать снова: «занят» — да, «не понимаю план» — нет.
 func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
+	// План схемы 1 переводится в схему 2 по базовому пайплайну: один движок
+	// на обе схемы, а встроенные скиллы этой сборки — его хэши.
+	if offer.Plan.SchemaVersion < 2 {
+		hashes := map[string]string{}
+		if e.cfg.Skills != nil {
+			hashes = e.cfg.Skills.BuiltinHashes()
+		} else {
+			// Без кэша (тесты ядра) скиллы не выкладываются — хэши условные.
+			for _, name := range protocol.BuiltinSkills {
+				hashes[name] = "builtin:" + name
+			}
+		}
+		if err := offer.Plan.Upgrade(hashes); err != nil {
+			e.reject(offer.JobID, err.Error(), false)
+			return
+		}
+	}
 	if err := offer.Plan.Validate(); err != nil {
 		e.reject(offer.JobID, err.Error(), false)
 		return
@@ -479,8 +510,10 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 		e.logf("accept %s: %v", j.ID, err)
 	}
 	var keys []string
-	for _, s := range j.Plan.Stages {
-		keys = append(keys, stageTitle(s.Key))
+	for _, s := range j.Plan.Steps {
+		if s.Kind != protocol.KindFinish && !s.Disabled {
+			keys = append(keys, s.Title)
+		}
 	}
 	e.taskNote(j, "Задание принято: %s; рабочая область — %s; папка проекта %s", strings.Join(keys, " → "), j.Plan.Workspace, j.Plan.Project.Path)
 	go e.run(jctx, j)
@@ -536,25 +569,70 @@ func (e *Executor) reject(jobID, reason string, retryable bool) {
 	}
 }
 
-// missing называет, чего нет на машине для плана.
+// missing называет, чего нет на машине для плана: модели. Скилл отказом не
+// считается — его докачают у оркестратора.
 func (e *Executor) missing(p *protocol.Plan) string {
 	models := map[string]bool{}
 	for _, m := range e.cfg.Models {
 		models[m] = true
 	}
-	skills := map[string]bool{}
-	for _, s := range e.cfg.Skills {
-		skills[s] = true
-	}
-	for _, s := range p.Stages {
+	for _, s := range p.Steps {
+		if s.Disabled {
+			continue
+		}
 		if s.Model != "" && len(models) > 0 && !models[s.Model] {
 			return "модели " + s.Model
 		}
-		if s.Skill != "" && len(skills) > 0 && !skills[s.Skill] {
-			return "скилла " + s.Skill
-		}
 	}
 	return ""
+}
+
+// FetchSkill запрашивает скилл у оркестратора по хэшу и ждёт ответа.
+func (e *Executor) FetchSkill(ctx context.Context, hash string) (*protocol.SkillFile, error) {
+	ch := make(chan *protocol.SkillFile, 1)
+	e.mu.Lock()
+	e.skillWaits[hash] = append(e.skillWaits[hash], ch)
+	e.mu.Unlock()
+	if err := e.send(protocol.MsgSkillGet, "", protocol.SkillGet{Hash: hash}); err != nil {
+		e.dropSkillWait(hash, ch)
+		return nil, err
+	}
+	select {
+	case f := <-ch:
+		if f.Error != "" {
+			return nil, errors.New(f.Error)
+		}
+		return f, nil
+	case <-time.After(2 * time.Minute):
+		e.dropSkillWait(hash, ch)
+		return nil, fmt.Errorf("оркестратор не прислал скилл за две минуты")
+	case <-ctx.Done():
+		e.dropSkillWait(hash, ch)
+		return nil, ctx.Err()
+	}
+}
+
+func (e *Executor) dropSkillWait(hash string, ch chan *protocol.SkillFile) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	waits := e.skillWaits[hash]
+	for i, w := range waits {
+		if w == ch {
+			e.skillWaits[hash] = append(waits[:i], waits[i+1:]...)
+			break
+		}
+	}
+}
+
+// deliverSkill отдаёт пришедший скилл всем, кто его ждёт.
+func (e *Executor) deliverSkill(f *protocol.SkillFile) {
+	e.mu.Lock()
+	waits := e.skillWaits[f.Hash]
+	delete(e.skillWaits, f.Hash)
+	e.mu.Unlock()
+	for _, ch := range waits {
+		ch <- f
+	}
 }
 
 // renewLoop продлевает лизы идущих заданий, пока соединение живо.

@@ -223,7 +223,7 @@ func checkProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectResu
 			} else if origin == "" {
 				add("Папка", "В папке репозиторий без origin — привязать к "+spec.Repo.RepoPath+" нельзя: добавьте origin или выберите другую папку", "err")
 			} else {
-				add("Папка", "В папке другой репозиторий (origin: "+origin+") — выберите другую папку", "err")
+				add("Папка", "В папке другой репозиторий (origin: "+gitops.RedactRemote(origin)+") — выберите другую папку", "err")
 			}
 		} else if fi, err := os.Stat(path); err == nil && fi.IsDir() {
 			if entries, _ := os.ReadDir(path); len(entries) > 0 {
@@ -285,7 +285,7 @@ func createProject(path string, spec *protocol.ProjectSpec) *protocol.ProjectRes
 			if origin == "" {
 				res.Error = "в папке репозиторий без origin — привязать к " + spec.Repo.RepoPath + " нельзя"
 			} else {
-				res.Error = "в папке другой репозиторий (origin: " + origin + ")"
+				res.Error = "в папке другой репозиторий (origin: " + gitops.RedactRemote(origin) + ")"
 			}
 			return res
 		}

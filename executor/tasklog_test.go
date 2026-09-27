@@ -23,7 +23,7 @@ func TestDescribeEvent(t *testing.T) {
 		{protocol.Event{Type: "log", Payload: map[string]any{"text": "Ветка: task-3-x"}}, "Ветка: task-3-x"},
 	}
 	for _, c := range cases {
-		if got := describeEvent(&c.ev); got != c.want {
+		if got := describeEvent(nil, &c.ev); got != c.want {
 			t.Errorf("%s: %q, ожидалось %q", c.ev.Type, got, c.want)
 		}
 	}
