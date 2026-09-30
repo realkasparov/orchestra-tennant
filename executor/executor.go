@@ -179,7 +179,8 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 		DeviceKey: e.cfg.DeviceKey, Hostname: e.cfg.Hostname, OS: e.cfg.OS,
 		Version: e.cfg.Version, MinSchema: protocol.MinSchemaVersion,
 		MaxSchema: protocol.SchemaVersion, Slots: e.cfg.Slots, ProjectsDir: e.cfg.ProjectsDir,
-		Models: e.cfg.Models, Running: e.runningIDs(), Parked: e.parkedJobs(),
+		Models: e.cfg.Models, ModelCatalog: protocol.Catalog(e.cfg.Models),
+		Running: e.runningIDs(), Parked: e.parkedJobs(),
 	}
 	if e.cfg.Skills != nil {
 		hello.SkillHashes = e.cfg.Skills.Hashes()
@@ -390,6 +391,9 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 			return
 		}
 	}
+	// Оркестратор может прислать короткие ключи моделей: сборку по ключу
+	// знает только машина.
+	offer.Plan.ResolveModels()
 	if err := offer.Plan.Validate(); err != nil {
 		e.reject(offer.JobID, err.Error(), false)
 		return

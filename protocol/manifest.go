@@ -343,9 +343,11 @@ func (m *Manifest) validate() error {
 			}
 		}
 	}
+	// Какие модели бывают, знает машина, а не манифест: ключ, которого нет в
+	// её каталоге, просто не будет выбран.
 	for _, k := range m.ModelPreference {
-		if ModelID(k) == Models[0].ID && k != Models[0].Key && k != Models[0].ID {
-			return fmt.Errorf("model_preference: неизвестная модель %q", k)
+		if !ValidModelKey(k) {
+			return fmt.Errorf("model_preference: недопустимый ключ модели %q", k)
 		}
 	}
 	return nil

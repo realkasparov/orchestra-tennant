@@ -219,6 +219,9 @@ func (p *Pipeline) Validate(m Manifests) error {
 		if s.Passes < 0 {
 			return fmt.Errorf("шаг %q: отрицательное число прогонов", s.Key)
 		}
+		if s.Model != "" && !ValidModelKey(s.Model) {
+			return fmt.Errorf("шаг %q: недопустимый ключ модели %q", s.Key, s.Model)
+		}
 		if s.Effort != "" && !knownEfforts[s.Effort] {
 			return fmt.Errorf("шаг %q: неизвестный режим усилий %q", s.Key, s.Effort)
 		}
