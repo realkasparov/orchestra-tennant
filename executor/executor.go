@@ -394,6 +394,10 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	// Оркестратор может прислать короткие ключи моделей: сборку по ключу
 	// знает только машина.
 	offer.Plan.ResolveModels()
+	if unknown := offer.Plan.UnknownModels(); len(unknown) > 0 {
+		e.reject(offer.JobID, "этот исполнитель не знает моделей: "+strings.Join(unknown, ", ")+" — обновите его (orchestra-tennant update) или выберите шагам другие", false)
+		return
+	}
 	if err := offer.Plan.Validate(); err != nil {
 		e.reject(offer.JobID, err.Error(), false)
 		return

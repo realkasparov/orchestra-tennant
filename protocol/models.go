@@ -87,9 +87,38 @@ var modelKeyRe = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
 // каталогом.
 func ValidModelKey(k string) bool { return modelKeyRe.MatchString(k) }
 
+// UnknownModels — модели включённых шагов и шага ответа, которых нет в
+// таблице этого исполнителя. Запустить их нельзя: подмена моделью по
+// умолчанию молча пустила бы шаг на другой (и дорогой) модели.
+func (p *Plan) UnknownModels() []string {
+	var out []string
+	seen := map[string]bool{}
+	check := func(m string) {
+		if m == "" || seen[m] {
+			return
+		}
+		if _, ok := ResolveModel(m); !ok {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	for _, s := range p.Steps {
+		if !s.Disabled {
+			check(s.Model)
+		}
+	}
+	for _, s := range p.Stages {
+		check(s.Model)
+	}
+	if p.QA != nil {
+		check(p.QA.Model)
+	}
+	return out
+}
+
 // ResolveModels переводит ключи моделей шагов плана в идентификаторы сборок
 // этого исполнителя. Неизвестный ключ остаётся как есть — его назовёт
-// проверка «на этой машине нет».
+// UnknownModels.
 func (p *Plan) ResolveModels() {
 	for i := range p.Steps {
 		if id, ok := ResolveModel(p.Steps[i].Model); ok {
