@@ -33,9 +33,11 @@ const (
 	MsgAck      = "ack"      // подтверждение приёма событий до номера
 	MsgProject  = "project"  // задание на проект: проверить, создать, обновить
 	MsgSkill    = "skill"    // скилл целиком в ответ на skill_get
+	MsgCompact  = "compact"  // сжать сессию шага (кнопка «Сжать сессию»)
 
 	// От исполнителя к оркестратору.
 	MsgProjectResult = "project_result" // ответ на задание о проекте
+	MsgCompactResult = "compact_result" // ответ на compact
 
 	// От исполнителя к оркестратору.
 	MsgHello    = "hello"     // представление при подключении
@@ -54,6 +56,12 @@ const (
 	EventArtifact = "artifact"
 	// EventDiff — дифф ветки против базового коммита по завершении этапа.
 	EventDiff = "diff"
+	// EventSessionUsage — заполненность контекста сессии шага: ключ, раунд,
+	// сессия, папка и модель сессии, размер, окно, процент, продолжения.
+	EventSessionUsage = "session_usage"
+	// EventSessionCompacted — сессия шага сжата: размер до и после, кто
+	// сжал (manual — кнопка, auto — порог исполнителя, claude — сам Claude Code).
+	EventSessionCompacted = "session_compacted"
 )
 
 // Envelope — конверт любого сообщения. Тип снаружи, содержимое внутри сырым
@@ -94,6 +102,9 @@ type Hello struct {
 	// нужно, но отказом отсутствие скилла не считается.
 	Skills      []string `json:"skills,omitempty"`
 	SkillHashes []string `json:"skill_hashes,omitempty"`
+	// Features — что исполнитель умеет сверх обязательного (FeatureCompact):
+	// оркестратор не шлёт команд, которых машина не поймёт.
+	Features []string `json:"features,omitempty"`
 	// Running — задания, которые исполнитель ведёт с прошлого соединения.
 	// Оркестратор сверяет их с закреплением и отвечает, что продолжать, а что
 	// бросить.
@@ -331,4 +342,52 @@ type ProjectResult struct {
 	Branches []string           `json:"branches,omitempty"`
 	Checks   []ProjectCheckItem `json:"checks,omitempty"`
 	Verdict  string             `json:"verdict,omitempty"` // ok | warn | err
+}
+
+// FeatureCompact — исполнитель понимает MsgCompact и шлёт session_usage.
+const FeatureCompact = "compact"
+
+// Пороги заполненности контекста сессии шага, в процентах окна модели.
+const (
+	// CompactOffer — с этого порога человеку предлагается «Сжать сессию».
+	CompactOffer = 60
+	// CompactAuto — с этого порога исполнитель сжимает сессию сам.
+	CompactAuto = 75
+)
+
+// Compact — команда сжать сессию шага. JobID пуст, если машина таску сейчас
+// не ведёт (готова, на паузе у оркестратора): тогда сессия поднимается по
+// SessionID, CWD и Model из последнего session_usage.
+type Compact struct {
+	ReqID     string `json:"req_id"`
+	TaskID    int64  `json:"task_id"`
+	Key       string `json:"key"`
+	Round     int    `json:"round"`
+	SessionID string `json:"session_id,omitempty"`
+	CWD       string `json:"cwd,omitempty"`
+	Model     string `json:"model,omitempty"`
+}
+
+// CompactResult — ответ на Compact. Status: done — сжато (Pre/Post — размер
+// до и после); scheduled — шаг идёт, сожмётся на ближайшей границе прогона,
+// итог придёт событием session_compacted; error — не вышло (Error).
+type CompactResult struct {
+	ReqID  string `json:"req_id"`
+	TaskID int64  `json:"task_id"`
+	Key    string `json:"key"`
+	Round  int    `json:"round"`
+	Status string `json:"status"`
+	Pre    int64  `json:"pre,omitempty"`
+	Post   int64  `json:"post,omitempty"`
+	Window int64  `json:"window,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// ContextPercent — заполненность контекста в процентах окна; 0, если окно
+// не известно.
+func ContextPercent(tokens, window int64) int {
+	if window <= 0 || tokens <= 0 {
+		return 0
+	}
+	return int(tokens * 100 / window)
 }

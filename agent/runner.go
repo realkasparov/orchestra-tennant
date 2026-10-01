@@ -39,6 +39,18 @@ type RunOpts struct {
 	// Markers — маркеры скилла (с двоеточием, как `RESULT:`): вырезаются из
 	// текста для чата вместе со встроенными.
 	Markers []string
+	// SessionEvents — слать в onEvent служебные события сессии: `context`
+	// (размер разговора после каждого обращения к модели, `tokens`) и
+	// `compacted` (Claude Code сжал историю: `pre`, `post`, `trigger`). Их
+	// разбирает исполнитель, в чат они не идут.
+	SessionEvents bool
+}
+
+// Compaction — сжатие истории сессии, увиденное в потоке (`compact_boundary`).
+type Compaction struct {
+	Trigger string // manual | auto
+	Pre     int64
+	Post    int64
 }
 
 // StreamEvent is one normalized event for the UI log.
@@ -64,6 +76,34 @@ type Result struct {
 	IsError   bool
 	ErrText   string
 	Usage     Usage // totals of the whole run
+	// Context — размер разговора: входные токены последнего обращения к модели
+	// вместе с кэшем (после сжатия — размер сводки). Сумма за прогон в Usage
+	// растёт с каждым ходом и размером контекста не является.
+	Context int64
+	// Windows — окно контекста по моделям из итога прогона (`contextWindow`).
+	Windows map[string]int64
+	// Compacted — последнее сжатие истории в этом прогоне; nil — не было.
+	Compacted *Compaction
+
+	lastMsg string // идентификатор последнего сообщения модели — обращение считается один раз
+}
+
+// Window — окно контекста модели прогона: по её идентификатору, иначе
+// наибольшее из итога (служебные вызовы Claude Code идут на других моделях).
+func (r *Result) Window(model string) int64 {
+	if r == nil {
+		return 0
+	}
+	if w, ok := r.Windows[model]; ok {
+		return w
+	}
+	var best int64
+	for _, w := range r.Windows {
+		if w > best {
+			best = w
+		}
+	}
+	return best
 }
 
 // Run spawns one headless claude turn and streams normalized events to onEvent.
@@ -168,6 +208,9 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 			msg["_interrupted"] = true
 		}
 		handleLine(msg, res, &text, onEvent, opts.Markers)
+		if opts.SessionEvents {
+			sessionLine(msg, res, onEvent)
+		}
 	}
 	select {
 	case <-stderrDone:
@@ -269,6 +312,75 @@ func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent 
 			res.Usage.CostUSD = c
 		}
 	}
+}
+
+// sessionLine разбирает служебное о сессии: размер разговора по каждому
+// обращению к модели, окно модели из итога и сжатие истории.
+func sessionLine(msg map[string]any, res *Result, onEvent func(StreamEvent)) {
+	switch msg["type"] {
+	case "assistant":
+		m, _ := msg["message"].(map[string]any)
+		u, ok := m["usage"].(map[string]any)
+		if !ok {
+			return
+		}
+		// Одно обращение к модели приходит несколькими сообщениями (по блоку
+		// содержимого) с одним идентификатором и одним расходом.
+		if id, _ := m["id"].(string); id != "" {
+			if id == res.lastMsg {
+				return
+			}
+			res.lastMsg = id
+		}
+		n := i64(u["input_tokens"]) + i64(u["cache_creation_input_tokens"]) + i64(u["cache_read_input_tokens"])
+		if n <= 0 {
+			return
+		}
+		res.Context = n
+		onEvent(StreamEvent{Type: "context", Payload: map[string]any{"tokens": n}})
+	case "system":
+		if msg["subtype"] != "compact_boundary" {
+			return
+		}
+		meta, _ := msg["compact_metadata"].(map[string]any)
+		c := &Compaction{Pre: i64(meta["pre_tokens"]), Post: i64(meta["post_tokens"])}
+		c.Trigger, _ = meta["trigger"].(string)
+		res.Compacted = c
+		if c.Post > 0 {
+			res.Context = c.Post
+		}
+		onEvent(StreamEvent{Type: "compacted", Payload: map[string]any{"pre": c.Pre, "post": c.Post, "trigger": c.Trigger}})
+	case "result":
+		mu, _ := msg["modelUsage"].(map[string]any)
+		for model, v := range mu {
+			if e, ok := v.(map[string]any); ok {
+				if w := i64(e["contextWindow"]); w > 0 {
+					if res.Windows == nil {
+						res.Windows = map[string]int64{}
+					}
+					res.Windows[model] = w
+				}
+			}
+		}
+	}
+}
+
+// Compact сжимает историю сессии средствами Claude Code: `--resume <сессия>
+// "/compact"` в той же папке, где сессия шла (Claude Code ищет сессии по
+// папке). Итог — размер до и после из события `compact_boundary`.
+func Compact(ctx context.Context, sessionID, cwd, model string) (*Compaction, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("у шага нет сессии")
+	}
+	res, err := Run(ctx, RunOpts{Prompt: "/compact", Resume: sessionID, Model: model, CWD: cwd, SessionEvents: true},
+		func(StreamEvent) {})
+	if err != nil {
+		return nil, err
+	}
+	if res.Compacted == nil {
+		return nil, fmt.Errorf("Claude Code не сообщил о сжатии сессии")
+	}
+	return res.Compacted, nil
 }
 
 // i64 reads a JSON number (decoded as float64) as int64; anything else → 0.

@@ -62,6 +62,7 @@ type Job struct {
 	answers  chan *protocol.Answer
 	messages chan *protocol.Message
 	cont     chan protocol.Continue
+	compacts chan *protocol.Compact
 
 	// State — состояние таски; заполняет Runner, хранится в журнале.
 	State *TaskState
@@ -239,6 +240,20 @@ func (j *Job) deliverMessage(m *protocol.Message) {
 		j.ex.logf("задание %s: очередь сообщений переполнена", j.ID)
 	}
 }
+
+// deliverCompact передаёт прогону команду сжать сессию шага; false — прогон
+// её не примет (очередь полна или у задания нет прогона).
+func (j *Job) deliverCompact(c *protocol.Compact) bool {
+	select {
+	case j.compacts <- c:
+		return true
+	default:
+		return false
+	}
+}
+
+// Compacts — команды «Сжать сессию» для шагов этого задания.
+func (j *Job) Compacts() <-chan *protocol.Compact { return j.compacts }
 
 func (j *Job) deliverContinue(budgetAck bool) {
 	select {

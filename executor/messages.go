@@ -112,13 +112,48 @@ type clarifyRequest struct {
 	// active — идёт прогон агента: уточнение имеет смысл; иначе сообщение
 	// разбирается как к стоящей таске.
 	active bool
+	// key — шаг идущего прогона; compact — просьба сжать его сессию (manual
+	// | auto), исполняется прерыванием и продолжением, как уточнение.
+	key     string
+	compact string
 }
 
 // arm запоминает, как прервать текущий прогон; nil — прогона нет.
-func (c *clarifyRequest) arm(cancel context.CancelFunc, interrupts bool) {
+func (c *clarifyRequest) arm(cancel context.CancelFunc, interrupts bool, key string) {
 	c.mu.Lock()
-	c.cancel, c.interrupts, c.active = cancel, interrupts, cancel != nil
+	c.cancel, c.interrupts, c.active, c.key = cancel, interrupts, cancel != nil, key
 	c.mu.Unlock()
+}
+
+// requestCompact просит сжать сессию шага key. Ответ: interrupt — прогон
+// этого шага прерван и сожмётся сразу; pending — шаг идёт, прерывать нельзя;
+// idle — этот шаг сейчас не идёт.
+func (c *clarifyRequest) requestCompact(key, trigger string) string {
+	c.mu.Lock()
+	if !c.active || c.key != key {
+		c.mu.Unlock()
+		return "idle"
+	}
+	if !c.interrupts {
+		c.mu.Unlock()
+		return "pending"
+	}
+	if c.compact == "" {
+		c.compact = trigger
+	}
+	cancel := c.cancel
+	c.mu.Unlock()
+	cancel()
+	return "interrupt"
+}
+
+// takeCompact отдаёт просьбу сжать сессию и очищает её.
+func (c *clarifyRequest) takeCompact() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.compact
+	c.compact = ""
+	return t
 }
 
 // running — идёт ли сейчас прогон агента.
@@ -169,6 +204,8 @@ func (r *run) serveMessages(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case c := <-r.job.Compacts():
+			r.compactRequest(ctx, c)
 		case m := <-r.job.Messages():
 			if r.clar.running() {
 				// Идёт агентный шаг: сообщение — уточнение к нему, без

@@ -48,3 +48,34 @@ func TestModelID(t *testing.T) {
 		}
 	}
 }
+
+// Размер разговора — по последнему обращению к модели (одно обращение —
+// несколько сообщений с одним id), окно — из итога, сжатие — из
+// compact_boundary.
+func TestSessionLine(t *testing.T) {
+	res := &Result{}
+	var events []StreamEvent
+	on := func(e StreamEvent) { events = append(events, e) }
+	call := func(id string, in, write, read float64) map[string]any {
+		return map[string]any{"type": "assistant", "message": map[string]any{"id": id,
+			"usage": map[string]any{"input_tokens": in, "cache_creation_input_tokens": write, "cache_read_input_tokens": read}}}
+	}
+	sessionLine(call("m1", 10, 9664, 22376), res, on)
+	sessionLine(call("m1", 10, 9664, 22376), res, on)
+	sessionLine(call("m2", 8, 2559, 32040), res, on)
+	if res.Context != 34607 || len(events) != 2 {
+		t.Fatalf("контекст %d, событий %d", res.Context, len(events))
+	}
+	sessionLine(map[string]any{"type": "system", "subtype": "compact_boundary",
+		"compact_metadata": map[string]any{"trigger": "manual", "pre_tokens": 31964.0, "post_tokens": 3603.0}}, res, on)
+	if res.Compacted == nil || res.Compacted.Pre != 31964 || res.Context != 3603 {
+		t.Fatalf("сжатие: %+v, контекст %d", res.Compacted, res.Context)
+	}
+	sessionLine(map[string]any{"type": "result", "modelUsage": map[string]any{
+		"claude-opus-5":             map[string]any{"contextWindow": 1000000.0},
+		"claude-haiku-4-5-20251001": map[string]any{"contextWindow": 200000.0},
+	}}, res, on)
+	if res.Window("claude-haiku-4-5-20251001") != 200000 || res.Window("claude-sonnet-5") != 1000000 {
+		t.Fatalf("окна: %+v", res.Windows)
+	}
+}

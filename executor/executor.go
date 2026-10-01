@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/realkasparov/orchestra-tennant/agent"
 	"github.com/realkasparov/orchestra-tennant/protocol"
 )
 
@@ -72,6 +73,35 @@ type Executor struct {
 	connected chan struct{}
 	// skillWaits — ожидающие ответа запросы скиллов по хэшу.
 	skillWaits map[string][]chan *protocol.SkillFile
+	// windows — окно контекста по модели из последних прогонов: пока идёт
+	// первый прогон сессии, процент считается по нему.
+	windows map[string]int64
+}
+
+// defaultWindow — окно контекста, пока модель на этой машине ещё не
+// сообщила своё.
+const defaultWindow = 200000
+
+// windowFor — последнее известное окно модели.
+func (e *Executor) windowFor(model string) int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if w := e.windows[model]; w > 0 {
+		return w
+	}
+	return defaultWindow
+}
+
+func (e *Executor) noteWindow(model string, w int64) {
+	if w <= 0 {
+		return
+	}
+	e.mu.Lock()
+	if e.windows == nil {
+		e.windows = map[string]int64{}
+	}
+	e.windows[model] = w
+	e.mu.Unlock()
 }
 
 // New создаёт исполнителя. Журнал читается сразу: незавершённые задания
@@ -180,7 +210,8 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 		Version: e.cfg.Version, MinSchema: protocol.MinSchemaVersion,
 		MaxSchema: protocol.SchemaVersion, Slots: e.cfg.Slots, ProjectsDir: e.cfg.ProjectsDir,
 		Models: e.cfg.Models, ModelCatalog: protocol.Catalog(e.cfg.Models),
-		Running: e.runningIDs(), Parked: e.parkedJobs(),
+		Features: []string{protocol.FeatureCompact},
+		Running:  e.runningIDs(), Parked: e.parkedJobs(),
 	}
 	if e.cfg.Skills != nil {
 		hello.SkillHashes = e.cfg.Skills.Hashes()
@@ -352,6 +383,11 @@ func (e *Executor) handle(ctx context.Context, env *protocol.Envelope) {
 		if j := e.job(env.JobID); j != nil {
 			j.deliverContinue(c.BudgetAck)
 		}
+	case protocol.MsgCompact:
+		var c protocol.Compact
+		if err := json.Unmarshal(env.Body, &c); err == nil {
+			e.handleCompact(ctx, env.JobID, &c)
+		}
 	case protocol.MsgProject:
 		e.handleProject(ctx, env)
 	case protocol.MsgSkill:
@@ -465,7 +501,8 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	jctx, cancel := context.WithCancel(ctx)
 	j := &Job{ID: offer.JobID, Plan: offer.Plan, Resume: offer.Resume, Skip: offer.Done, ex: e,
 		answers: make(chan *protocol.Answer, 8), messages: make(chan *protocol.Message, 8),
-		cont: make(chan protocol.Continue, 1), cancel: cancel, ended: make(chan struct{})}
+		compacts: make(chan *protocol.Compact, 4),
+		cont:     make(chan protocol.Continue, 1), cancel: cancel, ended: make(chan struct{})}
 	if existing != nil {
 		// Память прошлого запуска: сессии агента, прогоны, вопросы. Без неё
 		// возобновление начинало бы этап заново, не зная, что можно продолжить.
@@ -824,4 +861,31 @@ func (e *Executor) send(typ, jobID string, body any) error {
 	}
 	e.trace("→", typ, jobID)
 	return send(conn, typ, jobID, body)
+}
+
+// handleCompact — «Сжать сессию». Задание идёт — решает его прогон (шаг
+// идёт или стоит); не идёт — сессия поднимается по присланным SessionID,
+// CWD и Model и сжимается здесь же. Ответ — compact_result.
+func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.Compact) {
+	reply := func(r *protocol.CompactResult) {
+		r.ReqID, r.TaskID, r.Key, r.Round = c.ReqID, c.TaskID, c.Key, c.Round
+		if err := e.send(protocol.MsgCompactResult, jobID, r); err != nil {
+			e.logf("ответ на сжатие сессии %s: %v", c.ReqID, err)
+		}
+	}
+	if j := e.job(jobID); j != nil && !j.isFinished() {
+		if j.deliverCompact(c) {
+			return // ответит прогон
+		}
+	}
+	go func() {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+		comp, err := agent.Compact(cctx, c.SessionID, c.CWD, c.Model)
+		if err != nil {
+			reply(&protocol.CompactResult{Status: "error", Error: err.Error()})
+			return
+		}
+		reply(&protocol.CompactResult{Status: "done", Pre: comp.Pre, Post: comp.Post, Window: e.windowFor(c.Model)})
+	}()
 }

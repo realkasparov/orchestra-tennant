@@ -18,6 +18,18 @@ type StageState struct {
 	SessionID   string         `json:"session_id,omitempty"`
 	CurrentPass int            `json:"current_pass,omitempty"`
 	Usage       protocol.Usage `json:"usage"`
+	// Сессия для заполненности контекста: папка и модель, в которых она шла
+	// (Claude Code ищет сессию по папке), размер разговора и окно модели.
+	SessionCWD   string `json:"session_cwd,omitempty"`
+	SessionModel string `json:"session_model,omitempty"`
+	Context      int64  `json:"context,omitempty"`
+	Window       int64  `json:"window,omitempty"`
+	// Resumes — сколько раз сессию продолжали снаружи (починка после тестов,
+	// продолжение после паузы, правка во вход «продолжение»).
+	Resumes int `json:"resumes,omitempty"`
+	// CompactPending — сжать перед следующим продолжением (manual | auto):
+	// шаг шёл, а прерывать его было нельзя.
+	CompactPending string `json:"compact_pending,omitempty"`
 }
 
 // QuestionState — вопрос агента и его судьба.
@@ -81,6 +93,19 @@ func (s *TaskState) stage(key string) *StageState {
 		}
 	}
 	return found
+}
+
+// stageRound — шаг key раунда round; round 0 — последний раунд.
+func (s *TaskState) stageRound(key string, round int) *StageState {
+	if round <= 0 {
+		return s.stage(key)
+	}
+	for _, st := range s.Stages {
+		if st.Key == key && st.Round == round {
+			return st
+		}
+	}
+	return nil
 }
 
 // round — номер последнего раунда (1 у свежей таски).

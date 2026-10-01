@@ -60,6 +60,8 @@ type run struct {
 	// pass и passScope — текущий прогон шага для привязок `$task.pass`.
 	pass      int
 	passScope string
+	// sess — замки и последние проценты сессий шагов.
+	sess sessionState
 }
 
 // Run исполняет задание. Возвращаемый статус — терминальный статус таски.
@@ -480,41 +482,107 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, sp agentSpec, p
 // его и продолжает ту же сессию с текстом уточнения.
 func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec, prompt, resume string, pass int) (string, error) {
 	var all strings.Builder
+	// Сессию шага сжимает и прогон, и кнопка человека: одновременно — нельзя.
+	lock := r.stageLock(st.Key)
+	lock.Lock()
+	defer lock.Unlock()
+	model := agent.ModelID(sp.model)
+	st.SessionCWD, st.SessionModel = sp.cwd, model
+	if st.Window == 0 {
+		st.Window = r.windowFor(model)
+	}
+	if resume != "" {
+		// Продолжение снаружи: починка после тестов, продолжение после паузы.
+		st.Resumes++
+		trigger := st.CompactPending
+		if trigger == "" && protocol.ContextPercent(st.Context, st.Window) >= protocol.CompactAuto {
+			trigger = "auto"
+		}
+		if trigger != "" {
+			if _, err := r.compactNow(ctx, st, resume, trigger); err == nil {
+				prompt = "Сессия сжата, чтобы освободить контекст.\n\n" + prompt
+			}
+		}
+		r.emitSession(st, true)
+	}
+	autoAsked := false
 	for {
 		if err := r.checkBudget(); err != nil {
 			return all.String(), err
 		}
 		runCtx, cancel := context.WithTimeout(ctx, r.plan.StageTimeout.Duration())
 		onEvent := func(ev agent.StreamEvent) {
+			switch ev.Type {
+			case "context":
+				n, _ := ev.Payload["tokens"].(int64)
+				st.Context = n
+				r.emitSession(st, false)
+				if !autoAsked && protocol.ContextPercent(n, st.Window) >= protocol.CompactAuto {
+					autoAsked = true
+					if r.clar.requestCompact(st.Key, "auto") == "pending" {
+						st.CompactPending = "auto"
+						r.log(st.Key, fmt.Sprintf("Контекст сессии %d%% — сожму её перед следующим продолжением: прервать этот шаг нельзя.", protocol.ContextPercent(n, st.Window)))
+					}
+				}
+				return
+			case "compacted":
+				pre, _ := ev.Payload["pre"].(int64)
+				post, _ := ev.Payload["post"].(int64)
+				r.sessionCompacted(st, pre, post, "claude")
+				return
+			}
 			r.job.Emit(st.Key, ev.Type, ev.Payload)
 		}
 		mcpCfg, extraTools := r.p.codeSearchFor(r.plan, sp.search)
-		r.clar.arm(cancel, sp.resume)
+		r.clar.arm(cancel, sp.resume, st.Key)
 		res, err := agent.Run(runCtx, agent.RunOpts{
 			Prompt: prompt, Resume: resume,
-			Model: agent.ModelID(sp.model), Effort: sp.effort,
+			Model: model, Effort: sp.effort,
 			CWD: sp.cwd, AddDirs: []string{r.st.TaskDir},
 			AllowedTools: withTools(sp.tools, extraTools),
 			MCPConfig:    mcpCfg, Markers: sp.markers,
+			SessionEvents: true,
 		}, onEvent)
-		r.clar.arm(nil, false)
+		r.clar.arm(nil, false, "")
 		clarified := r.clar.take()
+		compactReq := r.clar.takeCompact()
 		timedOut := runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 		cancel()
 		if res != nil && res.SessionID != "" {
 			st.SessionID, st.CurrentPass = res.SessionID, pass
 		}
+		if res != nil {
+			if w := res.Window(model); w > 0 {
+				st.Window = w
+				r.noteWindow(model, w)
+			}
+			if res.Context > 0 {
+				st.Context = res.Context
+			}
+		}
+		r.emitSession(st, true)
 		r.recordUsage(st, res)
 		r.job.SaveState()
 		if timedOut {
 			return all.String(), fmt.Errorf("этап превысил лимит времени (%s) и был остановлен", r.plan.StageTimeout.Duration())
 		}
-		if err != nil && (clarified == "" || ctx.Err() != nil || res == nil || res.SessionID == "") {
+		if err != nil && ((clarified == "" && compactReq == "") || ctx.Err() != nil || res == nil || res.SessionID == "") {
 			return all.String(), err
 		}
 		if res != nil {
 			all.WriteString(res.FullText)
 			resume = res.SessionID
+		}
+		if compactReq != "" {
+			// Прогон прерван ради сжатия: сжимаем и продолжаем ту же сессию.
+			prompt = "Продолжай работу с места остановки."
+			if _, cerr := r.compactNow(ctx, st, resume, compactReq); cerr == nil {
+				prompt = "Сессия сжата, чтобы освободить контекст. Продолжай работу с места остановки."
+			}
+			if clarified != "" {
+				prompt += "\n\nУточнение пользователя (учти его):\n" + clarified
+			}
+			continue
 		}
 		if clarified != "" {
 			r.log(st.Key, "Уточнение принято — продолжаю ту же сессию.")
