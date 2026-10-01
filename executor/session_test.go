@@ -202,4 +202,9 @@ esac
 	if !strings.Contains(string(raw), "/compact") || st.Context != 9000 {
 		t.Fatalf("сжатие: контекст %d, вызовы %s", st.Context, raw)
 	}
+	// Промпт прерванного на старте вызова не теряется: ответы доходят.
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "ответы на вопросы") || !strings.Contains(last, "Сессия сжата") {
+		t.Fatalf("продолжение без исходного промпта: %s", last)
+	}
 }

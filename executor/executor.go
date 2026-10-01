@@ -897,6 +897,10 @@ func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.
 			return
 		}
 	}
+	// Задания таски, бывшие до сжатия (например, только что остановленное
+	// паузой), могут ещё выходить из той же сессии — сжатие их дождётся.
+	// Принятые позже сами ждут сжатие (waitCompaction), их ждать нельзя.
+	before := e.taskJobs(c.TaskID)
 	ic, done, ok := e.startCompaction(c)
 	if !ok {
 		reply(&protocol.CompactResult{Status: "error", Error: "сессия этой таски уже сжимается"})
@@ -906,6 +910,12 @@ func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.
 		defer done()
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		defer cancel()
+		for _, j := range before {
+			select {
+			case <-j.ended:
+			case <-cctx.Done():
+			}
+		}
 		comp, err := agent.Compact(cctx, c.SessionID, c.CWD, c.Model)
 		if err != nil {
 			reply(&protocol.CompactResult{Status: "error", Error: err.Error()})
@@ -1009,4 +1019,17 @@ func (e *Executor) dropCompacts(j *Job) {
 			return
 		}
 	}
+}
+
+// taskJobs — задания таски в памяти исполнителя.
+func (e *Executor) taskJobs(taskID int64) []*Job {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []*Job
+	for _, j := range e.jobs {
+		if j.Plan != nil && j.Plan.TaskID == taskID && j.ended != nil {
+			out = append(out, j)
+		}
+	}
+	return out
 }

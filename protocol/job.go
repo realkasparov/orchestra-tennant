@@ -345,7 +345,10 @@ type ProjectResult struct {
 }
 
 // FeatureCompact — исполнитель понимает MsgCompact и шлёт session_usage.
-const FeatureCompact = "compact"
+// Версия 2 (тенант 0.4.5): сжатие в обход задания отвечает без его
+// идентификатора, задание таски ждёт такого сжатия, раунд сверяется.
+// Исполнителям v0.4.4 («compact») сервис команд сжатия не шлёт.
+const FeatureCompact = "compact.v2"
 
 // Пороги заполненности контекста сессии шага, в процентах окна модели.
 const (

@@ -577,11 +577,15 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			SessionEvents: true,
 		}, onEvent)
 		r.clar.arm(nil, false, "", 0, false)
-		if res != nil && res.SessionID == "" && resume != "" {
+		// started — CLI успел начать вызов; иначе промпт до агента не дошёл,
+		// и продолжение должно его повторить.
+		started := res != nil && res.SessionID != ""
+		if res != nil && !started && resume != "" {
 			// Прерван на старте, до первой строки: продолжаемая сессия
 			// известна и так — уточнение или сжатие продолжат её.
 			res.SessionID = resume
 		}
+		sent := prompt
 		clarified := r.clar.take()
 		compactReq := r.clar.takeCompact()
 		timedOut := runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
@@ -626,13 +630,24 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 		}
 		if compactReq != "" {
 			// Прогон прерван ради сжатия: сжимаем и продолжаем ту же сессию.
-			prompt = "Продолжай работу с места остановки."
 			if compactReq == "auto" {
 				autos++
 			}
+			compacted := false
 			if _, cerr := r.compactNow(ctx, st, resume, compactReq); cerr == nil {
-				prompt = "Сессия сжата, чтобы освободить контекст. Продолжай работу с места остановки."
+				compacted = true
 				autoAsked = autos >= 3
+			}
+			if ctx.Err() != nil {
+				return all.String(), ctx.Err()
+			}
+			prompt = "Продолжай работу с места остановки."
+			if !started {
+				// Промпт не дошёл до агента — повторяем его.
+				prompt = sent
+			}
+			if compacted {
+				prompt = "Сессия сжата, чтобы освободить контекст.\n\n" + prompt
 			}
 			if clarified != "" {
 				prompt += "\n\nУточнение пользователя (учти его):\n" + clarified
@@ -641,7 +656,11 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 		}
 		if clarified != "" {
 			r.log(st.Key, "Уточнение принято — продолжаю ту же сессию.")
-			prompt = "Уточнение пользователя (учти его и продолжи с места остановки):\n" + clarified
+			if !started {
+				prompt = sent + "\n\nУточнение пользователя (учти его):\n" + clarified
+			} else {
+				prompt = "Уточнение пользователя (учти его и продолжи с места остановки):\n" + clarified
+			}
 			continue
 		}
 
