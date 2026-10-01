@@ -83,7 +83,7 @@ func TestManualCompactIdleStage(t *testing.T) {
 	r.st.Stages = append(r.st.Stages, st)
 	r.seedSessions()
 	r.compactRequest(context.Background(), &protocol.Compact{ReqID: "q1", Key: "analyze", Round: 1})
-	r.closeSessions()
+	r.sess.wg.Wait()
 	if st.Context != 130000 {
 		t.Fatalf("горутина сообщений тронула шаг: %d", st.Context)
 	}
@@ -97,6 +97,14 @@ func TestManualCompactIdleStage(t *testing.T) {
 	if !compacted {
 		t.Fatal("нет события о сжатии")
 	}
+
+	// Задание кончилось раньше, чем шаг взяли снова: итог — в шаг и журнал.
+	st.Context = 130000
+	r.compactRequest(context.Background(), &protocol.Compact{ReqID: "q2", Key: "analyze", Round: 1})
+	r.closeSessions()
+	if st.Context != 12000 || st.CompactPending != "" {
+		t.Fatalf("итог сжатия при конце задания: %+v", st)
+	}
 }
 
 // Шаг занят (ждёт ответов): просьба откладывается до следующего обращения к
@@ -106,7 +114,7 @@ func TestManualCompactBusyStage(t *testing.T) {
 	st := &StageState{Key: "analyze", Round: 2, SessionID: "s2"}
 	r.st.Stages = append(r.st.Stages, st)
 	r.seedSessions()
-	lock := r.stageLock("analyze")
+	lock := r.stageLock("analyze", 2)
 	lock.Lock()
 	r.compactRequest(context.Background(), &protocol.Compact{ReqID: "q1", Key: "analyze", Round: 2})
 	lock.Unlock()

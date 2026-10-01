@@ -487,9 +487,11 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, sp agentSpec, p
 func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec, prompt, resume string, pass int) (string, error) {
 	var all strings.Builder
 	// Сессию шага сжимает и прогон, и кнопка человека: одновременно — нельзя.
-	lock := r.stageLock(st.Key)
+	lock := r.stageLock(st.Key, st.Round)
 	lock.Lock()
 	defer lock.Unlock()
+	// Просьба сжать, пришедшая под конец прогона, остаётся у шага.
+	defer r.keepPending(st)
 	model := agent.ModelID(sp.model)
 	st.SessionCWD, st.SessionModel = sp.cwd, model
 	// Окно — только сообщённое моделью: по окну по умолчанию процент
@@ -624,6 +626,7 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			return all.String(), fmt.Errorf("невалидный QUESTIONS_JSON: %w", qerr)
 		}
 		if !present || len(qs) == 0 {
+			r.keepPending(st)
 			if st.CompactPending == "manual" {
 				// Человек просил сжать, а шаг тем временем закончился.
 				r.compactNow(ctx, st, resume, "manual")

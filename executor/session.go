@@ -27,7 +27,7 @@ type sessionInfo struct {
 // sessionState — то, что прогон помнит о сессиях шагов между вызовами.
 type sessionState struct {
 	mu      sync.Mutex
-	locks   map[string]*sync.Mutex
+	locks   map[sref]*sync.Mutex
 	lastPct map[sref]int
 	// info — снимки сессий шагов раундов; pending — просьбы сжать, пока
 	// шаг занят; compacted — размер после сжатия стоящего шага, который цикл
@@ -49,18 +49,19 @@ type sref struct {
 
 func sessKey(key string, round int) sref { return sref{key, round} }
 
-// stageLock — замок сессии шага: прогон держит его, пока идёт агент;
-// сжатие стоящего шага берёт его же.
-func (r *run) stageLock(key string) *sync.Mutex {
+// stageLock — замок сессии шага раунда: прогон держит его, пока идёт
+// агент; сжатие стоящего шага берёт его же.
+func (r *run) stageLock(key string, round int) *sync.Mutex {
 	r.sess.mu.Lock()
 	defer r.sess.mu.Unlock()
 	if r.sess.locks == nil {
-		r.sess.locks = map[string]*sync.Mutex{}
+		r.sess.locks = map[sref]*sync.Mutex{}
 	}
-	l := r.sess.locks[key]
+	k := sessKey(key, round)
+	l := r.sess.locks[k]
 	if l == nil {
 		l = &sync.Mutex{}
-		r.sess.locks[key] = l
+		r.sess.locks[k] = l
 	}
 	return l
 }
@@ -153,10 +154,10 @@ func (r *run) takeSession(st *StageState) string {
 	delete(r.sess.pending, k)
 	r.sess.mu.Unlock()
 	if ok {
+		// Уже сжата по кнопке: прежняя просьба (и автосжатие по старому
+		// размеру) ни к чему — порог решит по новому.
 		st.Context = post
-		if st.CompactPending == "manual" {
-			st.CompactPending = "" // уже сжата по кнопке
-		}
+		st.CompactPending = ""
 	}
 	trigger := st.CompactPending
 	if manual != "" {
@@ -164,6 +165,20 @@ func (r *run) takeSession(st *StageState) string {
 	}
 	st.CompactPending = ""
 	return trigger
+}
+
+// keepPending переносит в шаг просьбу сжать, оставленную горутиной
+// сообщений, — шаг кончает прогон, и просьба уйдёт в журнал. Зовёт только
+// цикл этапов.
+func (r *run) keepPending(st *StageState) {
+	k := sessKey(st.Key, st.Round)
+	r.sess.mu.Lock()
+	t := r.sess.pending[k]
+	delete(r.sess.pending, k)
+	r.sess.mu.Unlock()
+	if t != "" {
+		st.CompactPending = t
+	}
 }
 
 // dropPending — шаг начинает новую сессию: просьбы сжать прежнюю ни к чему.
@@ -174,12 +189,32 @@ func (r *run) dropPending(st *StageState) {
 	r.sess.mu.Unlock()
 }
 
-// closeSessions — прогон заканчивается: дождаться сжатий в фоне.
+// closeSessions — прогон заканчивается: дождаться сжатий в фоне и перенести
+// в шаги то, что цикл этапов не успел забрать, — итоги сжатий и просьбы
+// останутся в журнале до продолжения. Зовёт цикл этапов.
 func (r *run) closeSessions() {
 	r.sess.mu.Lock()
 	r.sess.closed = true
 	r.sess.mu.Unlock()
 	r.sess.wg.Wait()
+	r.sess.mu.Lock()
+	compacted, pending := r.sess.compacted, r.sess.pending
+	r.sess.compacted, r.sess.pending = nil, nil
+	r.sess.mu.Unlock()
+	if len(compacted) == 0 && len(pending) == 0 {
+		return
+	}
+	for k, post := range compacted {
+		if st := r.st.stageRound(k.key, k.round); st != nil {
+			st.Context, st.CompactPending = post, ""
+		}
+	}
+	for k, t := range pending {
+		if st := r.st.stageRound(k.key, k.round); st != nil {
+			st.CompactPending = t
+		}
+	}
+	r.job.SaveState()
 }
 
 // emitSession сообщает оркестратору заполненность сессии шага. Без force —
@@ -232,7 +267,6 @@ func (r *run) sessionCompacted(st *StageState, pre, post int64, trigger string) 
 // compactNow сжимает сессию шага из цикла этапов. Сбой не роняет шаг:
 // сессия продолжается как есть, причина — в журнале.
 func (r *run) compactNow(ctx context.Context, st *StageState, session, trigger string) (*agent.Compaction, error) {
-	st.CompactPending = ""
 	if session == "" {
 		session = st.SessionID
 	}
@@ -240,9 +274,16 @@ func (r *run) compactNow(ctx context.Context, st *StageState, session, trigger s
 	defer cancel()
 	comp, err := agent.Compact(cctx, session, st.SessionCWD, st.SessionModel)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Пауза оборвала сжатие: просьба остаётся до продолжения.
+			st.CompactPending = trigger
+			return nil, err
+		}
+		st.CompactPending = ""
 		r.log(st.Key, "Сжать сессию не вышло: "+err.Error()+" — продолжаю без сжатия.")
 		return nil, err
 	}
+	st.CompactPending = ""
 	r.sessionCompacted(st, comp.Pre, comp.Post, trigger)
 	r.job.SaveState()
 	return comp, nil
@@ -276,7 +317,7 @@ func (r *run) compactRequest(ctx context.Context, c *protocol.Compact) {
 		return
 	}
 	k := sessKey(c.Key, round)
-	lock := r.stageLock(c.Key)
+	lock := r.stageLock(c.Key, round)
 	r.sess.mu.Lock()
 	if r.sess.closed || r.sess.busy[k] {
 		busy := r.sess.busy[k]
@@ -314,7 +355,7 @@ func (r *run) compactRequest(ctx context.Context, c *protocol.Compact) {
 		defer cancel()
 		comp, err := agent.Compact(cctx, in.ID, in.CWD, in.Model)
 		if err != nil {
-			r.log(c.Key, "Сжать сессию не вышло: "+err.Error())
+			// Причину пишет в журнал таски сервис по этому ответу.
 			reply(&protocol.CompactResult{Status: "error", Error: err.Error()})
 			return
 		}

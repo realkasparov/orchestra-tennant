@@ -76,6 +76,10 @@ type Executor struct {
 	// windows — окно контекста по модели из последних прогонов: пока идёт
 	// первый прогон сессии, процент считается по нему.
 	windows map[string]int64
+	// compacting — таски, чью сессию сейчас сжимает команда без задания:
+	// задание той же таски ждёт конца сжатия, чтобы не продолжить сессию
+	// одновременно с ним.
+	compacting map[int64]chan struct{}
 }
 
 // defaultWindow — окно контекста, пока модель на этой машине ещё не
@@ -565,6 +569,9 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 // тогда он уйдёт при следующем подключении вместе с досылкой событий.
 func (e *Executor) run(ctx context.Context, j *Job) {
 	defer close(j.ended)
+	// Команды сжатия, пришедшие, пока прогон заканчивался, получают ответ.
+	defer e.dropCompacts(j)
+	e.waitCompaction(ctx, j.Plan.TaskID)
 	status, err := e.runner.Run(ctx, j)
 	reason := ""
 	if r := j.cancelReason(); r != "" {
@@ -878,7 +885,13 @@ func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.
 		reply(&protocol.CompactResult{Status: "error", Error: "очередь команд задания полна — повторите позже"})
 		return
 	}
+	done, ok := e.startCompaction(c.TaskID)
+	if !ok {
+		reply(&protocol.CompactResult{Status: "error", Error: "сессия этой таски уже сжимается"})
+		return
+	}
 	go func() {
+		defer done()
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		defer cancel()
 		comp, err := agent.Compact(cctx, c.SessionID, c.CWD, c.Model)
@@ -916,4 +929,55 @@ func (e *Executor) noteCompacted(c *protocol.Compact, comp *agent.Compaction) {
 	}
 	parked.mu.Unlock()
 	parked.SaveState()
+}
+
+// startCompaction отмечает сжатие сессии таски без задания; false — уже идёт.
+func (e *Executor) startCompaction(taskID int64) (done func(), ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.compacting[taskID] != nil {
+		return nil, false
+	}
+	if e.compacting == nil {
+		e.compacting = map[int64]chan struct{}{}
+	}
+	ch := make(chan struct{})
+	e.compacting[taskID] = ch
+	return func() {
+		e.mu.Lock()
+		delete(e.compacting, taskID)
+		e.mu.Unlock()
+		close(ch)
+	}, true
+}
+
+// waitCompaction — задание таски ждёт конца её сжатия без задания.
+func (e *Executor) waitCompaction(ctx context.Context, taskID int64) {
+	e.mu.Lock()
+	ch := e.compacting[taskID]
+	e.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+}
+
+// dropCompacts отвечает на команды сжатия, которые прогон задания уже не
+// заберёт.
+func (e *Executor) dropCompacts(j *Job) {
+	for {
+		select {
+		case c := <-j.compacts:
+			res := &protocol.CompactResult{ReqID: c.ReqID, TaskID: c.TaskID, Key: c.Key, Round: c.Round,
+				Status: "error", Error: "задание остановилось — нажмите «Сжать сессию» ещё раз"}
+			if err := e.send(protocol.MsgCompactResult, j.ID, res); err != nil {
+				e.logf("ответ на сжатие сессии %s: %v", c.ReqID, err)
+			}
+		default:
+			return
+		}
+	}
 }
