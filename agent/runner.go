@@ -339,6 +339,12 @@ func sessionLine(msg map[string]any, res *Result, onEvent func(StreamEvent)) {
 		res.Context = n
 		onEvent(StreamEvent{Type: "context", Payload: map[string]any{"tokens": n}})
 	case "system":
+		if msg["subtype"] == "init" {
+			if sid, _ := msg["session_id"].(string); sid != "" {
+				onEvent(StreamEvent{Type: "session", Payload: map[string]any{"id": sid}})
+			}
+			return
+		}
 		if msg["subtype"] != "compact_boundary" {
 			return
 		}

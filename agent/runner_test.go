@@ -60,6 +60,12 @@ func TestSessionLine(t *testing.T) {
 		return map[string]any{"type": "assistant", "message": map[string]any{"id": id,
 			"usage": map[string]any{"input_tokens": in, "cache_creation_input_tokens": write, "cache_read_input_tokens": read}}}
 	}
+	// Сессия известна с первой строки — до первого обращения к модели.
+	sessionLine(map[string]any{"type": "system", "subtype": "init", "session_id": "s1"}, res, on)
+	if len(events) != 1 || events[0].Type != "session" || events[0].Payload["id"] != "s1" {
+		t.Fatalf("начало сессии: %+v", events)
+	}
+	events = nil
 	sessionLine(call("m1", 10, 9664, 22376), res, on)
 	sessionLine(call("m1", 10, 9664, 22376), res, on)
 	sessionLine(call("m2", 8, 2559, 32040), res, on)

@@ -67,7 +67,7 @@ func TestClarifyRequest(t *testing.T) {
 		t.Fatal("без прогона не должно быть active")
 	}
 	cancelled := false
-	c.arm(func() { cancelled = true }, true, "execute")
+	c.arm(func() { cancelled = true }, true, "execute", 1)
 	if !c.running() {
 		t.Fatal("прогон не отмечен")
 	}
@@ -83,12 +83,12 @@ func TestClarifyRequest(t *testing.T) {
 		t.Error("уточнение не очищено")
 	}
 	cancelled = false
-	c.arm(func() { cancelled = true }, false, "execute")
+	c.arm(func() { cancelled = true }, false, "execute", 1)
 	c.request("ещё")
 	if cancelled {
 		t.Fatal("нерезюмируемый прогон прерван")
 	}
-	c.arm(nil, false, "")
+	c.arm(nil, false, "", 0)
 	if c.running() {
 		t.Fatal("после прогона active остался")
 	}
@@ -205,22 +205,25 @@ func TestReworkKeys(t *testing.T) {
 // откладывает, чужой или стоящий шаг — сжимается отдельно.
 func TestClarifyCompactRequest(t *testing.T) {
 	var c clarifyRequest
-	if got := c.requestCompact("execute", "manual"); got != "idle" {
+	if got := c.requestCompact("execute", 0, "manual"); got != "idle" {
 		t.Fatalf("без прогона: %s", got)
 	}
 	cancelled := false
-	c.arm(func() { cancelled = true }, true, "execute")
-	if got := c.requestCompact("review", "manual"); got != "idle" {
+	c.arm(func() { cancelled = true }, true, "execute", 1)
+	if got := c.requestCompact("review", 1, "manual"); got != "idle" {
 		t.Fatalf("чужой шаг: %s", got)
 	}
-	if got := c.requestCompact("execute", "auto"); got != "interrupt" || !cancelled {
+	if got := c.requestCompact("execute", 2, "manual"); got != "idle" || cancelled {
+		t.Fatalf("тот же шаг другого раунда: %s, прерван %v", got, cancelled)
+	}
+	if got := c.requestCompact("execute", 1, "auto"); got != "interrupt" || !cancelled {
 		t.Fatalf("идущий шаг: %s, прерван %v", got, cancelled)
 	}
 	if got := c.takeCompact(); got != "auto" || c.takeCompact() != "" {
 		t.Fatalf("просьба: %q", got)
 	}
-	c.arm(func() {}, false, "execute")
-	if got := c.requestCompact("execute", "manual"); got != "pending" {
+	c.arm(func() {}, false, "execute", 1)
+	if got := c.requestCompact("execute", 1, "manual"); got != "pending" {
 		t.Fatalf("нерезюмируемый шаг: %s", got)
 	}
 }

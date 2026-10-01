@@ -112,25 +112,26 @@ type clarifyRequest struct {
 	// active — идёт прогон агента: уточнение имеет смысл; иначе сообщение
 	// разбирается как к стоящей таске.
 	active bool
-	// key — шаг идущего прогона; compact — просьба сжать его сессию (manual
-	// | auto), исполняется прерыванием и продолжением, как уточнение.
+	// key и round — шаг идущего прогона; compact — просьба сжать его сессию
+	// (manual | auto), исполняется прерыванием и продолжением, как уточнение.
 	key     string
+	round   int
 	compact string
 }
 
 // arm запоминает, как прервать текущий прогон; nil — прогона нет.
-func (c *clarifyRequest) arm(cancel context.CancelFunc, interrupts bool, key string) {
+func (c *clarifyRequest) arm(cancel context.CancelFunc, interrupts bool, key string, round int) {
 	c.mu.Lock()
-	c.cancel, c.interrupts, c.active, c.key = cancel, interrupts, cancel != nil, key
+	c.cancel, c.interrupts, c.active, c.key, c.round = cancel, interrupts, cancel != nil, key, round
 	c.mu.Unlock()
 }
 
-// requestCompact просит сжать сессию шага key. Ответ: interrupt — прогон
-// этого шага прерван и сожмётся сразу; pending — шаг идёт, прерывать нельзя;
-// idle — этот шаг сейчас не идёт.
-func (c *clarifyRequest) requestCompact(key, trigger string) string {
+// requestCompact просит сжать сессию шага key раунда round (0 — любого).
+// Ответ: interrupt — прогон этого шага прерван и сожмётся сразу; pending —
+// шаг идёт, прерывать нельзя; idle — этот шаг сейчас не идёт.
+func (c *clarifyRequest) requestCompact(key string, round int, trigger string) string {
 	c.mu.Lock()
-	if !c.active || c.key != key {
+	if !c.active || c.key != key || (round > 0 && c.round != round) {
 		c.mu.Unlock()
 		return "idle"
 	}
@@ -196,6 +197,25 @@ type question struct {
 	usage protocol.Usage
 }
 
+// dropCompacts отвечает на сжатия, которые прогон уже не исполнит.
+func (r *run) dropCompacts() {
+	for {
+		select {
+		case c := <-r.job.Compacts():
+			res := &protocol.CompactResult{ReqID: c.ReqID, TaskID: c.TaskID, Key: c.Key, Round: c.Round,
+				Status: "error", Error: "задание закончилось — нажмите «Сжать сессию» ещё раз"}
+			if r.job.ex == nil {
+				continue
+			}
+			if err := r.job.ex.send(protocol.MsgCompactResult, r.job.ID, res); err != nil {
+				r.job.ex.logf("ответ на сжатие сессии %s: %v", c.ReqID, err)
+			}
+		default:
+			return
+		}
+	}
+}
+
 // serveMessages разбирает сообщения, пока идёт задание. Здесь только эхо и
 // триаж (он состояние не трогает): правка прерывает этап сразу, вопрос
 // встаёт в очередь к циклу этапов — у того в руках состояние таски.
@@ -203,6 +223,7 @@ func (r *run) serveMessages(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			r.dropCompacts()
 			return
 		case c := <-r.job.Compacts():
 			r.compactRequest(ctx, c)

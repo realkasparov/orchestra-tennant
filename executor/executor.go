@@ -82,14 +82,11 @@ type Executor struct {
 // сообщила своё.
 const defaultWindow = 200000
 
-// windowFor — последнее известное окно модели.
-func (e *Executor) windowFor(model string) int64 {
+// knownWindow — окно, которое модель сообщила на этой машине; 0 — ещё нет.
+func (e *Executor) knownWindow(model string) int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if w := e.windows[model]; w > 0 {
-		return w
-	}
-	return defaultWindow
+	return e.windows[model]
 }
 
 func (e *Executor) noteWindow(model string, w int64) {
@@ -873,10 +870,13 @@ func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.
 			e.logf("ответ на сжатие сессии %s: %v", c.ReqID, err)
 		}
 	}
-	if j := e.job(jobID); j != nil && !j.isFinished() {
+	// Идёт прогон задания — сжимает он: у него замок шага и состояние.
+	if j, orphan := e.jobState(jobID); j != nil && !orphan && !j.isFinished() {
 		if j.deliverCompact(c) {
 			return // ответит прогон
 		}
+		reply(&protocol.CompactResult{Status: "error", Error: "очередь команд задания полна — повторите позже"})
+		return
 	}
 	go func() {
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
@@ -886,6 +886,34 @@ func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.
 			reply(&protocol.CompactResult{Status: "error", Error: err.Error()})
 			return
 		}
-		reply(&protocol.CompactResult{Status: "done", Pre: comp.Pre, Post: comp.Post, Window: e.windowFor(c.Model)})
+		e.noteCompacted(c, comp)
+		reply(&protocol.CompactResult{Status: "done", Pre: comp.Pre, Post: comp.Post, Window: e.knownWindow(c.Model)})
 	}()
+}
+
+// noteCompacted — сессия шага стоящего задания сжата: запомненный в журнале
+// размер разговора теперь меньше, и при продолжении она не сожмётся снова.
+func (e *Executor) noteCompacted(c *protocol.Compact, comp *agent.Compaction) {
+	if comp.Post <= 0 {
+		return
+	}
+	e.mu.Lock()
+	var parked *Job
+	for _, j := range e.jobs {
+		if j.Plan != nil && j.Plan.TaskID == c.TaskID && j.orphan {
+			parked = j
+		}
+	}
+	e.mu.Unlock()
+	if parked == nil {
+		return
+	}
+	parked.mu.Lock()
+	if parked.State != nil {
+		if st := parked.State.stageRound(c.Key, c.Round); st != nil && st.SessionID == c.SessionID {
+			st.Context, st.CompactPending = comp.Post, ""
+		}
+	}
+	parked.mu.Unlock()
+	parked.SaveState()
 }
