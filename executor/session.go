@@ -181,11 +181,14 @@ func (r *run) keepPending(st *StageState) {
 	}
 }
 
-// dropPending — шаг начинает новую сессию: просьбы сжать прежнюю ни к чему.
-func (r *run) dropPending(st *StageState) {
-	st.CompactPending = ""
+// newSession — шаг начинает новую сессию: размер и просьбы сжать прежнюю
+// ни к чему.
+func (r *run) newSession(st *StageState) {
+	st.CompactPending, st.Context = "", 0
+	k := sessKey(st.Key, st.Round)
 	r.sess.mu.Lock()
-	delete(r.sess.pending, sessKey(st.Key, st.Round))
+	delete(r.sess.pending, k)
+	delete(r.sess.lastPct, k)
 	r.sess.mu.Unlock()
 }
 
@@ -270,6 +273,20 @@ func (r *run) compactNow(ctx context.Context, st *StageState, session, trigger s
 	if session == "" {
 		session = st.SessionID
 	}
+	// Пока сжимает цикл этапов, кнопка отвечает «уже сжимается», а не
+	// откладывает второе сжатие.
+	k := sessKey(st.Key, st.Round)
+	r.sess.mu.Lock()
+	if r.sess.busy == nil {
+		r.sess.busy = map[sref]bool{}
+	}
+	r.sess.busy[k] = true
+	r.sess.mu.Unlock()
+	defer func() {
+		r.sess.mu.Lock()
+		delete(r.sess.busy, k)
+		r.sess.mu.Unlock()
+	}()
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	comp, err := agent.Compact(cctx, session, st.SessionCWD, st.SessionModel)

@@ -117,12 +117,22 @@ type clarifyRequest struct {
 	key     string
 	round   int
 	compact string
+	// session — у идущего прогона уже есть сессия: прервать его ради
+	// сжатия можно. Без неё прерванный прогон нечем продолжить.
+	session bool
 }
 
 // arm запоминает, как прервать текущий прогон; nil — прогона нет.
-func (c *clarifyRequest) arm(cancel context.CancelFunc, interrupts bool, key string, round int) {
+func (c *clarifyRequest) arm(cancel context.CancelFunc, interrupts bool, key string, round int, session bool) {
 	c.mu.Lock()
-	c.cancel, c.interrupts, c.active, c.key, c.round = cancel, interrupts, cancel != nil, key, round
+	c.cancel, c.interrupts, c.active, c.key, c.round, c.session = cancel, interrupts, cancel != nil, key, round, session
+	c.mu.Unlock()
+}
+
+// sessionStarted — прогон сообщил свою сессию.
+func (c *clarifyRequest) sessionStarted() {
+	c.mu.Lock()
+	c.session = true
 	c.mu.Unlock()
 }
 
@@ -135,7 +145,7 @@ func (c *clarifyRequest) requestCompact(key string, round int, trigger string) s
 		c.mu.Unlock()
 		return "idle"
 	}
-	if !c.interrupts {
+	if !c.interrupts || !c.session {
 		c.mu.Unlock()
 		return "pending"
 	}

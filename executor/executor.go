@@ -79,7 +79,15 @@ type Executor struct {
 	// compacting — таски, чью сессию сейчас сжимает команда без задания:
 	// задание той же таски ждёт конца сжатия, чтобы не продолжить сессию
 	// одновременно с ним.
-	compacting map[int64]chan struct{}
+	compacting map[int64]*idleCompaction
+}
+
+// idleCompaction — сжатие сессии таски без задания: итог применяется к
+// заданию, которое его ждало.
+type idleCompaction struct {
+	done chan struct{}
+	c    *protocol.Compact
+	post int64 // размер после сжатия; 0 — не сжалось
 }
 
 // defaultWindow — окно контекста, пока модель на этой машине ещё не
@@ -571,7 +579,7 @@ func (e *Executor) run(ctx context.Context, j *Job) {
 	defer close(j.ended)
 	// Команды сжатия, пришедшие, пока прогон заканчивался, получают ответ.
 	defer e.dropCompacts(j)
-	e.waitCompaction(ctx, j.Plan.TaskID)
+	e.waitCompaction(ctx, j)
 	status, err := e.runner.Run(ctx, j)
 	reason := ""
 	if r := j.cancelReason(); r != "" {
@@ -871,9 +879,11 @@ func (e *Executor) send(typ, jobID string, body any) error {
 // идёт или стоит); не идёт — сессия поднимается по присланным SessionID,
 // CWD и Model и сжимается здесь же. Ответ — compact_result.
 func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.Compact) {
+	// Ответ отсюда — не от прогона: без идентификатора задания, и сервис
+	// сам запишет итог сжатия.
 	reply := func(r *protocol.CompactResult) {
 		r.ReqID, r.TaskID, r.Key, r.Round = c.ReqID, c.TaskID, c.Key, c.Round
-		if err := e.send(protocol.MsgCompactResult, jobID, r); err != nil {
+		if err := e.send(protocol.MsgCompactResult, "", r); err != nil {
 			e.logf("ответ на сжатие сессии %s: %v", c.ReqID, err)
 		}
 	}
@@ -882,10 +892,12 @@ func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.
 		if j.deliverCompact(c) {
 			return // ответит прогон
 		}
-		reply(&protocol.CompactResult{Status: "error", Error: "очередь команд задания полна — повторите позже"})
-		return
+		if !j.isFinished() {
+			reply(&protocol.CompactResult{Status: "error", Error: "очередь команд задания полна — повторите позже"})
+			return
+		}
 	}
-	done, ok := e.startCompaction(c.TaskID)
+	ic, done, ok := e.startCompaction(c)
 	if !ok {
 		reply(&protocol.CompactResult{Status: "error", Error: "сессия этой таски уже сжимается"})
 		return
@@ -899,6 +911,7 @@ func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.
 			reply(&protocol.CompactResult{Status: "error", Error: err.Error()})
 			return
 		}
+		ic.post = comp.Post
 		e.noteCompacted(c, comp)
 		reply(&protocol.CompactResult{Status: "done", Pre: comp.Pre, Post: comp.Post, Window: e.knownWindow(c.Model)})
 	}()
@@ -932,42 +945,58 @@ func (e *Executor) noteCompacted(c *protocol.Compact, comp *agent.Compaction) {
 }
 
 // startCompaction отмечает сжатие сессии таски без задания; false — уже идёт.
-func (e *Executor) startCompaction(taskID int64) (done func(), ok bool) {
+func (e *Executor) startCompaction(c *protocol.Compact) (ic *idleCompaction, done func(), ok bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.compacting[taskID] != nil {
-		return nil, false
+	if e.compacting[c.TaskID] != nil {
+		return nil, nil, false
 	}
 	if e.compacting == nil {
-		e.compacting = map[int64]chan struct{}{}
+		e.compacting = map[int64]*idleCompaction{}
 	}
-	ch := make(chan struct{})
-	e.compacting[taskID] = ch
-	return func() {
+	ic = &idleCompaction{done: make(chan struct{}), c: c}
+	e.compacting[c.TaskID] = ic
+	return ic, func() {
 		e.mu.Lock()
-		delete(e.compacting, taskID)
+		delete(e.compacting, c.TaskID)
 		e.mu.Unlock()
-		close(ch)
+		close(ic.done)
 	}, true
 }
 
-// waitCompaction — задание таски ждёт конца её сжатия без задания.
-func (e *Executor) waitCompaction(ctx context.Context, taskID int64) {
+// waitCompaction — задание таски ждёт конца её сжатия без задания и берёт
+// его итог: задание могло принять память таски уже после того, как сжатие
+// записало его в журнал прежнего задания, — или раньше.
+func (e *Executor) waitCompaction(ctx context.Context, j *Job) {
 	e.mu.Lock()
-	ch := e.compacting[taskID]
+	ic := e.compacting[j.Plan.TaskID]
 	e.mu.Unlock()
-	if ch == nil {
+	if ic == nil {
 		return
 	}
 	select {
-	case <-ch:
+	case <-ic.done:
 	case <-ctx.Done():
+		return
 	}
+	if ic.post <= 0 {
+		return
+	}
+	j.mu.Lock()
+	if j.State != nil {
+		if st := j.State.stageRound(ic.c.Key, ic.c.Round); st != nil && st.SessionID == ic.c.SessionID {
+			st.Context, st.CompactPending = ic.post, ""
+		}
+	}
+	j.mu.Unlock()
 }
 
 // dropCompacts отвечает на команды сжатия, которые прогон задания уже не
 // заберёт.
 func (e *Executor) dropCompacts(j *Job) {
+	j.mu.Lock()
+	j.compactsClosed = true
+	j.mu.Unlock()
 	for {
 		select {
 		case c := <-j.compacts:

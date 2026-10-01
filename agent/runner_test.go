@@ -72,6 +72,13 @@ func TestSessionLine(t *testing.T) {
 	if res.Context != 34607 || len(events) != 2 {
 		t.Fatalf("контекст %d, событий %d", res.Context, len(events))
 	}
+	// Разговор субагента — не размер сессии шага.
+	sub := call("m3", 10, 150000, 10000)
+	sub["parent_tool_use_id"] = "toolu_1"
+	sessionLine(sub, res, on)
+	if res.Context != 34607 || len(events) != 2 {
+		t.Fatalf("субагент: контекст %d, событий %d", res.Context, len(events))
+	}
 	sessionLine(map[string]any{"type": "system", "subtype": "compact_boundary",
 		"compact_metadata": map[string]any{"trigger": "manual", "pre_tokens": 31964.0, "post_tokens": 3603.0}}, res, on)
 	if res.Compacted == nil || res.Compacted.Pre != 31964 || res.Context != 3603 {

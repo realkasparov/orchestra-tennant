@@ -67,7 +67,7 @@ func TestClarifyRequest(t *testing.T) {
 		t.Fatal("без прогона не должно быть active")
 	}
 	cancelled := false
-	c.arm(func() { cancelled = true }, true, "execute", 1)
+	c.arm(func() { cancelled = true }, true, "execute", 1, true)
 	if !c.running() {
 		t.Fatal("прогон не отмечен")
 	}
@@ -83,12 +83,12 @@ func TestClarifyRequest(t *testing.T) {
 		t.Error("уточнение не очищено")
 	}
 	cancelled = false
-	c.arm(func() { cancelled = true }, false, "execute", 1)
+	c.arm(func() { cancelled = true }, false, "execute", 1, true)
 	c.request("ещё")
 	if cancelled {
 		t.Fatal("нерезюмируемый прогон прерван")
 	}
-	c.arm(nil, false, "", 0)
+	c.arm(nil, false, "", 0, false)
 	if c.running() {
 		t.Fatal("после прогона active остался")
 	}
@@ -209,7 +209,7 @@ func TestClarifyCompactRequest(t *testing.T) {
 		t.Fatalf("без прогона: %s", got)
 	}
 	cancelled := false
-	c.arm(func() { cancelled = true }, true, "execute", 1)
+	c.arm(func() { cancelled = true }, true, "execute", 1, true)
 	if got := c.requestCompact("review", 1, "manual"); got != "idle" {
 		t.Fatalf("чужой шаг: %s", got)
 	}
@@ -222,8 +222,18 @@ func TestClarifyCompactRequest(t *testing.T) {
 	if got := c.takeCompact(); got != "auto" || c.takeCompact() != "" {
 		t.Fatalf("просьба: %q", got)
 	}
-	c.arm(func() {}, false, "execute", 1)
+	c.arm(func() {}, false, "execute", 1, true)
 	if got := c.requestCompact("execute", 1, "manual"); got != "pending" {
 		t.Fatalf("нерезюмируемый шаг: %s", got)
+	}
+	// Новая сессия ещё не началась: прерванный прогон нечем продолжить.
+	cancelled = false
+	c.arm(func() { cancelled = true }, true, "execute", 1, false)
+	if got := c.requestCompact("execute", 1, "manual"); got != "pending" || cancelled {
+		t.Fatalf("до начала сессии: %s, прерван %v", got, cancelled)
+	}
+	c.sessionStarted()
+	if got := c.requestCompact("execute", 1, "manual"); got != "interrupt" || !cancelled {
+		t.Fatalf("после начала сессии: %s, прерван %v", got, cancelled)
 	}
 }

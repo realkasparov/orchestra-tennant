@@ -63,6 +63,9 @@ type Job struct {
 	messages chan *protocol.Message
 	cont     chan protocol.Continue
 	compacts chan *protocol.Compact
+	// compactsClosed — прогон кончился и очередь сжатий разобрана: новые
+	// команды заданию не отдаются. Под mu.
+	compactsClosed bool
 
 	// State — состояние таски; заполняет Runner, хранится в журнале.
 	State *TaskState
@@ -244,6 +247,11 @@ func (j *Job) deliverMessage(m *protocol.Message) {
 // deliverCompact передаёт прогону команду сжать сессию шага; false — прогон
 // её не примет (очередь полна или у задания нет прогона).
 func (j *Job) deliverCompact(c *protocol.Compact) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.compactsClosed {
+		return false
+	}
 	select {
 	case j.compacts <- c:
 		return true

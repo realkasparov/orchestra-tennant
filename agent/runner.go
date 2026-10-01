@@ -319,6 +319,11 @@ func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent 
 func sessionLine(msg map[string]any, res *Result, onEvent func(StreamEvent)) {
 	switch msg["type"] {
 	case "assistant":
+		// Сообщения субагента (Task) идут в тот же поток со своим расходом:
+		// это его разговор, а не размер сессии шага.
+		if p, _ := msg["parent_tool_use_id"].(string); p != "" {
+			return
+		}
 		m, _ := msg["message"].(map[string]any)
 		u, ok := m["usage"].(map[string]any)
 		if !ok {

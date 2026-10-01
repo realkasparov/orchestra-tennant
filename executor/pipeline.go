@@ -503,9 +503,12 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 		// Продолжение снаружи: починка после тестов, продолжение после паузы.
 		st.Resumes++
 	} else {
-		r.dropPending(st)
+		r.newSession(st)
 	}
-	autoAsked := false
+	// autoAsked — просьба сжать с порога в этом обращении уже была; autos —
+	// сколько раз сжимали с порога за вызов: больше трёх — значит, сжатие
+	// не помогает, и шаг дорабатывает как есть.
+	autoAsked, autos := false, 0
 	for {
 		if err := r.checkBudget(); err != nil {
 			return all.String(), err
@@ -517,10 +520,16 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			if trigger == "" && protocol.ContextPercent(st.Context, st.Window) >= protocol.CompactAuto {
 				trigger = "auto"
 			}
+			if trigger == "auto" && autos >= 3 {
+				trigger = ""
+			}
 			if trigger != "" {
+				if trigger == "auto" {
+					autos++
+				}
 				if _, err := r.compactNow(ctx, st, resume, trigger); err == nil {
 					prompt = "Сессия сжата, чтобы освободить контекст.\n\n" + prompt
-					autoAsked = false
+					autoAsked = autos >= 3
 				}
 			}
 			r.emitSession(st, true)
@@ -534,6 +543,7 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 				if id, _ := ev.Payload["id"].(string); id != "" {
 					st.SessionID, st.CurrentPass = id, pass
 					r.syncSession(st)
+					r.clar.sessionStarted()
 				}
 				return
 			case "context":
@@ -557,7 +567,7 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			r.job.Emit(st.Key, ev.Type, ev.Payload)
 		}
 		mcpCfg, extraTools := r.p.codeSearchFor(r.plan, sp.search)
-		r.clar.arm(cancel, sp.resume, st.Key, st.Round)
+		r.clar.arm(cancel, sp.resume, st.Key, st.Round, resume != "")
 		res, err := agent.Run(runCtx, agent.RunOpts{
 			Prompt: prompt, Resume: resume,
 			Model: model, Effort: sp.effort,
@@ -566,7 +576,7 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			MCPConfig:    mcpCfg, Markers: sp.markers,
 			SessionEvents: true,
 		}, onEvent)
-		r.clar.arm(nil, false, "", 0)
+		r.clar.arm(nil, false, "", 0, false)
 		clarified := r.clar.take()
 		compactReq := r.clar.takeCompact()
 		timedOut := runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
@@ -597,6 +607,12 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			return all.String(), fmt.Errorf("этап превысил лимит времени (%s) и был остановлен", r.plan.StageTimeout.Duration())
 		}
 		if err != nil && ((clarified == "" && compactReq == "") || ctx.Err() != nil || res == nil || res.SessionID == "") {
+			if compactReq != "" {
+				// Пауза пришла вместе с просьбой сжать: просьба остаётся до
+				// продолжения.
+				st.CompactPending = compactReq
+				r.job.SaveState()
+			}
 			return all.String(), err
 		}
 		if res != nil {
@@ -606,9 +622,12 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 		if compactReq != "" {
 			// Прогон прерван ради сжатия: сжимаем и продолжаем ту же сессию.
 			prompt = "Продолжай работу с места остановки."
+			if compactReq == "auto" {
+				autos++
+			}
 			if _, cerr := r.compactNow(ctx, st, resume, compactReq); cerr == nil {
 				prompt = "Сессия сжата, чтобы освободить контекст. Продолжай работу с места остановки."
-				autoAsked = false
+				autoAsked = autos >= 3
 			}
 			if clarified != "" {
 				prompt += "\n\nУточнение пользователя (учти его):\n" + clarified
