@@ -189,6 +189,12 @@ func (r *run) newSession(st *StageState) {
 	r.sess.mu.Lock()
 	delete(r.sess.pending, k)
 	delete(r.sess.lastPct, k)
+	delete(r.sess.compacted, k)
+	// Снимок прежней сессии: кнопка не должна сжимать её вместо новой.
+	if in, ok := r.sess.info[k]; ok {
+		in.ID, in.Context = "", 0
+		r.sess.info[k] = in
+	}
 	r.sess.mu.Unlock()
 }
 

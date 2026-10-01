@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/realkasparov/orchestra-tennant/protocol"
 )
@@ -148,5 +149,57 @@ func TestNoAutoCompactWithoutKnownWindow(t *testing.T) {
 	raw, _ := os.ReadFile(calls)
 	if strings.Contains(string(raw), "/compact") {
 		t.Fatalf("сжато по окну по умолчанию: %s", raw)
+	}
+}
+
+// Кнопка в первые секунды продолженного вызова, до первой строки CLI: шаг не
+// падает, а сжимает продолжаемую сессию и продолжает её.
+func TestCompactDuringResumedStart(t *testing.T) {
+	dir := t.TempDir()
+	calls := filepath.Join(dir, "calls")
+	script := `#!/bin/sh
+printf '%s\n' "$*" | tr '\n' ' ' >> "` + calls + `"; echo >> "` + calls + `"
+case "$*" in
+*/compact*)
+  echo '{"type":"system","subtype":"init","session_id":"s1"}'
+  echo '{"type":"system","subtype":"compact_boundary","session_id":"s1","compact_metadata":{"trigger":"manual","pre_tokens":100000,"post_tokens":9000}}'
+  echo '{"type":"result","subtype":"success","session_id":"s1","usage":{}}'
+  ;;
+*Продолжай*|*сжата*)
+  echo '{"type":"system","subtype":"init","session_id":"s1"}'
+  echo '{"type":"result","subtype":"success","session_id":"s1","result":"готово","usage":{}}'
+  ;;
+*)
+  # медленный старт: прерывание до первой строки — выход без вывода
+  trap 'exit 0' INT TERM
+  sleep 5 &
+  wait
+  ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	plan := fullPlan()
+	plan.StageTimeout = protocol.Seconds(60)
+	r, _ := testRun(t, plan)
+	st := &StageState{Key: "execute", Round: 1, SessionID: "s1", SessionCWD: t.TempDir(), Context: 100000}
+	r.st.Stages = append(r.st.Stages, st)
+	sp := agentSpec{key: "execute", skill: "execute-plan", model: "sonnet", cwd: st.SessionCWD, resume: true}
+	go func() {
+		for i := 0; i < 100; i++ {
+			time.Sleep(20 * time.Millisecond)
+			if r.clar.requestCompact("execute", 1, "manual") == "interrupt" {
+				return
+			}
+		}
+	}()
+	if _, err := r.runAgentSession(context.Background(), st, sp, "ответы на вопросы", "s1", 1); err != nil {
+		t.Fatalf("шаг упал: %v", err)
+	}
+	raw, _ := os.ReadFile(calls)
+	if !strings.Contains(string(raw), "/compact") || st.Context != 9000 {
+		t.Fatalf("сжатие: контекст %d, вызовы %s", st.Context, raw)
 	}
 }

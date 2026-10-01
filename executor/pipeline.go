@@ -577,6 +577,11 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			SessionEvents: true,
 		}, onEvent)
 		r.clar.arm(nil, false, "", 0, false)
+		if res != nil && res.SessionID == "" && resume != "" {
+			// Прерван на старте, до первой строки: продолжаемая сессия
+			// известна и так — уточнение или сжатие продолжат её.
+			res.SessionID = resume
+		}
 		clarified := r.clar.take()
 		compactReq := r.clar.takeCompact()
 		timedOut := runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
