@@ -573,6 +573,9 @@ func (r *run) stepTestGate(ctx context.Context, st *StageState, def *protocol.St
 		"Почини причину падения, прогони команду сам до зелёного статуса и закоммить правку "+
 		"(commit message: %s: fix tests). Не отключай и не ослабляй сами тесты без веской причины — если тест "+
 		"устарел по сути задачи, объясни это в step04-execution.md.", cmd, out, r.st.Reference)
+	if note := r.humanCommitsResumeNote(); note != "" {
+		prompt += "\n\n" + note
+	}
 	sp := r.specFor(fixDef)
 	if _, err := r.runAgentSession(ctx, fixSt, sp, prompt, fixSt.SessionID, fixSt.CurrentPass); err != nil {
 		return err
