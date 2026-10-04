@@ -60,6 +60,8 @@ type run struct {
 	// pass и passScope — текущий прогон шага для привязок `$task.pass`.
 	pass      int
 	passScope string
+	// sess — замки и последние проценты сессий шагов.
+	sess sessionState
 }
 
 // Run исполняет задание. Возвращаемый статус — терминальный статус таски.
@@ -87,13 +89,32 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			r.log("", "Индекс кода: "+err.Error())
 		}
 	}
+	// Сообщение задания или отложенное прошлым заданием.
+	msg := r.plan.Message
+	if msg == nil {
+		msg = r.st.PendingMessage
+	}
+	if err := r.reclaimBranch(); err != nil {
+		if msg != nil && r.st.MessageJob != job.ID {
+			r.st.PendingMessage = msg
+			r.job.SaveState()
+			err = fmt.Errorf("%w; сообщение сохранено — «Повторить» начнёт его", err)
+		}
+		r.log("", "Ошибка: "+err.Error())
+		r.taskStatus("error")
+		return "error", err
+	}
 	mctx, mcancel := context.WithCancel(ctx)
 	defer mcancel()
+	r.seedSessions()
+	// Сжатие стоящего шага в фоне доделывается до конца задания: события о
+	// нём должны уйти раньше итога.
+	defer r.closeSessions()
 	go r.serveMessages(mctx)
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
-	if m := r.plan.Message; m != nil && r.st.MessageJob != job.ID {
+	if m := msg; m != nil && r.st.MessageJob != job.ID {
 		r.handleMessage(ctx, m.Text, m.Mode)
 		if ctx.Err() != nil {
 			r.change.take()
@@ -108,10 +129,10 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 				return r.failRound(err)
 			}
 		}
-		r.st.MessageJob = job.ID
+		r.st.MessageJob, r.st.PendingMessage = job.ID, nil
 		r.job.SaveState()
 	}
-	if r.plan.Message != nil && r.allStagesDone() {
+	if msg != nil && r.allStagesDone() {
 		r.answerQueued(ctx)
 		return "done", nil
 	}
@@ -480,45 +501,181 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, sp agentSpec, p
 // его и продолжает ту же сессию с текстом уточнения.
 func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec, prompt, resume string, pass int) (string, error) {
 	var all strings.Builder
+	// Сессию шага сжимает и прогон, и кнопка человека: одновременно — нельзя.
+	lock := r.stageLock(st.Key, st.Round)
+	lock.Lock()
+	defer lock.Unlock()
+	// Просьба сжать, пришедшая под конец прогона, остаётся у шага.
+	defer r.keepPending(st)
+	model := agent.ModelID(sp.model)
+	st.SessionCWD, st.SessionModel = sp.cwd, model
+	// Окно — только сообщённое моделью: по окну по умолчанию процент
+	// показывается, но автосжатия нет (у модели может быть окно 1M).
+	if w := r.knownWindow(model); w > 0 {
+		st.Window = w
+	}
+	if resume != "" {
+		// Продолжение снаружи: починка после тестов, продолжение после паузы.
+		st.Resumes++
+	} else {
+		r.newSession(st)
+	}
+	// autoAsked — просьба сжать с порога в этом обращении уже была; autos —
+	// сколько раз сжимали с порога за вызов: больше трёх — значит, сжатие
+	// не помогает, и шаг дорабатывает как есть.
+	autoAsked, autos := false, 0
 	for {
 		if err := r.checkBudget(); err != nil {
 			return all.String(), err
 		}
+		if resume != "" {
+			// Перед каждым продолжением сессии — сжатие, о котором просили,
+			// пока шаг был занят, или с порога.
+			trigger := r.takeSession(st)
+			if trigger == "" && protocol.ContextPercent(st.Context, st.Window) >= protocol.CompactAuto {
+				trigger = "auto"
+			}
+			if trigger == "auto" && autos >= 3 {
+				trigger = ""
+			}
+			if trigger != "" {
+				if trigger == "auto" {
+					autos++
+				}
+				if _, err := r.compactNow(ctx, st, resume, trigger); err == nil {
+					prompt = "Сессия сжата, чтобы освободить контекст.\n\n" + prompt
+					autoAsked = autos >= 3
+				}
+			}
+			r.emitSession(st, true)
+		}
 		runCtx, cancel := context.WithTimeout(ctx, r.plan.StageTimeout.Duration())
 		onEvent := func(ev agent.StreamEvent) {
+			switch ev.Type {
+			case "session":
+				// Сессия известна с первой строки: кнопка «Сжать сессию»
+				// работает и в первом прогоне шага.
+				if id, _ := ev.Payload["id"].(string); id != "" {
+					st.SessionID, st.CurrentPass = id, pass
+					r.syncSession(st)
+					r.clar.sessionStarted()
+				}
+				return
+			case "context":
+				n, _ := ev.Payload["tokens"].(int64)
+				st.Context = n
+				r.emitSession(st, false)
+				if !autoAsked && protocol.ContextPercent(n, st.Window) >= protocol.CompactAuto {
+					autoAsked = true
+					if r.clar.requestCompact(st.Key, st.Round, "auto") == "pending" {
+						st.CompactPending = "auto"
+						r.log(st.Key, fmt.Sprintf("Контекст сессии %d%% — сожму её перед следующим продолжением: прервать этот шаг нельзя.", protocol.ContextPercent(n, st.Window)))
+					}
+				}
+				return
+			case "compacted":
+				pre, _ := ev.Payload["pre"].(int64)
+				post, _ := ev.Payload["post"].(int64)
+				r.sessionCompacted(st, pre, post, "claude")
+				return
+			}
 			r.job.Emit(st.Key, ev.Type, ev.Payload)
 		}
 		mcpCfg, extraTools := r.p.codeSearchFor(r.plan, sp.search)
-		r.clar.arm(cancel, sp.resume)
+		r.clar.arm(cancel, sp.resume, st.Key, st.Round, resume != "")
 		res, err := agent.Run(runCtx, agent.RunOpts{
 			Prompt: prompt, Resume: resume,
-			Model: agent.ModelID(sp.model), Effort: sp.effort,
+			Model: model, Effort: sp.effort,
 			CWD: sp.cwd, AddDirs: []string{r.st.TaskDir},
 			AllowedTools: withTools(sp.tools, extraTools),
 			MCPConfig:    mcpCfg, Markers: sp.markers,
+			SessionEvents: true,
 		}, onEvent)
-		r.clar.arm(nil, false)
+		r.clar.arm(nil, false, "", 0, false)
+		// started — CLI успел начать вызов; иначе промпт до агента не дошёл,
+		// и продолжение должно его повторить.
+		started := res != nil && res.SessionID != ""
+		if res != nil && !started && resume != "" {
+			// Прерван на старте, до первой строки: продолжаемая сессия
+			// известна и так — уточнение или сжатие продолжат её.
+			res.SessionID = resume
+		}
+		sent := prompt
 		clarified := r.clar.take()
+		compactReq := r.clar.takeCompact()
 		timedOut := runCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 		cancel()
 		if res != nil && res.SessionID != "" {
 			st.SessionID, st.CurrentPass = res.SessionID, pass
 		}
-		r.recordUsage(st, res)
+		if res != nil {
+			if w := res.Window(model); w > 0 {
+				st.Window = w
+				r.noteWindow(model, w)
+			}
+			if res.Context > 0 {
+				st.Context = res.Context
+			}
+		}
+		r.emitSession(st, true)
+		r.recordUsage(st, runUsage(st, res, resume))
+		if compactReq != "" && res != nil && clarified == "" {
+			// Прогон кончился сам, или прерванный ответ уже задал вопросы:
+			// сжимаем перед следующим продолжением, а вопросы — человеку.
+			if qs, present, qerr := agent.Questions(res.FullText); err == nil || (qerr == nil && present && len(qs) > 0) {
+				st.CompactPending, compactReq, err = compactReq, "", nil
+			}
+		}
 		r.job.SaveState()
 		if timedOut {
 			return all.String(), fmt.Errorf("этап превысил лимит времени (%s) и был остановлен", r.plan.StageTimeout.Duration())
 		}
-		if err != nil && (clarified == "" || ctx.Err() != nil || res == nil || res.SessionID == "") {
+		if err != nil && ((clarified == "" && compactReq == "") || ctx.Err() != nil || res == nil || res.SessionID == "") {
+			if compactReq != "" {
+				// Пауза пришла вместе с просьбой сжать: просьба остаётся до
+				// продолжения.
+				st.CompactPending = compactReq
+				r.job.SaveState()
+			}
 			return all.String(), err
 		}
 		if res != nil {
 			all.WriteString(res.FullText)
 			resume = res.SessionID
 		}
+		if compactReq != "" {
+			// Прогон прерван ради сжатия: сжимаем и продолжаем ту же сессию.
+			if compactReq == "auto" {
+				autos++
+			}
+			compacted := false
+			if _, cerr := r.compactNow(ctx, st, resume, compactReq); cerr == nil {
+				compacted = true
+				autoAsked = autos >= 3
+			}
+			if ctx.Err() != nil {
+				return all.String(), ctx.Err()
+			}
+			prompt = "Продолжай работу с места остановки."
+			if !started {
+				// Промпт не дошёл до агента — повторяем его.
+				prompt = sent
+			}
+			if compacted {
+				prompt = "Сессия сжата, чтобы освободить контекст.\n\n" + prompt
+			}
+			if clarified != "" {
+				prompt += "\n\nУточнение пользователя (учти его):\n" + clarified
+			}
+			continue
+		}
 		if clarified != "" {
 			r.log(st.Key, "Уточнение принято — продолжаю ту же сессию.")
-			prompt = "Уточнение пользователя (учти его и продолжи с места остановки):\n" + clarified
+			if !started {
+				prompt = sent + "\n\nУточнение пользователя (учти его):\n" + clarified
+			} else {
+				prompt = "Уточнение пользователя (учти его и продолжи с места остановки):\n" + clarified
+			}
 			continue
 		}
 
@@ -527,6 +684,11 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			return all.String(), fmt.Errorf("невалидный QUESTIONS_JSON: %w", qerr)
 		}
 		if !present || len(qs) == 0 {
+			r.keepPending(st)
+			if st.CompactPending == "manual" {
+				// Человек просил сжать, а шаг тем временем закончился.
+				r.compactNow(ctx, st, resume, "manual")
+			}
 			return all.String(), nil
 		}
 		answers, err := r.askUser(ctx, st, qs)
@@ -630,10 +792,40 @@ func usageOf(res *agent.Result) protocol.Usage {
 		CacheWrite: res.Usage.CacheWrite, CacheRead: res.Usage.CacheRead, CostUSD: res.Usage.CostUSD}
 }
 
+// runUsage — расход одного вызова сессии шага. В итоге Claude Code — суммы
+// всей сессии, и при --resume они включают прошлые вызовы: без вычитания
+// каждое продолжение (ответы на вопросы, уточнение, пауза, починка тестов)
+// заново добавляло бы в этап всё потраченное до него. resumed — сессия,
+// которую вызов продолжал (пусто — новая). CLI, у которого суммы при
+// продолжении начинаются с нуля, узнаётся по уменьшению: тогда берётся итог
+// как есть. Вызов без итога (оборван) расхода не даёт и базу не трогает: его
+// траты войдут в разницу следующего вызова.
+func runUsage(st *StageState, res *agent.Result, resumed string) protocol.Usage {
+	total := usageOf(res)
+	if st == nil || res == nil || !res.GotResult {
+		return total
+	}
+	u := total
+	if resumed != "" && resumed == st.SessionTotalID {
+		base := st.SessionTotal
+		if total.CostUSD >= base.CostUSD {
+			u.CostUSD = total.CostUSD - base.CostUSD
+		}
+		if total.TokIn >= base.TokIn && total.TokOut >= base.TokOut &&
+			total.CacheWrite >= base.CacheWrite && total.CacheRead >= base.CacheRead {
+			u.TokIn, u.TokOut = total.TokIn-base.TokIn, total.TokOut-base.TokOut
+			u.CacheWrite, u.CacheRead = total.CacheWrite-base.CacheWrite, total.CacheRead-base.CacheRead
+		}
+	}
+	if res.SessionID != "" {
+		st.SessionTotal, st.SessionTotalID = total, res.SessionID
+	}
+	return u
+}
+
 // recordUsage накапливает расход прогона в этап и дублирует итог в
 // stage_status, чтобы вкладка «Этапы» обновилась без перезагрузки.
-func (r *run) recordUsage(st *StageState, res *agent.Result) {
-	u := usageOf(res)
+func (r *run) recordUsage(st *StageState, u protocol.Usage) {
 	if st == nil || u.Zero() {
 		return
 	}
@@ -729,6 +921,45 @@ func (r *run) emitDiff() {
 // ведущий git сам.
 func (r *run) folderMode() bool {
 	return r.plan.Workspace == "folder" || r.st.SelfWorkspace
+}
+
+// reclaimBranch возвращает ветку таски в её рабочую копию перед работой
+// агента: человек мог открыть таску в папке проекта (ветка переехала туда)
+// и закоммитить свои правки. Папка проекта отпускает ветку — встаёт на
+// базовую, — worktree встаёт на ветку со всеми коммитами. Делается до
+// раунда правки: база раунда должна включать коммиты человека.
+// Незакоммиченное в папке на ветке таски — отказ: ни автокоммита, ни stash.
+func (r *run) reclaimBranch() error {
+	wt, branch := r.st.WorktreeDir, r.st.BranchName
+	if wt == "" || branch == "" || r.folderMode() {
+		return nil
+	}
+	if cur, err := gitops.CurrentBranch(wt); err != nil || cur == branch {
+		return nil // рабочей копии нет (её заведёт шаг) или ветка на месте
+	}
+	holder, err := gitops.BranchHolder(wt, branch)
+	if err != nil {
+		return err
+	}
+	if holder != "" {
+		proj := r.plan.Project
+		if !samePath(holder, proj.Path) {
+			return fmt.Errorf("ветку таски «%s» держит рабочая копия %s — переключите её на другую ветку и повторите", branch, holder)
+		}
+		if dirty, err := gitops.DirtyFiles(holder); err != nil {
+			return err
+		} else if len(dirty) > 0 {
+			return fmt.Errorf("в папке проекта незакоммиченные правки ветки таски «%s» (%s) — закоммитьте их и повторите", branch, strings.Join(dirty, ", "))
+		}
+		if err := gitops.Checkout(holder, proj.BaseBranch); err != nil {
+			return fmt.Errorf("вернуть папку проекта на «%s»: %w", proj.BaseBranch, err)
+		}
+		r.log("", fmt.Sprintf("Ветка «%s» возвращена агенту, папка проекта — на «%s».", branch, proj.BaseBranch))
+	}
+	if err := gitops.Switch(wt, branch); err != nil {
+		return fmt.Errorf("вернуть ветку «%s» в рабочую копию таски: %w", branch, err)
+	}
+	return nil
 }
 
 // checkWorkspace — рабочая копия в папке проекта всё ещё наша: там наша

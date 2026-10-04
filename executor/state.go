@@ -18,6 +18,23 @@ type StageState struct {
 	SessionID   string         `json:"session_id,omitempty"`
 	CurrentPass int            `json:"current_pass,omitempty"`
 	Usage       protocol.Usage `json:"usage"`
+	// SessionTotal — суммы сессии SessionTotalID после её последнего вызова:
+	// Claude Code продолжает счёт при --resume, и расход следующего вызова —
+	// разница с ними.
+	SessionTotal   protocol.Usage `json:"session_total,omitempty"`
+	SessionTotalID string         `json:"session_total_id,omitempty"`
+	// Сессия для заполненности контекста: папка и модель, в которых она шла
+	// (Claude Code ищет сессию по папке), размер разговора и окно модели.
+	SessionCWD   string `json:"session_cwd,omitempty"`
+	SessionModel string `json:"session_model,omitempty"`
+	Context      int64  `json:"context,omitempty"`
+	Window       int64  `json:"window,omitempty"`
+	// Resumes — сколько раз сессию продолжали снаружи (починка после тестов,
+	// продолжение после паузы, правка во вход «продолжение»).
+	Resumes int `json:"resumes,omitempty"`
+	// CompactPending — сжать перед следующим продолжением (manual | auto):
+	// шаг шёл, а прерывать его было нельзя.
+	CompactPending string `json:"compact_pending,omitempty"`
 }
 
 // QuestionState — вопрос агента и его судьба.
@@ -52,6 +69,11 @@ type TaskState struct {
 	// MessageJob — задание, чьё стартовое сообщение уже разобрано: при
 	// возобновлении того же задания правка не заводит раунд второй раз.
 	MessageJob string `json:"message_job,omitempty"`
+	// PendingMessage — сообщение задания, которое не удалось начать: ветку
+	// таски не вернуть агенту (незакоммиченное в папке проекта). Его
+	// исполнит следующее задание таски («Повторить»), чтобы правка не
+	// потерялась.
+	PendingMessage *protocol.Message `json:"pending_message,omitempty"`
 	// Outputs — выходы шагов: ключ шага → имя выхода → значение (маркер —
 	// его значение, артефакт — путь к файлу). По ним шаги ссылаются друг на
 	// друга через `$steps.<ключ>.<выход>`.
@@ -81,6 +103,19 @@ func (s *TaskState) stage(key string) *StageState {
 		}
 	}
 	return found
+}
+
+// stageRound — шаг key раунда round; round 0 — последний раунд.
+func (s *TaskState) stageRound(key string, round int) *StageState {
+	if round <= 0 {
+		return s.stage(key)
+	}
+	for _, st := range s.Stages {
+		if st.Key == key && st.Round == round {
+			return st
+		}
+	}
+	return nil
 }
 
 // round — номер последнего раунда (1 у свежей таски).

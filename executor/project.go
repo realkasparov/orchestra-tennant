@@ -55,12 +55,12 @@ func (e *Executor) handleProject(ctx context.Context, env *protocol.Envelope) {
 	}()
 }
 
-// view показывает ветку в папке проекта. Ветка таски выкладывается
-// отсоединённым HEAD на её коммите: сама ветка остаётся в worktree, и
-// таска продолжает работать; человек смотрит код в редакторе. Базовая
-// ветка выкладывается как есть — так папку возвращают в исходное
-// состояние. Отказы: папка занята идущей в ней таской, незакоммиченные
-// изменения, ветки нет.
+// view выставляет ветку в папке проекта. Ветка таски переезжает в папку
+// настоящей веткой (takeBranch): человек видит коммиты агента и коммитит
+// свои. Базовая ветка выкладывается как есть — так папку возвращают в
+// исходное состояние. Отказы: папка занята идущей в ней таской, агент
+// работает над таской, незакоммиченные изменения в папке или в рабочей
+// копии таски, ветки нет.
 func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	path := strings.TrimSpace(spec.Dir)
 	if path == "" || !isRepo(path) {
@@ -72,9 +72,8 @@ func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	if other := e.folderHolder(path, 0); other != 0 {
 		return &protocol.ProjectResult{Error: fmt.Sprintf("папка проекта занята таской #%d, которая сейчас идёт прямо в ней; дождитесь её или остановите", other)}
 	}
-	// Ветка уже выставлена в папке (таска шла прямо в ней): отсоединять её
-	// нечего — папка и так показывает этот код, а ветку можно продолжать;
-	// незакоммиченные правки человека этому не помеха.
+	// Ветка уже выставлена в папке (открыта раньше или таска шла прямо в
+	// ней): делать нечего, незакоммиченные правки человека этому не помеха.
 	if cur, err := gitops.CurrentBranch(path); err == nil && cur == spec.Branch {
 		return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
 	}
@@ -83,14 +82,14 @@ func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	} else if len(dirty) > 0 {
 		return &protocol.ProjectResult{Error: "в папке проекта незакоммиченные изменения (" + strings.Join(dirty, ", ") + ") — закоммитьте или спрячьте их (git stash)"}
 	}
-	var err error
 	if spec.Branch == spec.BaseBranch {
-		err = gitops.Checkout(path, spec.Branch)
-	} else {
-		err = gitops.CheckoutDetached(path, spec.Branch)
+		if err := gitops.Checkout(path, spec.Branch); err != nil {
+			return &protocol.ProjectResult{Error: "переключить папку: " + err.Error()}
+		}
+		return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
 	}
-	if err != nil {
-		return &protocol.ProjectResult{Error: "переключить папку: " + err.Error()}
+	if err := e.takeBranch(path, spec.Branch); err != nil {
+		return &protocol.ProjectResult{Error: err.Error()}
 	}
 	return &protocol.ProjectResult{OK: true, Path: path, BaseBranch: spec.Branch, Repo: true}
 }
@@ -374,4 +373,65 @@ func hasStage(plan *protocol.Plan, key string) bool {
 		}
 	}
 	return false
+}
+
+// takeBranch переносит ветку таски в папку проекта: рабочая копия, которая
+// её держит (worktree таски), отпускает её — остаётся на том же коммите
+// отсоединённой, — и папка встаёт на ветку. Человек коммитит в ветку сам;
+// агенту ветка вернётся в начале его следующего задания (reclaimBranch).
+func (e *Executor) takeBranch(path, branch string) error {
+	holder, err := gitops.BranchHolder(path, branch)
+	if err != nil {
+		return err
+	}
+	if holder == "" {
+		return gitops.Switch(path, branch)
+	}
+	if samePath(holder, path) {
+		return nil
+	}
+	if id := e.runningIn(holder); id != 0 {
+		return fmt.Errorf("агент работает над таской #%d — поставьте её на паузу или дождитесь", id)
+	}
+	if dirty, err := gitops.DirtyFiles(holder); err != nil {
+		return err
+	} else if len(dirty) > 0 {
+		return fmt.Errorf("в рабочей копии таски незакоммиченные изменения агента (%s) — продолжите таску до конца шага", strings.Join(dirty, ", "))
+	}
+	if err := gitops.SwitchDetach(holder); err != nil {
+		return fmt.Errorf("отпустить ветку в рабочей копии таски: %w", err)
+	}
+	if err := gitops.Switch(path, branch); err != nil {
+		if back := gitops.Switch(holder, branch); back != nil {
+			return fmt.Errorf("переключить папку: %v; вернуть ветку в рабочую копию таски тоже не вышло: %v", err, back)
+		}
+		return fmt.Errorf("переключить папку: %w", err)
+	}
+	return nil
+}
+
+// runningIn — идущее задание, чья рабочая копия — dir; 0, если такого нет.
+func (e *Executor) runningIn(dir string) int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, j := range e.jobs {
+		if j.orphan || j.isFinished() {
+			continue
+		}
+		if wt := j.worktreeDir(); wt != "" && samePath(wt, dir) {
+			return j.Plan.TaskID
+		}
+	}
+	return 0
+}
+
+// samePath — одна ли это папка: git пишет пути без символических ссылок
+// (/private/tmp вместо /tmp), а в настройках проекта они могут быть.
+func samePath(a, b string) bool {
+	ra, err1 := filepath.EvalSymlinks(a)
+	rb, err2 := filepath.EvalSymlinks(b)
+	if err1 != nil || err2 != nil {
+		return filepath.Clean(a) == filepath.Clean(b)
+	}
+	return filepath.Clean(ra) == filepath.Clean(rb)
 }

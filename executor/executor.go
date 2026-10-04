@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/realkasparov/orchestra-tennant/agent"
 	"github.com/realkasparov/orchestra-tennant/protocol"
 )
 
@@ -72,6 +73,44 @@ type Executor struct {
 	connected chan struct{}
 	// skillWaits — ожидающие ответа запросы скиллов по хэшу.
 	skillWaits map[string][]chan *protocol.SkillFile
+	// windows — окно контекста по модели из последних прогонов: пока идёт
+	// первый прогон сессии, процент считается по нему.
+	windows map[string]int64
+	// compacting — таски, чью сессию сейчас сжимает команда без задания:
+	// задание той же таски ждёт конца сжатия, чтобы не продолжить сессию
+	// одновременно с ним.
+	compacting map[int64]*idleCompaction
+}
+
+// idleCompaction — сжатие сессии таски без задания: итог применяется к
+// заданию, которое его ждало.
+type idleCompaction struct {
+	done chan struct{}
+	c    *protocol.Compact
+	post int64 // размер после сжатия; 0 — не сжалось
+}
+
+// defaultWindow — окно контекста, пока модель на этой машине ещё не
+// сообщила своё.
+const defaultWindow = 200000
+
+// knownWindow — окно, которое модель сообщила на этой машине; 0 — ещё нет.
+func (e *Executor) knownWindow(model string) int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.windows[model]
+}
+
+func (e *Executor) noteWindow(model string, w int64) {
+	if w <= 0 {
+		return
+	}
+	e.mu.Lock()
+	if e.windows == nil {
+		e.windows = map[string]int64{}
+	}
+	e.windows[model] = w
+	e.mu.Unlock()
 }
 
 // New создаёт исполнителя. Журнал читается сразу: незавершённые задания
@@ -179,7 +218,9 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 		DeviceKey: e.cfg.DeviceKey, Hostname: e.cfg.Hostname, OS: e.cfg.OS,
 		Version: e.cfg.Version, MinSchema: protocol.MinSchemaVersion,
 		MaxSchema: protocol.SchemaVersion, Slots: e.cfg.Slots, ProjectsDir: e.cfg.ProjectsDir,
-		Models: e.cfg.Models, Running: e.runningIDs(), Parked: e.parkedJobs(),
+		Models: e.cfg.Models, ModelCatalog: protocol.Catalog(e.cfg.Models),
+		Features: []string{protocol.FeatureCompact, protocol.FeatureUsage},
+		Running:  e.runningIDs(), Parked: e.parkedJobs(),
 	}
 	if e.cfg.Skills != nil {
 		hello.SkillHashes = e.cfg.Skills.Hashes()
@@ -351,6 +392,11 @@ func (e *Executor) handle(ctx context.Context, env *protocol.Envelope) {
 		if j := e.job(env.JobID); j != nil {
 			j.deliverContinue(c.BudgetAck)
 		}
+	case protocol.MsgCompact:
+		var c protocol.Compact
+		if err := json.Unmarshal(env.Body, &c); err == nil {
+			e.handleCompact(ctx, env.JobID, &c)
+		}
 	case protocol.MsgProject:
 		e.handleProject(ctx, env)
 	case protocol.MsgSkill:
@@ -389,6 +435,13 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 			e.reject(offer.JobID, err.Error(), false)
 			return
 		}
+	}
+	// Оркестратор может прислать короткие ключи моделей: сборку по ключу
+	// знает только машина.
+	offer.Plan.ResolveModels()
+	if unknown := offer.Plan.UnknownModels(); len(unknown) > 0 {
+		e.reject(offer.JobID, "этот исполнитель не знает моделей: "+strings.Join(unknown, ", ")+" — обновите его (orchestra-tennant update) или выберите шагам другие", false)
+		return
 	}
 	if err := offer.Plan.Validate(); err != nil {
 		e.reject(offer.JobID, err.Error(), false)
@@ -457,7 +510,8 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 	jctx, cancel := context.WithCancel(ctx)
 	j := &Job{ID: offer.JobID, Plan: offer.Plan, Resume: offer.Resume, Skip: offer.Done, ex: e,
 		answers: make(chan *protocol.Answer, 8), messages: make(chan *protocol.Message, 8),
-		cont: make(chan protocol.Continue, 1), cancel: cancel, ended: make(chan struct{})}
+		compacts: make(chan *protocol.Compact, 4),
+		cont:     make(chan protocol.Continue, 1), cancel: cancel, ended: make(chan struct{})}
 	if existing != nil {
 		// Память прошлого запуска: сессии агента, прогоны, вопросы. Без неё
 		// возобновление начинало бы этап заново, не зная, что можно продолжить.
@@ -523,6 +577,9 @@ func (e *Executor) accept(ctx context.Context, offer *protocol.Offer) {
 // тогда он уйдёт при следующем подключении вместе с досылкой событий.
 func (e *Executor) run(ctx context.Context, j *Job) {
 	defer close(j.ended)
+	// Команды сжатия, пришедшие, пока прогон заканчивался, получают ответ.
+	defer e.dropCompacts(j)
+	e.waitCompaction(ctx, j)
 	status, err := e.runner.Run(ctx, j)
 	reason := ""
 	if r := j.cancelReason(); r != "" {
@@ -816,4 +873,163 @@ func (e *Executor) send(typ, jobID string, body any) error {
 	}
 	e.trace("→", typ, jobID)
 	return send(conn, typ, jobID, body)
+}
+
+// handleCompact — «Сжать сессию». Задание идёт — решает его прогон (шаг
+// идёт или стоит); не идёт — сессия поднимается по присланным SessionID,
+// CWD и Model и сжимается здесь же. Ответ — compact_result.
+func (e *Executor) handleCompact(ctx context.Context, jobID string, c *protocol.Compact) {
+	// Ответ отсюда — не от прогона: без идентификатора задания, и сервис
+	// сам запишет итог сжатия.
+	reply := func(r *protocol.CompactResult) {
+		r.ReqID, r.TaskID, r.Key, r.Round = c.ReqID, c.TaskID, c.Key, c.Round
+		if err := e.send(protocol.MsgCompactResult, "", r); err != nil {
+			e.logf("ответ на сжатие сессии %s: %v", c.ReqID, err)
+		}
+	}
+	// Идёт прогон задания — сжимает он: у него замок шага и состояние.
+	if j, orphan := e.jobState(jobID); j != nil && !orphan && !j.isFinished() {
+		if j.deliverCompact(c) {
+			return // ответит прогон
+		}
+		if !j.isFinished() {
+			reply(&protocol.CompactResult{Status: "error", Error: "очередь команд задания полна — повторите позже"})
+			return
+		}
+	}
+	// Задания таски, бывшие до сжатия (например, только что остановленное
+	// паузой), могут ещё выходить из той же сессии — сжатие их дождётся.
+	// Принятые позже сами ждут сжатие (waitCompaction), их ждать нельзя.
+	before := e.taskJobs(c.TaskID)
+	ic, done, ok := e.startCompaction(c)
+	if !ok {
+		reply(&protocol.CompactResult{Status: "error", Error: "сессия этой таски уже сжимается"})
+		return
+	}
+	go func() {
+		defer done()
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+		for _, j := range before {
+			select {
+			case <-j.ended:
+			case <-cctx.Done():
+			}
+		}
+		comp, err := agent.Compact(cctx, c.SessionID, c.CWD, c.Model)
+		if err != nil {
+			reply(&protocol.CompactResult{Status: "error", Error: err.Error()})
+			return
+		}
+		ic.post = comp.Post
+		e.noteCompacted(c, comp)
+		reply(&protocol.CompactResult{Status: "done", Pre: comp.Pre, Post: comp.Post, Window: e.knownWindow(c.Model)})
+	}()
+}
+
+// noteCompacted — сессия шага стоящего задания сжата: запомненный в журнале
+// размер разговора теперь меньше, и при продолжении она не сожмётся снова.
+func (e *Executor) noteCompacted(c *protocol.Compact, comp *agent.Compaction) {
+	if comp.Post <= 0 {
+		return
+	}
+	e.mu.Lock()
+	var parked *Job
+	for _, j := range e.jobs {
+		if j.Plan != nil && j.Plan.TaskID == c.TaskID && j.orphan {
+			parked = j
+		}
+	}
+	e.mu.Unlock()
+	if parked == nil {
+		return
+	}
+	parked.mu.Lock()
+	if parked.State != nil {
+		if st := parked.State.stageRound(c.Key, c.Round); st != nil && st.SessionID == c.SessionID {
+			st.Context, st.CompactPending = comp.Post, ""
+		}
+	}
+	parked.mu.Unlock()
+	parked.SaveState()
+}
+
+// startCompaction отмечает сжатие сессии таски без задания; false — уже идёт.
+func (e *Executor) startCompaction(c *protocol.Compact) (ic *idleCompaction, done func(), ok bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.compacting[c.TaskID] != nil {
+		return nil, nil, false
+	}
+	if e.compacting == nil {
+		e.compacting = map[int64]*idleCompaction{}
+	}
+	ic = &idleCompaction{done: make(chan struct{}), c: c}
+	e.compacting[c.TaskID] = ic
+	return ic, func() {
+		e.mu.Lock()
+		delete(e.compacting, c.TaskID)
+		e.mu.Unlock()
+		close(ic.done)
+	}, true
+}
+
+// waitCompaction — задание таски ждёт конца её сжатия без задания и берёт
+// его итог: задание могло принять память таски уже после того, как сжатие
+// записало его в журнал прежнего задания, — или раньше.
+func (e *Executor) waitCompaction(ctx context.Context, j *Job) {
+	e.mu.Lock()
+	ic := e.compacting[j.Plan.TaskID]
+	e.mu.Unlock()
+	if ic == nil {
+		return
+	}
+	select {
+	case <-ic.done:
+	case <-ctx.Done():
+		return
+	}
+	if ic.post <= 0 {
+		return
+	}
+	j.mu.Lock()
+	if j.State != nil {
+		if st := j.State.stageRound(ic.c.Key, ic.c.Round); st != nil && st.SessionID == ic.c.SessionID {
+			st.Context, st.CompactPending = ic.post, ""
+		}
+	}
+	j.mu.Unlock()
+}
+
+// dropCompacts отвечает на команды сжатия, которые прогон задания уже не
+// заберёт.
+func (e *Executor) dropCompacts(j *Job) {
+	j.mu.Lock()
+	j.compactsClosed = true
+	j.mu.Unlock()
+	for {
+		select {
+		case c := <-j.compacts:
+			res := &protocol.CompactResult{ReqID: c.ReqID, TaskID: c.TaskID, Key: c.Key, Round: c.Round,
+				Status: "error", Error: "задание остановилось — нажмите «Сжать сессию» ещё раз"}
+			if err := e.send(protocol.MsgCompactResult, j.ID, res); err != nil {
+				e.logf("ответ на сжатие сессии %s: %v", c.ReqID, err)
+			}
+		default:
+			return
+		}
+	}
+}
+
+// taskJobs — задания таски в памяти исполнителя.
+func (e *Executor) taskJobs(taskID int64) []*Job {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []*Job
+	for _, j := range e.jobs {
+		if j.Plan != nil && j.Plan.TaskID == taskID && j.ended != nil {
+			out = append(out, j)
+		}
+	}
+	return out
 }

@@ -192,20 +192,42 @@ func Checkout(dir, branch string) error {
 	return err
 }
 
-// CheckoutDetached выставляет коммит ветки отсоединённым HEAD: папка
-// показывает код ветки, а сама ветка остаётся там, где выложена (в
-// worktree таски), и её можно продолжать.
-func CheckoutDetached(dir, branch string) error {
+// BranchHolder — рабочая копия репозитория repo (папка проекта или одна из
+// её worktree), в которой сейчас выставлена ветка branch; пусто — ветка
+// нигде не выставлена.
+func BranchHolder(repo, branch string) (string, error) {
+	if err := CheckRef(branch); err != nil {
+		return "", err
+	}
+	out, err := run(repo, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	dir := ""
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			dir = strings.TrimPrefix(line, "worktree ")
+		case line == "branch refs/heads/"+branch:
+			return dir, nil
+		}
+	}
+	return "", nil
+}
+
+// SwitchDetach отпускает ветку рабочей копии: HEAD остаётся на том же
+// коммите отсоединённым, файлы не меняются.
+func SwitchDetach(dir string) error {
+	_, err := run(dir, "switch", "--detach")
+	return err
+}
+
+// Switch выставляет в рабочей копии существующую локальную ветку.
+func Switch(dir, branch string) error {
 	if err := CheckRef(branch); err != nil {
 		return err
 	}
-	ref := branch
-	if _, err := run(dir, "rev-parse", "--verify", "refs/heads/"+branch); err != nil {
-		// Ветка только на origin: с --detach git не заводит локальную,
-		// поэтому отсоединяемся прямо на удалённую.
-		ref = "refs/remotes/origin/" + branch
-	}
-	_, err := run(dir, "checkout", "--detach", ref)
+	_, err := run(dir, "switch", branch)
 	return err
 }
 

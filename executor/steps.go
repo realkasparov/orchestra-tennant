@@ -186,7 +186,9 @@ func (r *run) buildPrompt(def *protocol.Step, m *protocol.Manifest) (string, err
 			case "files":
 				sections.WriteString(filesSection(r.st.WorktreeDir, planText(r.st.TaskDir)))
 			case "diff":
-				sections.WriteString(diffSection(r.st.WorktreeDir, r.st.BaseCommit))
+				// Дифф раунда: работа прошлых раундов уже проверена, а
+				// коммиты человека между раундами — не предмет ревью.
+				sections.WriteString(diffSection(r.st.WorktreeDir, r.roundBase()))
 			}
 		}
 	}
@@ -211,6 +213,14 @@ func (r *run) resolve(src string, m *protocol.Manifest, input string) (string, e
 	}
 	switch scope {
 	case "task":
+		// Свёртка «Выполнения» и ревью — от базы раунда: иначе второй раунд
+		// свернул бы в один коммит и прошлые раунды, и коммиты человека между
+		// ними, а ревью «исправило» бы правки человека как лишние.
+		// Замороженные схемы до этого правила привязывают их к базе таски.
+		if name == "base_commit" && m != nil && ((m.Name == "execute-plan" && input == "BASE") ||
+			(m.Name == "review-task" && input == "BASE_COMMIT")) {
+			return r.roundBase(), nil
+		}
 		return r.taskRef(name), nil
 	case "project":
 		p := r.plan.Project
@@ -497,7 +507,10 @@ func (r *run) stepBranch(st *StageState) error {
 		}
 	}
 	final := ref + "-" + slug
-	if r.st.BranchName == final || strings.HasPrefix(r.st.BranchName, final+"-") {
+	// Ветка уже названа в прошлом раунде — имя остаётся: человек мог открыть
+	// её в папке проекта и ждёт ту же ветку.
+	named := strings.HasPrefix(r.st.BranchName, ref+"-") && r.st.round() > 1
+	if named || r.st.BranchName == final || strings.HasPrefix(r.st.BranchName, final+"-") {
 		r.st.setOutput(st.Key, "branch", r.st.BranchName)
 		return r.finishStage(st)
 	}
