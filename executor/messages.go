@@ -374,7 +374,7 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 		CWD: cwd, AddDirs: []string{r.st.TaskDir},
 		AllowedTools: tools,
 	}, func(ev agent.StreamEvent) { r.job.Emit("answer", ev.Type, ev.Payload) })
-	r.recordUsage(st, res)
+	r.recordUsage(st, usageOf(res))
 	if ctx.Err() != nil {
 		// Пауза посреди ответа — не ошибка: этап остаётся на паузе, ответ
 		// дадут заново при возобновлении.

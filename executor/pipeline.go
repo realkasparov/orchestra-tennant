@@ -618,7 +618,7 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			}
 		}
 		r.emitSession(st, true)
-		r.recordUsage(st, res)
+		r.recordUsage(st, runUsage(st, res, resume))
 		if compactReq != "" && res != nil && clarified == "" {
 			// Прогон кончился сам, или прерванный ответ уже задал вопросы:
 			// сжимаем перед следующим продолжением, а вопросы — человеку.
@@ -792,10 +792,40 @@ func usageOf(res *agent.Result) protocol.Usage {
 		CacheWrite: res.Usage.CacheWrite, CacheRead: res.Usage.CacheRead, CostUSD: res.Usage.CostUSD}
 }
 
+// runUsage — расход одного вызова сессии шага. В итоге Claude Code — суммы
+// всей сессии, и при --resume они включают прошлые вызовы: без вычитания
+// каждое продолжение (ответы на вопросы, уточнение, пауза, починка тестов)
+// заново добавляло бы в этап всё потраченное до него. resumed — сессия,
+// которую вызов продолжал (пусто — новая). CLI, у которого суммы при
+// продолжении начинаются с нуля, узнаётся по уменьшению: тогда берётся итог
+// как есть. Вызов без итога (оборван) расхода не даёт и базу не трогает: его
+// траты войдут в разницу следующего вызова.
+func runUsage(st *StageState, res *agent.Result, resumed string) protocol.Usage {
+	total := usageOf(res)
+	if st == nil || res == nil || !res.GotResult {
+		return total
+	}
+	u := total
+	if resumed != "" && resumed == st.SessionTotalID {
+		base := st.SessionTotal
+		if total.CostUSD >= base.CostUSD {
+			u.CostUSD = total.CostUSD - base.CostUSD
+		}
+		if total.TokIn >= base.TokIn && total.TokOut >= base.TokOut &&
+			total.CacheWrite >= base.CacheWrite && total.CacheRead >= base.CacheRead {
+			u.TokIn, u.TokOut = total.TokIn-base.TokIn, total.TokOut-base.TokOut
+			u.CacheWrite, u.CacheRead = total.CacheWrite-base.CacheWrite, total.CacheRead-base.CacheRead
+		}
+	}
+	if res.SessionID != "" {
+		st.SessionTotal, st.SessionTotalID = total, res.SessionID
+	}
+	return u
+}
+
 // recordUsage накапливает расход прогона в этап и дублирует итог в
 // stage_status, чтобы вкладка «Этапы» обновилась без перезагрузки.
-func (r *run) recordUsage(st *StageState, res *agent.Result) {
-	u := usageOf(res)
+func (r *run) recordUsage(st *StageState, u protocol.Usage) {
 	if st == nil || u.Zero() {
 		return
 	}

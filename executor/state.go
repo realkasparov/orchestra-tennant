@@ -18,6 +18,11 @@ type StageState struct {
 	SessionID   string         `json:"session_id,omitempty"`
 	CurrentPass int            `json:"current_pass,omitempty"`
 	Usage       protocol.Usage `json:"usage"`
+	// SessionTotal — суммы сессии SessionTotalID после её последнего вызова:
+	// Claude Code продолжает счёт при --resume, и расход следующего вызова —
+	// разница с ними.
+	SessionTotal   protocol.Usage `json:"session_total,omitempty"`
+	SessionTotalID string         `json:"session_total_id,omitempty"`
 	// Сессия для заполненности контекста: папка и модель, в которых она шла
 	// (Claude Code ищет сессию по папке), размер разговора и окно модели.
 	SessionCWD   string `json:"session_cwd,omitempty"`
