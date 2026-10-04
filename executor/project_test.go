@@ -362,6 +362,12 @@ func TestReclaimRefusesCommitsOffBranch(t *testing.T) {
 	if cur, _ := gitops.CurrentBranch(repo); cur != "task-7-x" {
 		t.Fatalf("отказ сдвинул папку: %q", cur)
 	}
+	// Совет из отказа выполним: влили коммит в ветку — возврат проходит.
+	late := gitc(t, wt, "rev-parse", "HEAD")
+	gitc(t, repo, "merge", "-q", "--ff-only", late)
+	if err := r.reclaimBranch(); err != nil {
+		t.Fatalf("после влития: %v", err)
+	}
 }
 
 // База раунда правки: после оборванного раунда — прежняя (его рабочие
@@ -485,5 +491,30 @@ func TestReclaimAfterHumanAmend(t *testing.T) {
 	}
 	if gitops.DetachedAt(wt, "task-7-x") != "" {
 		t.Fatal("отметка отсоединения не снята")
+	}
+}
+
+// Коммит человека между раундами — не работа следующего раунда: пустое
+// «Выполнение» после правки — ошибка, а не «закоммитил человек».
+func TestEmptyRoundAfterHumanCommitFails(t *testing.T) {
+	_, repo, wt := viewWorld(t)
+	plan := fullPlan()
+	plan.Project = protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"}
+	r, _ := testRun(t, plan)
+	head := gitc(t, wt, "rev-parse", "HEAD")
+	r.st.WorktreeDir, r.st.BranchName, r.st.RoundBase = wt, "task-7-x", head
+	r.st.HumanCommits = []string{head}
+	def := r.plan.Step("execute")
+	if def == nil {
+		t.Fatal("нет шага execute")
+	}
+	_ = os.WriteFile(filepath.Join(r.st.TaskDir, "step04-execution.md"), []byte("отчёт"), 0o644)
+	if err := r.runChecks(def, "", true); err == nil || !strings.Contains(err.Error(), "ни одного коммита") {
+		t.Fatalf("пустой раунд прошёл: %v", err)
+	}
+	// Посреди раунда (HumanBase) — работу закоммитил человек, не ошибка.
+	r.st.HumanBase = head
+	if err := r.runChecks(def, "", true); err != nil {
+		t.Fatalf("работа раунда человека: %v", err)
 	}
 }

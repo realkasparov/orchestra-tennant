@@ -470,7 +470,9 @@ func (r *run) runChecks(def *protocol.Step, text string, gitChecks bool) error {
 			// Работа раунда — от базы ревью: коммиты агента ниже коммита
 			// человека посреди раунда тоже его работа.
 			if head == r.reviewBase() {
-				if r.isHumanCommit(head) {
+				// Только коммит человека посреди этого раунда: сделанный до
+				// правки (между раундами) работой раунда не считается.
+				if r.st.HumanBase != "" && head == r.st.HumanBase {
 					r.log(def.Key, "Новых коммитов агента нет: работу раунда закоммитил человек.")
 					continue
 				}
@@ -623,14 +625,4 @@ func (r *run) humanCommitsNote() string {
 		return ""
 	}
 	return "\n\nHUMAN COMMITS in this diff (made by the user — their decisions: do not revert or rewrite them, review only the agent's changes): " + strings.Join(in, ", ") + "\n"
-}
-
-// isHumanCommit — коммит из найденных при возврате ветки коммитов человека.
-func (r *run) isHumanCommit(sha string) bool {
-	for _, h := range r.st.HumanCommits {
-		if h == sha {
-			return true
-		}
-	}
-	return false
 }

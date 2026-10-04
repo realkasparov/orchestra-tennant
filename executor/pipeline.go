@@ -970,9 +970,8 @@ func (r *run) reclaimBranch() error {
 	// папку: его коммиты не в ветке, и переключение их бросило бы. Сверка — с
 	// коммитом, на котором worktree отпустил ветку (человек мог переписать
 	// ветку amend или rebase — это его право, не повод отказывать).
-	if at := gitops.DetachedAt(wt, branch); at != "" && at != oldHead ||
-		at == "" && !gitops.IsAncestor(wt, oldHead, branch) {
-		return fmt.Errorf("в рабочей копии таски коммиты агента, которых нет в ветке «%s» (HEAD %s) — перенесите их в ветку (git cherry-pick) и повторите", branch, short(oldHead))
+	if at := gitops.DetachedAt(wt, branch); at != oldHead && !gitops.IsAncestor(wt, oldHead, branch) {
+		return fmt.Errorf("в рабочей копии таски коммиты агента, которых нет в ветке «%s» (HEAD %s) — влейте их в ветку (git merge %s в папке проекта) и повторите", branch, short(oldHead), oldHead)
 	}
 	_ = gitops.PruneWorktrees(wt)
 	holder, err := gitops.BranchHolder(wt, branch)
