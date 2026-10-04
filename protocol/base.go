@@ -30,7 +30,7 @@ func BasePipeline() *Pipeline {
 			{Key: "branch", Kind: KindBranch, Title: "Создание ветки", Desc: "Переименовывает ветку задачи по референсу и описанию — без агента"},
 			{Key: "execute", Kind: KindAgent, Title: "Выполнение", Skill: "execute-plan", Requires: []string{"analyze", "branch"},
 				Desc: "Реализует план в рабочей копии и коммитит",
-				Bind: map[string]string{"REFERENCE": "$task.reference", "TITLE": "$task.branch_title", "BASE": "$task.base_commit"}},
+				Bind: map[string]string{"REFERENCE": "$task.reference", "TITLE": "$task.branch_title", "BASE": "$task.round_base"}},
 			{Key: "test_gate", Kind: KindTestGate, Title: "Тест-гейт", FixWith: "execute",
 				Desc: "Прогоняет команду тестов проекта; падение чинится сессией выполнения один раз"},
 			{Key: "review", Kind: KindAgent, Title: "Ревью", Skill: "review-task", Requires: []string{"execute"},

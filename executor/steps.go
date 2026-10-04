@@ -211,6 +211,12 @@ func (r *run) resolve(src string, m *protocol.Manifest, input string) (string, e
 	}
 	switch scope {
 	case "task":
+		// Свёртка «Выполнения» — от базы раунда: иначе второй раунд свернул
+		// бы в один коммит и прошлые раунды, и коммиты человека между ними.
+		// Замороженные схемы до этого правила привязывают BASE к базе таски.
+		if name == "base_commit" && input == "BASE" && m != nil && m.Name == "execute-plan" {
+			return r.roundBase(), nil
+		}
 		return r.taskRef(name), nil
 	case "project":
 		p := r.plan.Project

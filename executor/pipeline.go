@@ -89,6 +89,11 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			r.log("", "Индекс кода: "+err.Error())
 		}
 	}
+	if err := r.reclaimBranch(); err != nil {
+		r.log("", "Ошибка: "+err.Error())
+		r.taskStatus("error")
+		return "error", err
+	}
 	mctx, mcancel := context.WithCancel(ctx)
 	defer mcancel()
 	r.seedSessions()
@@ -876,6 +881,45 @@ func (r *run) emitDiff() {
 // ведущий git сам.
 func (r *run) folderMode() bool {
 	return r.plan.Workspace == "folder" || r.st.SelfWorkspace
+}
+
+// reclaimBranch возвращает ветку таски в её рабочую копию перед работой
+// агента: человек мог открыть таску в папке проекта (ветка переехала туда)
+// и закоммитить свои правки. Папка проекта отпускает ветку — встаёт на
+// базовую, — worktree встаёт на ветку со всеми коммитами. Делается до
+// раунда правки: база раунда должна включать коммиты человека.
+// Незакоммиченное в папке на ветке таски — отказ: ни автокоммита, ни stash.
+func (r *run) reclaimBranch() error {
+	wt, branch := r.st.WorktreeDir, r.st.BranchName
+	if wt == "" || branch == "" || r.folderMode() {
+		return nil
+	}
+	if cur, err := gitops.CurrentBranch(wt); err != nil || cur == branch {
+		return nil // рабочей копии нет (её заведёт шаг) или ветка на месте
+	}
+	holder, err := gitops.BranchHolder(wt, branch)
+	if err != nil {
+		return err
+	}
+	if holder != "" {
+		proj := r.plan.Project
+		if !samePath(holder, proj.Path) {
+			return fmt.Errorf("ветку таски «%s» держит рабочая копия %s — переключите её на другую ветку и повторите", branch, holder)
+		}
+		if dirty, err := gitops.DirtyFiles(holder); err != nil {
+			return err
+		} else if len(dirty) > 0 {
+			return fmt.Errorf("в папке проекта незакоммиченные правки ветки таски «%s» (%s) — закоммитьте их и повторите", branch, strings.Join(dirty, ", "))
+		}
+		if err := gitops.Checkout(holder, proj.BaseBranch); err != nil {
+			return fmt.Errorf("вернуть папку проекта на «%s»: %w", proj.BaseBranch, err)
+		}
+		r.log("", fmt.Sprintf("Ветка «%s» возвращена агенту, папка проекта — на «%s».", branch, proj.BaseBranch))
+	}
+	if err := gitops.Switch(wt, branch); err != nil {
+		return fmt.Errorf("вернуть ветку «%s» в рабочую копию таски: %w", branch, err)
+	}
+	return nil
 }
 
 // checkWorkspace — рабочая копия в папке проекта всё ещё наша: там наша

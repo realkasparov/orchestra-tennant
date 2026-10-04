@@ -190,7 +190,7 @@ func TestPlanV2RoundTrips(t *testing.T) {
 	if back.SchemaVersion != 2 || len(back.Steps) != len(p.Steps) || len(back.Skills) != len(p.Skills) {
 		t.Fatalf("план схемы 2 изменился при передаче: %+v", back)
 	}
-	if back.Step("execute").Bind["BASE"] != "$task.base_commit" {
+	if back.Step("execute").Bind["BASE"] != "$task.round_base" {
 		t.Error("привязки потерялись")
 	}
 }
