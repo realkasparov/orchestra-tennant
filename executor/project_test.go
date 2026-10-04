@@ -289,6 +289,9 @@ func TestBranchHandoverRoundTrip(t *testing.T) {
 	if h, _ := gitops.HeadSHA(wt); h != human {
 		t.Fatal("worktree без коммита человека")
 	}
+	if !r.humanCommits {
+		t.Fatal("коммиты человека не замечены")
+	}
 	// Повторный возврат — ничего не делает.
 	if err := r.reclaimBranch(); err != nil {
 		t.Fatal(err)
@@ -336,5 +339,70 @@ func TestBranchNameStableAcrossRounds(t *testing.T) {
 	}
 	if cur, _ := gitops.CurrentBranch(wt); cur != "task-7-x" || r.st.BranchName != "task-7-x" {
 		t.Fatalf("ветка переименована во втором раунде: %s / %s", cur, r.st.BranchName)
+	}
+}
+
+// Агент закоммитил в отсоединённую рабочую копию (ветку забрали в папку во
+// время старта задания): возврат ветки отказывает, а не выбрасывает коммит.
+func TestReclaimRefusesCommitsOffBranch(t *testing.T) {
+	ex, repo, wt := viewWorld(t)
+	if res := ex.view(&protocol.ProjectSpec{Dir: repo, BaseBranch: "main", Branch: "task-7-x"}); !res.OK {
+		t.Fatalf("открытие: %+v", res)
+	}
+	_ = os.WriteFile(filepath.Join(wt, "late.txt"), []byte("x"), 0o644)
+	gitc(t, wt, "add", "-A")
+	gitc(t, wt, "commit", "-q", "-m", "поздний коммит агента")
+	plan := fullPlan()
+	plan.Project = protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"}
+	r, _ := testRun(t, plan)
+	r.st.WorktreeDir, r.st.BranchName = wt, "task-7-x"
+	if err := r.reclaimBranch(); err == nil || !strings.Contains(err.Error(), "нет в ветке") {
+		t.Fatalf("коммит вне ветки: %v", err)
+	}
+	if cur, _ := gitops.CurrentBranch(repo); cur != "task-7-x" {
+		t.Fatalf("отказ сдвинул папку: %q", cur)
+	}
+}
+
+// База раунда правки: после оборванного раунда — прежняя (его рабочие
+// коммиты свернёт и проверит новый раунд); после законченного или поверх
+// коммитов человека — HEAD.
+func TestChangeRoundBase(t *testing.T) {
+	_, repo, wt := viewWorld(t)
+	plan := fullPlan()
+	plan.Project = protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"}
+	r, _ := testRun(t, plan)
+	base := gitc(t, repo, "rev-parse", "main")
+	head := gitc(t, wt, "rev-parse", "HEAD")
+	r.st.WorktreeDir, r.st.BranchName, r.st.BaseCommit, r.st.RoundBase = wt, "task-7-x", base, base
+	for _, k := range r.reworkKeys() {
+		r.st.Stages = append(r.st.Stages, &StageState{Key: k, Round: 1, Status: "done"})
+	}
+	r.st.stage("execute").Status = "paused"
+	if err := r.startChangeRound(); err != nil {
+		t.Fatal(err)
+	}
+	if r.st.RoundBase != base {
+		t.Fatalf("после оборванного раунда база %s, ждали прежнюю", short(r.st.RoundBase))
+	}
+	for _, st := range r.st.Stages {
+		st.Status = "done"
+	}
+	if err := r.startChangeRound(); err != nil {
+		t.Fatal(err)
+	}
+	if r.st.RoundBase != head {
+		t.Fatalf("после законченного раунда база %s, ждали HEAD", short(r.st.RoundBase))
+	}
+}
+
+func TestMergeMessages(t *testing.T) {
+	p := &protocol.Message{Text: "правка", Mode: "change"}
+	n := &protocol.Message{Text: "вопрос", Mode: "question"}
+	if m := mergeMessages(p, n); m.Text != "правка\n\nвопрос" || m.Mode != "change" {
+		t.Fatalf("слияние: %+v", m)
+	}
+	if mergeMessages(nil, n) != n || mergeMessages(p, nil) != p {
+		t.Fatal("одно из двух")
 	}
 }

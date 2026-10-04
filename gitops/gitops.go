@@ -215,6 +215,15 @@ func BranchHolder(repo, branch string) (string, error) {
 	return "", nil
 }
 
+// IsAncestor — коммит ref достижим из ветки или коммита of.
+func IsAncestor(dir, ref, of string) bool {
+	if CheckRef(ref) != nil || CheckRef(of) != nil {
+		return false
+	}
+	_, err := run(dir, "merge-base", "--is-ancestor", ref, of)
+	return err == nil
+}
+
 // SwitchDetach отпускает ветку рабочей копии: HEAD остаётся на том же
 // коммите отсоединённым, файлы не меняются.
 func SwitchDetach(dir string) error {

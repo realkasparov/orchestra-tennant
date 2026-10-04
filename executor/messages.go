@@ -501,9 +501,14 @@ func (r *run) startChangeRound() error {
 	if err := archiveRound(r.st.TaskDir, r.st.round(), r.roundArtifacts(keys)); err != nil {
 		return fmt.Errorf("перенос артефактов прошлого раунда: %w", err)
 	}
+	// Прошлый раунд оборван (пауза или ошибка посреди «Выполнения»): его
+	// рабочие коммиты ещё не свёрнуты и не проверены — база остаётся прежней,
+	// чтобы новый раунд свернул и проверил их. Коммиты человека (ветка
+	// возвращена с ними) — граница всегда: их не сворачивают и не правят.
+	complete := r.roundComplete()
 	round := r.st.addRound(keys)
 	r.markDisabled()
-	if r.st.WorktreeDir != "" {
+	if r.st.WorktreeDir != "" && (complete || r.humanCommits || r.st.RoundBase == "") {
 		if head, err := gitops.HeadSHA(r.st.WorktreeDir); err == nil {
 			r.st.RoundBase = head
 			r.job.Emit("", "task_field", map[string]any{"round_base": head})

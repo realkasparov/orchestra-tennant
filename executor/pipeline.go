@@ -62,6 +62,9 @@ type run struct {
 	passScope string
 	// sess — замки и последние проценты сессий шагов.
 	sess sessionState
+	// humanCommits — ветка вернулась агенту с коммитами человека: они —
+	// граница раунда, сворачивать и править их нельзя.
+	humanCommits bool
 }
 
 // Run исполняет задание. Возвращаемый статус — терминальный статус таски.
@@ -89,13 +92,15 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			r.log("", "Индекс кода: "+err.Error())
 		}
 	}
-	// Сообщение задания или отложенное прошлым заданием.
+	// Сообщение задания вместе с отложенным прошлым заданием: новое сообщение
+	// до «Повторить» не должно вытеснить отложенную правку.
 	msg := r.plan.Message
-	if msg == nil {
-		msg = r.st.PendingMessage
+	if msg != nil && r.st.MessageJob == job.ID {
+		msg = nil // уже разобрано этим заданием до перезапуска
 	}
+	msg = mergeMessages(r.st.PendingMessage, msg)
 	if err := r.reclaimBranch(); err != nil {
-		if msg != nil && r.st.MessageJob != job.ID {
+		if msg != nil {
 			r.st.PendingMessage = msg
 			r.job.SaveState()
 			err = fmt.Errorf("%w; сообщение сохранено — «Повторить» начнёт его", err)
@@ -114,7 +119,7 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
-	if m := msg; m != nil && r.st.MessageJob != job.ID {
+	if m := msg; m != nil {
 		r.handleMessage(ctx, m.Text, m.Mode)
 		if ctx.Err() != nil {
 			r.change.take()
@@ -937,6 +942,22 @@ func (r *run) reclaimBranch() error {
 	if cur, err := gitops.CurrentBranch(wt); err != nil || cur == branch {
 		return nil // рабочей копии нет (её заведёт шаг) или ветка на месте
 	}
+	// Рабочая копия таски должна встать на ветку целиком: незакоммиченное в
+	// ней или коммиты вне ветки (агент коммитил, пока ветку забирали) —
+	// отказ до того, как трогать папку проекта.
+	if dirty, err := gitops.DirtyFiles(wt); err != nil {
+		return err
+	} else if len(dirty) > 0 {
+		return fmt.Errorf("в рабочей копии таски незакоммиченные изменения (%s) — ветку «%s» ей не вернуть", strings.Join(dirty, ", "), branch)
+	}
+	oldHead, err := gitops.HeadSHA(wt)
+	if err != nil {
+		return err
+	}
+	if !gitops.IsAncestor(wt, oldHead, branch) {
+		return fmt.Errorf("в рабочей копии таски коммиты, которых нет в ветке «%s» (HEAD %s) — перенесите их в ветку (git cherry-pick) и повторите", branch, short(oldHead))
+	}
+	_ = gitops.PruneWorktrees(wt)
 	holder, err := gitops.BranchHolder(wt, branch)
 	if err != nil {
 		return err
@@ -959,7 +980,45 @@ func (r *run) reclaimBranch() error {
 	if err := gitops.Switch(wt, branch); err != nil {
 		return fmt.Errorf("вернуть ветку «%s» в рабочую копию таски: %w", branch, err)
 	}
+	if head, err := gitops.HeadSHA(wt); err == nil && head != oldHead {
+		// Человек закоммитил в ветку: дальше раунд считается от его коммитов.
+		r.humanCommits = true
+		if r.st.RoundBase != "" {
+			r.st.RoundBase = head
+			r.job.Emit("", "task_field", map[string]any{"round_base": head})
+		}
+		r.log("", fmt.Sprintf("В ветке «%s» коммиты человека — агент продолжит поверх них, не сворачивая и не правя их.", branch))
+	}
 	return nil
+}
+
+// roundComplete — последний раунд дошёл до конца: все его этапы исполнены
+// или пропущены.
+func (r *run) roundComplete() bool {
+	last := r.st.round()
+	for _, st := range r.st.Stages {
+		if st.Round == last && st.Status != "done" && st.Status != "skipped" {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeMessages — отложенное сообщение и новое одним: правка, если хоть одно
+// из них — правка.
+func mergeMessages(pending, next *protocol.Message) *protocol.Message {
+	switch {
+	case pending == nil:
+		return next
+	case next == nil:
+		return pending
+	}
+	m := *next
+	m.Text = pending.Text + "\n\n" + next.Text
+	if pending.Mode == "change" || next.Mode == "change" {
+		m.Mode = "change"
+	}
+	return &m
 }
 
 // checkWorkspace — рабочая копия в папке проекта всё ещё наша: там наша

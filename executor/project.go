@@ -380,6 +380,8 @@ func hasStage(plan *protocol.Plan, key string) bool {
 // отсоединённой, — и папка встаёт на ветку. Человек коммитит в ветку сам;
 // агенту ветка вернётся в начале его следующего задания (reclaimBranch).
 func (e *Executor) takeBranch(path, branch string) error {
+	// Записи о рабочих копиях, чьих папок уже нет, держали бы ветку зря.
+	_ = gitops.PruneWorktrees(path)
 	holder, err := gitops.BranchHolder(path, branch)
 	if err != nil {
 		return err
@@ -400,6 +402,14 @@ func (e *Executor) takeBranch(path, branch string) error {
 	}
 	if err := gitops.SwitchDetach(holder); err != nil {
 		return fmt.Errorf("отпустить ветку в рабочей копии таски: %w", err)
+	}
+	// Задание таски могло стартовать между проверкой и отсоединением: тогда
+	// агент закоммитил бы мимо ветки — возвращаем ветку ему.
+	if id := e.runningIn(holder); id != 0 {
+		if back := gitops.Switch(holder, branch); back != nil {
+			return fmt.Errorf("агент начал работу над таской #%d, а вернуть ему ветку не вышло: %v", id, back)
+		}
+		return fmt.Errorf("агент работает над таской #%d — поставьте её на паузу или дождитесь", id)
 	}
 	if err := gitops.Switch(path, branch); err != nil {
 		if back := gitops.Switch(holder, branch); back != nil {
