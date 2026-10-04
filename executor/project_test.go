@@ -289,7 +289,7 @@ func TestBranchHandoverRoundTrip(t *testing.T) {
 	if h, _ := gitops.HeadSHA(wt); h != human {
 		t.Fatal("worktree без коммита человека")
 	}
-	if !r.humanCommits {
+	if r.st.HumanBase != human {
 		t.Fatal("коммиты человека не замечены")
 	}
 	// Повторный возврат — ничего не делает.
@@ -442,6 +442,25 @@ func TestHumanCommitMidRoundKeepsReview(t *testing.T) {
 	// Сессия шага, продолженная после паузы, узнаёт новую базу свёртки.
 	if note := r.humanCommitsResumeNote(); !strings.Contains(note, human) {
 		t.Fatalf("заметка продолжению: %q", note)
+	}
+	// Следующее задание той же таски (новый run, то же состояние) тоже её
+	// передаёт.
+	r2, _ := testRun(t, plan)
+	r2.st = r.st
+	if note := r2.humanCommitsResumeNote(); !strings.Contains(note, human) {
+		t.Fatalf("заметка в следующем задании: %q", note)
+	}
+	// Правка сообщением посреди оборванного раунда не теряет базу ревью:
+	// работа агента до коммита человека ещё не проверена.
+	for _, k := range r.reworkKeys() {
+		r.st.Stages = append(r.st.Stages, &StageState{Key: k, Round: 1, Status: "done"})
+	}
+	r.st.stage("review").Status = "paused"
+	if err := r.startChangeRound(); err != nil {
+		t.Fatal(err)
+	}
+	if r.st.ReviewBase != base || r.st.RoundBase != human || r.st.HumanBase != "" {
+		t.Fatalf("после правки: база раунда %s, ревью %s, human %s", short(r.st.RoundBase), short(r.st.ReviewBase), short(r.st.HumanBase))
 	}
 }
 

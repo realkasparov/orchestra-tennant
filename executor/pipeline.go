@@ -62,9 +62,6 @@ type run struct {
 	passScope string
 	// sess — замки и последние проценты сессий шагов.
 	sess sessionState
-	// humanCommits — ветка вернулась агенту с коммитами человека: они —
-	// граница раунда, сворачивать и править их нельзя.
-	humanCommits bool
 }
 
 // Run исполняет задание. Возвращаемый статус — терминальный статус таски.
@@ -1005,7 +1002,6 @@ func (r *run) reclaimBranch() error {
 		// Человек закоммитил в ветку: дальше раунд считается от его коммитов,
 		// их не сворачивают. Если агент уже закоммитил работу раунда, ревью
 		// смотрит её от прежней базы — коммиты человека в ней помечены.
-		r.humanCommits = true
 		if shas, err := gitops.RevList(wt, oldHead, head); err == nil {
 			r.st.HumanCommits = append(r.st.HumanCommits, shas...)
 		}
@@ -1016,6 +1012,7 @@ func (r *run) reclaimBranch() error {
 			r.st.RoundBase = head
 			r.job.Emit("", "task_field", map[string]any{"round_base": head})
 		}
+		r.st.HumanBase = head
 		r.job.SaveState()
 		r.log("", fmt.Sprintf("В ветке «%s» коммиты человека — агент продолжит поверх них, не сворачивая и не правя их.", branch))
 	}
@@ -1026,14 +1023,14 @@ func (r *run) reclaimBranch() error {
 // человек и от какой базы теперь сворачивать. Пусто — коммитов человека в
 // этом задании не было.
 func (r *run) humanCommitsResumeNote() string {
-	if !r.humanCommits || r.st.RoundBase == "" {
+	if r.st.HumanBase == "" {
 		return ""
 	}
 	return fmt.Sprintf("Пока шаг стоял, пользователь закоммитил в ветку свои правки — HEAD теперь %s. "+
 		"Это его решения: не сворачивай, не переписывай (reset, rebase, amend) и не откатывай коммиты до %s включительно. "+
 		"База для свёртки твоих коммитов теперь %s (вместо BASE/ROUND_BASE из начала шага); "+
 		"твои незакоммиченные изменения и коммиты ниже неё остаются как есть.",
-		short(r.st.RoundBase), short(r.st.RoundBase), r.st.RoundBase)
+		short(r.st.HumanBase), short(r.st.HumanBase), r.st.HumanBase)
 }
 
 // roundComplete — последний раунд дошёл до конца: все его этапы исполнены

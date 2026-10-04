@@ -467,7 +467,13 @@ func (r *run) runChecks(def *protocol.Step, text string, gitChecks bool) error {
 			if err != nil {
 				return err
 			}
-			if head == r.roundBase() {
+			// Работа раунда — от базы ревью: коммиты агента ниже коммита
+			// человека посреди раунда тоже его работа.
+			if head == r.reviewBase() {
+				if r.isHumanCommit(head) {
+					r.log(def.Key, "Новых коммитов агента нет: работу раунда закоммитил человек.")
+					continue
+				}
 				return fmt.Errorf("%s не создал ни одного коммита", def.Title)
 			}
 		case "clean_tree":
@@ -617,4 +623,14 @@ func (r *run) humanCommitsNote() string {
 		return ""
 	}
 	return "\n\nHUMAN COMMITS in this diff (made by the user — their decisions: do not revert or rewrite them, review only the agent's changes): " + strings.Join(in, ", ") + "\n"
+}
+
+// isHumanCommit — коммит из найденных при возврате ветки коммитов человека.
+func (r *run) isHumanCommit(sha string) bool {
+	for _, h := range r.st.HumanCommits {
+		if h == sha {
+			return true
+		}
+	}
+	return false
 }

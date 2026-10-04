@@ -508,13 +508,16 @@ func (r *run) startChangeRound() error {
 	complete := r.roundComplete()
 	round := r.st.addRound(keys)
 	r.markDisabled()
-	if r.st.WorktreeDir != "" && (complete || r.humanCommits || r.st.RoundBase == "") {
+	// Коммиты человека посреди раунда база раунда уже учла (возврат ветки
+	// передвинул её на них), а база ревью держит работу агента до них —
+	// оборванный раунд их сохраняет.
+	if r.st.WorktreeDir != "" && (complete || r.st.RoundBase == "") {
 		if head, err := gitops.HeadSHA(r.st.WorktreeDir); err == nil {
 			r.st.RoundBase, r.st.ReviewBase = head, ""
 			r.job.Emit("", "task_field", map[string]any{"round_base": head})
 		}
 	}
-	r.humanCommits = false
+	r.st.HumanBase = "" // новый раунд — новые сессии шагов
 	for _, key := range keys {
 		r.emitStage(r.st.stage(key), "pending")
 	}
