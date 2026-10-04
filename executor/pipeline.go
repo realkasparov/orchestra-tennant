@@ -89,7 +89,17 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			r.log("", "Индекс кода: "+err.Error())
 		}
 	}
+	// Сообщение задания или отложенное прошлым заданием.
+	msg := r.plan.Message
+	if msg == nil {
+		msg = r.st.PendingMessage
+	}
 	if err := r.reclaimBranch(); err != nil {
+		if msg != nil && r.st.MessageJob != job.ID {
+			r.st.PendingMessage = msg
+			r.job.SaveState()
+			err = fmt.Errorf("%w; сообщение сохранено — «Повторить» начнёт его", err)
+		}
 		r.log("", "Ошибка: "+err.Error())
 		r.taskStatus("error")
 		return "error", err
@@ -104,7 +114,7 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
-	if m := r.plan.Message; m != nil && r.st.MessageJob != job.ID {
+	if m := msg; m != nil && r.st.MessageJob != job.ID {
 		r.handleMessage(ctx, m.Text, m.Mode)
 		if ctx.Err() != nil {
 			r.change.take()
@@ -119,10 +129,10 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 				return r.failRound(err)
 			}
 		}
-		r.st.MessageJob = job.ID
+		r.st.MessageJob, r.st.PendingMessage = job.ID, nil
 		r.job.SaveState()
 	}
-	if r.plan.Message != nil && r.allStagesDone() {
+	if msg != nil && r.allStagesDone() {
 		r.answerQueued(ctx)
 		return "done", nil
 	}
