@@ -301,8 +301,13 @@ func TestBranchHandoverRoundTrip(t *testing.T) {
 	if got, _ := r.resolve("$task.base_commit", em, "BASE"); got != human {
 		t.Fatalf("BASE выполнения: %s, ждали базу раунда", got)
 	}
-	if got, _ := r.resolve("$task.base_commit", r.manifest("review-task"), "BASE_COMMIT"); got != r.st.BaseCommit {
-		t.Fatalf("база ревью: %s", got)
+	// Ревью — работа раунда: коммиты человека не предмет его правок.
+	if got, _ := r.resolve("$task.base_commit", r.manifest("review-task"), "BASE_COMMIT"); got != human {
+		t.Fatalf("база ревью: %s, ждали базу раунда", got)
+	}
+	// Инструкции по проверке нужна вся ветка.
+	if got, _ := r.resolve("$task.base_commit", r.manifest("handoff-notes"), "BASE_COMMIT"); got != r.st.BaseCommit {
+		t.Fatalf("база инструкции: %s", got)
 	}
 	for _, f := range []string{"w1", "w2"} {
 		_ = os.WriteFile(filepath.Join(wt, f), []byte(f), 0o644)
@@ -313,5 +318,23 @@ func TestBranchHandoverRoundTrip(t *testing.T) {
 	gitc(t, wt, "commit", "-q", "-m", "агент, раунд 2")
 	if log := gitc(t, wt, "log", "--format=%s", "main..task-7-x"); log != "агент, раунд 2\nчеловек\nагент" {
 		t.Fatalf("история ветки:\n%s", log)
+	}
+}
+
+// Имя ветки даётся один раз: в следующих раундах «Создание ветки» его не
+// меняет, даже если анализ описал правку иначе.
+func TestBranchNameStableAcrossRounds(t *testing.T) {
+	_, repo, wt := viewWorld(t)
+	plan := fullPlan()
+	plan.Project = protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"}
+	r, _ := testRun(t, plan)
+	r.st.WorktreeDir, r.st.BranchName, r.st.Reference, r.st.BranchSlug = wt, "task-7-x", "task-7", "done-output"
+	st := &StageState{Key: "branch", Round: 2}
+	r.st.Stages = append(r.st.Stages, &StageState{Key: "branch", Round: 1, Status: "done"}, st)
+	if err := r.stepBranch(st); err != nil {
+		t.Fatal(err)
+	}
+	if cur, _ := gitops.CurrentBranch(wt); cur != "task-7-x" || r.st.BranchName != "task-7-x" {
+		t.Fatalf("ветка переименована во втором раунде: %s / %s", cur, r.st.BranchName)
 	}
 }

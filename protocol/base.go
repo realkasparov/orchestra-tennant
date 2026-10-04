@@ -35,7 +35,7 @@ func BasePipeline() *Pipeline {
 				Desc: "Прогоняет команду тестов проекта; падение чинится сессией выполнения один раз"},
 			{Key: "review", Kind: KindAgent, Title: "Ревью", Skill: "review-task", Requires: []string{"execute"},
 				Desc: "Проверяет получившийся дифф против требований и плана; в режиме «без остановок» сам исправляет найденное",
-				Bind: map[string]string{"REFERENCE": "$task.reference", "BASE_COMMIT": "$task.base_commit", "MODE": "$plan.review_mode"}},
+				Bind: map[string]string{"REFERENCE": "$task.reference", "BASE_COMMIT": "$task.round_base", "MODE": "$plan.review_mode"}},
 			{Key: "handoff", Kind: KindAgent, Title: "Инструкция по проверке", Skill: "handoff-notes", Requires: []string{"execute"},
 				Desc: "Пишет, как увидеть результат: что пересобрать и в каком порядке, как запустить, что проверить руками",
 				Bind: map[string]string{"REFERENCE": "$task.reference", "BRANCH": "$task.branch_name", "BASE_COMMIT": "$task.base_commit",
