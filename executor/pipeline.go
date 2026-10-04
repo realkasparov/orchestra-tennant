@@ -507,6 +507,11 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, sp agentSpec, p
 		} else {
 			prompt = continuationPrompt
 		}
+		// Пока шаг стоял, человек закоммитил в ветку: сессия помнит прежнюю
+		// базу из первого промпта — свёртка от неё поглотила бы его коммиты.
+		if note := r.humanCommitsResumeNote(); note != "" {
+			prompt += "\n\n" + note
+		}
 	}
 	return r.runAgentSession(ctx, st, sp, prompt, resume, pass)
 }
@@ -1015,6 +1020,20 @@ func (r *run) reclaimBranch() error {
 		r.log("", fmt.Sprintf("В ветке «%s» коммиты человека — агент продолжит поверх них, не сворачивая и не правя их.", branch))
 	}
 	return nil
+}
+
+// humanCommitsResumeNote — для продолжаемой сессии: какие коммиты добавил
+// человек и от какой базы теперь сворачивать. Пусто — коммитов человека в
+// этом задании не было.
+func (r *run) humanCommitsResumeNote() string {
+	if !r.humanCommits || r.st.RoundBase == "" {
+		return ""
+	}
+	return fmt.Sprintf("Пока шаг стоял, пользователь закоммитил в ветку свои правки — HEAD теперь %s. "+
+		"Это его решения: не сворачивай, не переписывай (reset, rebase, amend) и не откатывай коммиты до %s включительно. "+
+		"База для свёртки твоих коммитов теперь %s (вместо BASE/ROUND_BASE из начала шага); "+
+		"твои незакоммиченные изменения и коммиты ниже неё остаются как есть.",
+		short(r.st.RoundBase), short(r.st.RoundBase), r.st.RoundBase)
 }
 
 // roundComplete — последний раунд дошёл до конца: все его этапы исполнены

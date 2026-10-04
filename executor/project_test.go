@@ -439,6 +439,10 @@ func TestHumanCommitMidRoundKeepsReview(t *testing.T) {
 	if note := r.humanCommitsNote(); !strings.Contains(note, short(human)) {
 		t.Fatalf("заметка о коммитах человека: %q", note)
 	}
+	// Сессия шага, продолженная после паузы, узнаёт новую базу свёртки.
+	if note := r.humanCommitsResumeNote(); !strings.Contains(note, human) {
+		t.Fatalf("заметка продолжению: %q", note)
+	}
 }
 
 // Человек переписал ветку в папке (amend коммита агента): это не повод
