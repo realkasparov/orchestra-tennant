@@ -61,6 +61,14 @@ type StreamEvent struct {
 
 // Usage is the token/cost accounting of one claude run, taken from the final
 // "result" event (нули, если CLI его не прислал — например, при обрыве).
+//
+// Claude Code отдаёт в итоге суммы всей сессии: `total_cost_usd` и
+// `modelUsage` включают субагентов и все ходы процесса (их бывает несколько:
+// фоновый агент будит процесс уведомлением), а при --resume продолжают счёт
+// прошлых вызовов той же сессии. Поле `usage` — только последний ход
+// основного агента, без субагентов. Поэтому токены берутся из `modelUsage`
+// (запасной путь — `usage` у CLI без него), а расход именно этого прогона —
+// разница с суммой после прошлого вызова сессии — считает исполнитель.
 type Usage struct {
 	InputTokens  int64   `json:"tok_in"`
 	OutputTokens int64   `json:"tok_out"`
@@ -75,7 +83,7 @@ type Result struct {
 	GotResult bool   // a "result" event was seen
 	IsError   bool
 	ErrText   string
-	Usage     Usage // totals of the whole run
+	Usage     Usage // суммы сессии из последнего итога (см. Usage)
 	// Context — размер разговора: входные токены последнего обращения к модели
 	// вместе с кэшем (после сжатия — размер сводки). Сумма за прогон в Usage
 	// растёт с каждым ходом и размером контекста не является.
@@ -302,7 +310,18 @@ func handleLine(msg map[string]any, res *Result, text *strings.Builder, onEvent 
 			res.IsError = true
 			res.ErrText, _ = msg["result"].(string)
 		}
-		if u, ok := msg["usage"].(map[string]any); ok {
+		if mu, ok := msg["modelUsage"].(map[string]any); ok && len(mu) > 0 {
+			var u Usage
+			for _, v := range mu {
+				e, _ := v.(map[string]any)
+				u.InputTokens += i64(e["inputTokens"])
+				u.OutputTokens += i64(e["outputTokens"])
+				u.CacheWrite += i64(e["cacheCreationInputTokens"])
+				u.CacheRead += i64(e["cacheReadInputTokens"])
+			}
+			u.CostUSD = res.Usage.CostUSD
+			res.Usage = u
+		} else if u, ok := msg["usage"].(map[string]any); ok {
 			res.Usage.InputTokens = i64(u["input_tokens"])
 			res.Usage.OutputTokens = i64(u["output_tokens"])
 			res.Usage.CacheWrite = i64(u["cache_creation_input_tokens"])

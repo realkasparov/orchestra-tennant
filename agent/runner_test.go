@@ -34,6 +34,30 @@ func TestResultUsage(t *testing.T) {
 	}
 }
 
+// Токены — из modelUsage: это суммы всей сессии с субагентами и всеми
+// ходами, а usage — только последний ход основного агента. Последний итог
+// процесса главнее предыдущих.
+func TestResultUsageFromModelUsage(t *testing.T) {
+	res := &Result{}
+	turn := func(cost float64, cacheRead float64) map[string]any {
+		return map[string]any{
+			"type": "result", "session_id": "s1", "total_cost_usd": cost,
+			"usage": map[string]any{"input_tokens": float64(1), "output_tokens": float64(2),
+				"cache_creation_input_tokens": float64(3), "cache_read_input_tokens": float64(4)},
+			"modelUsage": map[string]any{
+				"claude-opus-5":             map[string]any{"inputTokens": float64(10), "outputTokens": float64(20), "cacheCreationInputTokens": float64(30), "cacheReadInputTokens": cacheRead, "contextWindow": float64(200000)},
+				"claude-haiku-4-5-20251001": map[string]any{"inputTokens": float64(1), "outputTokens": float64(2), "cacheCreationInputTokens": float64(3), "cacheReadInputTokens": float64(4)},
+			},
+		}
+	}
+	handleLine(turn(0.5, 100), res, nil, func(StreamEvent) {}, nil)
+	handleLine(turn(0.75, 300), res, nil, func(StreamEvent) {}, nil)
+	u := res.Usage
+	if u.InputTokens != 11 || u.OutputTokens != 22 || u.CacheWrite != 33 || u.CacheRead != 304 || u.CostUSD != 0.75 {
+		t.Fatalf("usage = %+v", u)
+	}
+}
+
 // Маппинг ключей моделей: opus — это Opus 5, неизвестный ключ — Fable.
 func TestModelID(t *testing.T) {
 	for key, want := range map[string]string{
