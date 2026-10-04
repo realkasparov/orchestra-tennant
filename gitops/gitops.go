@@ -224,6 +224,54 @@ func IsAncestor(dir, ref, of string) bool {
 	return err == nil
 }
 
+// RevList — коммиты from..to, от старых к новым.
+func RevList(dir, from, to string) ([]string, error) {
+	if err := CheckRef(from); err != nil {
+		return nil, err
+	}
+	if err := CheckRef(to); err != nil {
+		return nil, err
+	}
+	out, err := run(dir, "rev-list", "--reverse", from+".."+to)
+	if err != nil || out == "" {
+		return nil, err
+	}
+	return strings.Split(out, "\n"), nil
+}
+
+// detachedRef — где рабочая копия запоминает коммит, на котором отпустила
+// ветку branch.
+func detachedRef(branch string) string { return "refs/orchestra/detached/" + branch }
+
+// MarkDetached запоминает коммит HEAD рабочей копии, отпускающей ветку.
+func MarkDetached(dir, branch string) error {
+	if err := CheckRef(branch); err != nil {
+		return err
+	}
+	_, err := run(dir, "update-ref", detachedRef(branch), "HEAD")
+	return err
+}
+
+// DetachedAt — коммит, на котором рабочая копия отпустила ветку; пусто —
+// отметки нет.
+func DetachedAt(dir, branch string) string {
+	if CheckRef(branch) != nil {
+		return ""
+	}
+	out, err := run(dir, "rev-parse", "--verify", "-q", detachedRef(branch))
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// ForgetDetached снимает отметку: ветка вернулась в рабочую копию.
+func ForgetDetached(dir, branch string) {
+	if CheckRef(branch) == nil {
+		_, _ = run(dir, "update-ref", "-d", detachedRef(branch))
+	}
+}
+
 // SwitchDetach отпускает ветку рабочей копии: HEAD остаётся на том же
 // коммите отсоединённым, файлы не меняются.
 func SwitchDetach(dir string) error {

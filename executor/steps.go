@@ -60,7 +60,7 @@ func (r *run) stepAgent(ctx context.Context, st *StageState, def *protocol.Step)
 	// Ревью без новых коммитов в раунде — нечего смотреть: шаг с контекстом
 	// диффа пропускается, как раньше пропускалось ревью.
 	if m != nil && hasContext(m, "diff") && r.st.WorktreeDir != "" && r.st.BaseCommit != "" {
-		if head, herr := gitops.HeadSHA(r.st.WorktreeDir); herr == nil && head == r.roundBase() {
+		if head, herr := gitops.HeadSHA(r.st.WorktreeDir); herr == nil && head == r.reviewBase() {
 			r.log(st.Key, "Новых коммитов в этом раунде нет — этап пропущен.")
 			st.Status = "skipped"
 			r.emitStage(st, "skipped")
@@ -188,7 +188,8 @@ func (r *run) buildPrompt(def *protocol.Step, m *protocol.Manifest) (string, err
 			case "diff":
 				// Дифф раунда: работа прошлых раундов уже проверена, а
 				// коммиты человека между раундами — не предмет ревью.
-				sections.WriteString(diffSection(r.st.WorktreeDir, r.roundBase()))
+				sections.WriteString(diffSection(r.st.WorktreeDir, r.reviewBase()))
+				sections.WriteString(r.humanCommitsNote())
 			}
 		}
 	}
@@ -217,8 +218,10 @@ func (r *run) resolve(src string, m *protocol.Manifest, input string) (string, e
 		// свернул бы в один коммит и прошлые раунды, и коммиты человека между
 		// ними, а ревью «исправило» бы правки человека как лишние.
 		// Замороженные схемы до этого правила привязывают их к базе таски.
-		if name == "base_commit" && m != nil && ((m.Name == "execute-plan" && input == "BASE") ||
-			(m.Name == "review-task" && input == "BASE_COMMIT")) {
+		if m != nil && m.Name == "review-task" && input == "BASE_COMMIT" && (name == "base_commit" || name == "round_base") {
+			return r.reviewBase(), nil
+		}
+		if name == "base_commit" && m != nil && m.Name == "execute-plan" && input == "BASE" {
 			return r.roundBase(), nil
 		}
 		return r.taskRef(name), nil
@@ -596,4 +599,22 @@ func (r *run) reindexChanged(head string) {
 		return
 	}
 	r.p.Index.EnqueueChanged(r.plan.Project.ID, files)
+}
+
+// humanCommitsNote — коммиты человека в диффе ревью: это решения
+// пользователя, их не правят и не откатывают.
+func (r *run) humanCommitsNote() string {
+	if len(r.st.HumanCommits) == 0 || r.st.WorktreeDir == "" {
+		return ""
+	}
+	var in []string
+	for _, sha := range r.st.HumanCommits {
+		if gitops.IsAncestor(r.st.WorktreeDir, r.reviewBase(), sha) && sha != r.reviewBase() {
+			in = append(in, short(sha))
+		}
+	}
+	if len(in) == 0 {
+		return ""
+	}
+	return "\n\nHUMAN COMMITS in this diff (made by the user — their decisions: do not revert or rewrite them, review only the agent's changes): " + strings.Join(in, ", ") + "\n"
 }

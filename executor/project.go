@@ -400,18 +400,24 @@ func (e *Executor) takeBranch(path, branch string) error {
 	} else if len(dirty) > 0 {
 		return fmt.Errorf("в рабочей копии таски незакоммиченные изменения агента (%s) — продолжите таску до конца шага", strings.Join(dirty, ", "))
 	}
+	if err := gitops.MarkDetached(holder, branch); err != nil {
+		return fmt.Errorf("запомнить коммит рабочей копии таски: %w", err)
+	}
 	if err := gitops.SwitchDetach(holder); err != nil {
+		gitops.ForgetDetached(holder, branch)
 		return fmt.Errorf("отпустить ветку в рабочей копии таски: %w", err)
 	}
 	// Задание таски могло стартовать между проверкой и отсоединением: тогда
 	// агент закоммитил бы мимо ветки — возвращаем ветку ему.
 	if id := e.runningIn(holder); id != 0 {
+		gitops.ForgetDetached(holder, branch)
 		if back := gitops.Switch(holder, branch); back != nil {
 			return fmt.Errorf("агент начал работу над таской #%d, а вернуть ему ветку не вышло: %v", id, back)
 		}
 		return fmt.Errorf("агент работает над таской #%d — поставьте её на паузу или дождитесь", id)
 	}
 	if err := gitops.Switch(path, branch); err != nil {
+		gitops.ForgetDetached(holder, branch)
 		if back := gitops.Switch(holder, branch); back != nil {
 			return fmt.Errorf("переключить папку: %v; вернуть ветку в рабочую копию таски тоже не вышло: %v", err, back)
 		}

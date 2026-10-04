@@ -510,10 +510,11 @@ func (r *run) startChangeRound() error {
 	r.markDisabled()
 	if r.st.WorktreeDir != "" && (complete || r.humanCommits || r.st.RoundBase == "") {
 		if head, err := gitops.HeadSHA(r.st.WorktreeDir); err == nil {
-			r.st.RoundBase = head
+			r.st.RoundBase, r.st.ReviewBase = head, ""
 			r.job.Emit("", "task_field", map[string]any{"round_base": head})
 		}
 	}
+	r.humanCommits = false
 	for _, key := range keys {
 		r.emitStage(r.st.stage(key), "pending")
 	}

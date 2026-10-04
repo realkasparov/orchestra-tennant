@@ -100,6 +100,16 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	}
 	msg = mergeMessages(r.st.PendingMessage, msg)
 	if err := r.reclaimBranch(); err != nil {
+		// Сообщения, пришедшие живыми к возобновлённому заданию, тоже не
+		// теряются: их разберёт «Повторить».
+		for drained := false; !drained; {
+			select {
+			case lm := <-r.job.Messages():
+				msg = mergeMessages(msg, &protocol.Message{Text: lm.Text, Mode: lm.Mode})
+			default:
+				drained = true
+			}
+		}
 		if msg != nil {
 			r.st.PendingMessage = msg
 			r.job.SaveState()
@@ -954,8 +964,13 @@ func (r *run) reclaimBranch() error {
 	if err != nil {
 		return err
 	}
-	if !gitops.IsAncestor(wt, oldHead, branch) {
-		return fmt.Errorf("в рабочей копии таски коммиты, которых нет в ветке «%s» (HEAD %s) — перенесите их в ветку (git cherry-pick) и повторите", branch, short(oldHead))
+	// Агент закоммитил в рабочую копию после того, как ветку забрали в
+	// папку: его коммиты не в ветке, и переключение их бросило бы. Сверка — с
+	// коммитом, на котором worktree отпустил ветку (человек мог переписать
+	// ветку amend или rebase — это его право, не повод отказывать).
+	if at := gitops.DetachedAt(wt, branch); at != "" && at != oldHead ||
+		at == "" && !gitops.IsAncestor(wt, oldHead, branch) {
+		return fmt.Errorf("в рабочей копии таски коммиты агента, которых нет в ветке «%s» (HEAD %s) — перенесите их в ветку (git cherry-pick) и повторите", branch, short(oldHead))
 	}
 	_ = gitops.PruneWorktrees(wt)
 	holder, err := gitops.BranchHolder(wt, branch)
@@ -980,13 +995,23 @@ func (r *run) reclaimBranch() error {
 	if err := gitops.Switch(wt, branch); err != nil {
 		return fmt.Errorf("вернуть ветку «%s» в рабочую копию таски: %w", branch, err)
 	}
+	gitops.ForgetDetached(wt, branch)
 	if head, err := gitops.HeadSHA(wt); err == nil && head != oldHead {
-		// Человек закоммитил в ветку: дальше раунд считается от его коммитов.
+		// Человек закоммитил в ветку: дальше раунд считается от его коммитов,
+		// их не сворачивают. Если агент уже закоммитил работу раунда, ревью
+		// смотрит её от прежней базы — коммиты человека в ней помечены.
 		r.humanCommits = true
+		if shas, err := gitops.RevList(wt, oldHead, head); err == nil {
+			r.st.HumanCommits = append(r.st.HumanCommits, shas...)
+		}
 		if r.st.RoundBase != "" {
+			if oldHead != r.st.RoundBase && r.st.ReviewBase == "" {
+				r.st.ReviewBase = r.st.RoundBase
+			}
 			r.st.RoundBase = head
 			r.job.Emit("", "task_field", map[string]any{"round_base": head})
 		}
+		r.job.SaveState()
 		r.log("", fmt.Sprintf("В ветке «%s» коммиты человека — агент продолжит поверх них, не сворачивая и не правя их.", branch))
 	}
 	return nil
@@ -995,13 +1020,8 @@ func (r *run) reclaimBranch() error {
 // roundComplete — последний раунд дошёл до конца: все его этапы исполнены
 // или пропущены.
 func (r *run) roundComplete() bool {
-	last := r.st.round()
-	for _, st := range r.st.Stages {
-		if st.Round == last && st.Status != "done" && st.Status != "skipped" {
-			return false
-		}
-	}
-	return true
+	// Последний этап каждого рабочего шага; ответ на вопрос — не раунд.
+	return r.allStagesDone()
 }
 
 // mergeMessages — отложенное сообщение и новое одним: правка, если хоть одно
@@ -1015,8 +1035,13 @@ func mergeMessages(pending, next *protocol.Message) *protocol.Message {
 	}
 	m := *next
 	m.Text = pending.Text + "\n\n" + next.Text
-	if pending.Mode == "change" || next.Mode == "change" {
+	switch {
+	case pending.Mode == "change" || next.Mode == "change":
 		m.Mode = "change"
+	case pending.Mode != next.Mode:
+		// Отложенное не разобрано: пусть разберёт триаж, ошибка в нём — в
+		// пользу правки.
+		m.Mode = "auto"
 	}
 	return &m
 }
@@ -1144,6 +1169,15 @@ func short(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// reviewBase — база ревью: прежняя база раунда, если его поделили коммиты
+// человека, иначе база раунда.
+func (r *run) reviewBase() string {
+	if r.st.ReviewBase != "" {
+		return r.st.ReviewBase
+	}
+	return r.roundBase()
 }
 
 // roundBase — база текущего раунда (для старых задач — база задачи).

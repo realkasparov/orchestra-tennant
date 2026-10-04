@@ -402,7 +402,65 @@ func TestMergeMessages(t *testing.T) {
 	if m := mergeMessages(p, n); m.Text != "правка\n\nвопрос" || m.Mode != "change" {
 		t.Fatalf("слияние: %+v", m)
 	}
+	if m := mergeMessages(&protocol.Message{Text: "а", Mode: "auto"}, n); m.Mode != "auto" {
+		t.Fatalf("неразобранное с вопросом: %+v", m)
+	}
 	if mergeMessages(nil, n) != n || mergeMessages(p, nil) != p {
 		t.Fatal("одно из двух")
+	}
+}
+
+// Пауза после «Выполнения», человек закоммитил поверх: база раунда — его
+// коммит (его не свернут), а ревью смотрит работу агента от прежней базы и
+// знает, какие коммиты — человека.
+func TestHumanCommitMidRoundKeepsReview(t *testing.T) {
+	ex, repo, wt := viewWorld(t)
+	plan := fullPlan()
+	plan.Project = protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"}
+	r, _ := testRun(t, plan)
+	base := gitc(t, repo, "rev-parse", "main")
+	r.st.WorktreeDir, r.st.BranchName, r.st.BaseCommit, r.st.RoundBase = wt, "task-7-x", base, base
+	if res := ex.view(&protocol.ProjectSpec{Dir: repo, BaseBranch: "main", Branch: "task-7-x"}); !res.OK {
+		t.Fatalf("открытие: %+v", res)
+	}
+	_ = os.WriteFile(filepath.Join(repo, "human.txt"), []byte("человек"), 0o644)
+	gitc(t, repo, "add", "-A")
+	gitc(t, repo, "commit", "-q", "-m", "человек")
+	human := gitc(t, repo, "rev-parse", "HEAD")
+	if err := r.reclaimBranch(); err != nil {
+		t.Fatal(err)
+	}
+	if r.st.RoundBase != human || r.st.ReviewBase != base {
+		t.Fatalf("база раунда %s, база ревью %s", short(r.st.RoundBase), short(r.st.ReviewBase))
+	}
+	if got, _ := r.resolve("$task.round_base", r.manifest("review-task"), "BASE_COMMIT"); got != base {
+		t.Fatalf("база ревью по привязке: %s", short(got))
+	}
+	if note := r.humanCommitsNote(); !strings.Contains(note, short(human)) {
+		t.Fatalf("заметка о коммитах человека: %q", note)
+	}
+}
+
+// Человек переписал ветку в папке (amend коммита агента): это не повод
+// отказывать в возврате ветки.
+func TestReclaimAfterHumanAmend(t *testing.T) {
+	ex, repo, wt := viewWorld(t)
+	if res := ex.view(&protocol.ProjectSpec{Dir: repo, BaseBranch: "main", Branch: "task-7-x"}); !res.OK {
+		t.Fatalf("открытие: %+v", res)
+	}
+	_ = os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("агент, поправлено"), 0o644)
+	gitc(t, repo, "commit", "-q", "-a", "--amend", "-m", "агент (поправил человек)")
+	plan := fullPlan()
+	plan.Project = protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"}
+	r, _ := testRun(t, plan)
+	r.st.WorktreeDir, r.st.BranchName = wt, "task-7-x"
+	if err := r.reclaimBranch(); err != nil {
+		t.Fatalf("возврат после amend: %v", err)
+	}
+	if cur, _ := gitops.CurrentBranch(wt); cur != "task-7-x" {
+		t.Fatalf("ветка не вернулась: %q", cur)
+	}
+	if gitops.DetachedAt(wt, "task-7-x") != "" {
+		t.Fatal("отметка отсоединения не снята")
 	}
 }
