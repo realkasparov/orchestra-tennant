@@ -189,7 +189,31 @@ func (j *Job) retire() {
 func (j *Job) finish(status, reason string) {
 	j.mu.Lock()
 	j.finished, j.status, j.reason = true, status, reason
+	// Сообщения, которые прогон уже не прочтёт (пришли, пока он
+	// заканчивался), — в отложенное: их начнёт следующее задание.
+	late := false
+	for drained := false; !drained; {
+		select {
+		case m := <-j.messages:
+			late = j.keepLateLocked(m) || late
+		default:
+			drained = true
+		}
+	}
 	j.mu.Unlock()
+	if late {
+		j.SaveState()
+	}
+}
+
+// keepLateLocked откладывает сообщение законченного задания в состояние
+// таски (под j.mu).
+func (j *Job) keepLateLocked(m *protocol.Message) bool {
+	if j.State == nil || m == nil {
+		return false
+	}
+	j.State.PendingMessage = mergeMessages(j.State.PendingMessage, m)
+	return true
 }
 
 // worktreeDir — рабочая копия таски из состояния; пусто до этапа branch.
@@ -237,6 +261,19 @@ func (j *Job) deliverAnswer(a *protocol.Answer) {
 }
 
 func (j *Job) deliverMessage(m *protocol.Message) {
+	j.mu.Lock()
+	if j.finished {
+		// Прогон закончился (например, ветку не вернуть): сообщение не
+		// теряется — его начнёт «Повторить».
+		late := j.keepLateLocked(m)
+		j.mu.Unlock()
+		if late {
+			j.SaveState()
+			j.ex.taskNote(j, "Сообщение пришло после конца задания — сохранено, «Повторить» начнёт его")
+		}
+		return
+	}
+	defer j.mu.Unlock()
 	select {
 	case j.messages <- m:
 	default:

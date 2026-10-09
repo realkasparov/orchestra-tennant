@@ -129,9 +129,10 @@ func AddWorktree(repo, dir, branch, baseBranch string) (string, error) {
 	if _, err := run(repo, "worktree", "add", "--no-track", dir, "-b", branch, ref); err != nil {
 		return "", err
 	}
-	if err := TrackOwnName(repo, branch); err != nil {
-		return "", err
-	}
+	// Upstream — удобство для push; ветка уже есть, сбой настройки (занят
+	// .git/config) не повод проваливать создание: без upstream push просто
+	// спросит, куда.
+	_ = TrackOwnName(repo, branch)
 	return sha, nil
 }
 
@@ -161,9 +162,10 @@ func CheckoutNewBranch(repo, branch, baseBranch string) (string, error) {
 	if _, err := run(repo, "checkout", "--no-track", "-b", branch, ref); err != nil {
 		return "", err
 	}
-	if err := TrackOwnName(repo, branch); err != nil {
-		return "", err
-	}
+	// Upstream — удобство для push; ветка уже есть, сбой настройки (занят
+	// .git/config) не повод проваливать создание: без upstream push просто
+	// спросит, куда.
+	_ = TrackOwnName(repo, branch)
 	return sha, nil
 }
 
@@ -176,7 +178,11 @@ func RenameBranch(worktree, oldName, newName string) error {
 		return err
 	}
 	// git branch -m переносит и upstream: он смотрел бы на старое имя.
-	return TrackOwnName(worktree, newName, oldName)
+	// Переименование уже состоялось — сбой настройки upstream его не отменяет.
+	if err := TrackOwnName(worktree, newName, oldName); err != nil {
+		_, _ = run(worktree, "branch", "--unset-upstream", newName)
+	}
+	return nil
 }
 
 // TrackOwnName направляет ветку на одноимённую ветку origin: git push (и
@@ -194,11 +200,9 @@ func TrackOwnName(repo, branch string, replace ...string) error {
 	own := "refs/heads/" + branch
 	cur, _ := run(repo, "config", "--get", "branch."+branch+".merge")
 	if cur == own {
-		if remote, _ := run(repo, "config", "--get", "branch."+branch+".remote"); remote == "origin" {
-			return nil
-		}
+		return nil // уже своё имя — remote (origin или форк) выбран не нами
 	}
-	if cur != "" && cur != own {
+	if cur != "" {
 		ok := false
 		for _, r := range replace {
 			if r != "" && cur == "refs/heads/"+r {

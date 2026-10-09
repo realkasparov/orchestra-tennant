@@ -518,3 +518,45 @@ func TestEmptyRoundAfterHumanCommitFails(t *testing.T) {
 		t.Fatalf("работа раунда человека: %v", err)
 	}
 }
+
+// Ветку забрал в папку исполнитель 0.4.6 — без отметки отсоединения: её
+// новые коммиты всё равно коммиты человека, их не сворачивают.
+func TestReclaimLegacyDetachKeepsHumanCommits(t *testing.T) {
+	_, repo, wt := viewWorld(t)
+	if err := gitops.SwitchDetach(wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitops.Switch(repo, "task-7-x"); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(repo, "human.txt"), []byte("человек"), 0o644)
+	gitc(t, repo, "add", "human.txt")
+	gitc(t, repo, "commit", "-q", "-m", "человек")
+	human := gitc(t, repo, "rev-parse", "HEAD")
+	plan := fullPlan()
+	plan.Project = protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"}
+	r, _ := testRun(t, plan)
+	base := gitc(t, wt, "rev-parse", "HEAD")
+	r.st.WorktreeDir, r.st.BranchName, r.st.RoundBase = wt, "task-7-x", base
+	if err := r.reclaimBranch(); err != nil {
+		t.Fatalf("возврат: %v", err)
+	}
+	if r.st.HumanBase != human || len(r.st.HumanCommits) != 1 || r.st.RoundBase != human {
+		t.Fatalf("коммит человека не учтён: base=%s human=%v round=%s", r.st.HumanBase, r.st.HumanCommits, r.st.RoundBase)
+	}
+}
+
+// Сообщение, пришедшее к законченному заданию (и застрявшее в очереди к
+// концу), сохраняется для «Повторить».
+func TestLateMessageKept(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	j := r.job
+	j.messages = make(chan *protocol.Message, 8)
+	j.deliverMessage(&protocol.Message{Text: "раз", Mode: "change"})
+	j.finish("error", "ветку не вернуть")
+	j.deliverMessage(&protocol.Message{Text: "два", Mode: "auto"})
+	pm := j.State.PendingMessage
+	if pm == nil || pm.Text != "раз\n\nдва" || pm.Mode != "change" {
+		t.Fatalf("сообщения потеряны: %+v", pm)
+	}
+}

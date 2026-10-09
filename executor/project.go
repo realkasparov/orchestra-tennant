@@ -76,7 +76,7 @@ func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	// уходил бы не в одноимённую ветку. Ветку базы не трогаем.
 	if spec.Branch != spec.BaseBranch {
 		if err := gitops.TrackOwnName(path, spec.Branch, spec.BaseBranch); err != nil {
-			return &protocol.ProjectResult{Error: "настроить push ветки: " + err.Error()}
+			e.logf("upstream ветки %s: %v", spec.Branch, err)
 		}
 	}
 	// Ветка уже выставлена в папке (открыта раньше или таска шла прямо в

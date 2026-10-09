@@ -135,10 +135,10 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 		}
 		if r.change.take() {
 			if err := r.checkWorkspace(); err != nil {
-				return r.failRound(err)
+				return r.failChange(err)
 			}
 			if err := r.startChangeRound(); err != nil {
-				return r.failRound(err)
+				return r.failChange(err)
 			}
 		}
 		r.st.MessageJob, r.st.PendingMessage = job.ID, nil
@@ -157,16 +157,27 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			return status, err
 		}
 		if err := r.checkWorkspace(); err != nil {
-			return r.failRound(err)
+			return r.failChange(err)
 		}
 		if err := r.startChangeRound(); err != nil {
-			return r.failRound(err)
+			return r.failChange(err)
 		}
 	}
 }
 
 // failRound — новый раунд не начался (грязная рабочая копия): ошибка в
 // журнал и статус задания, этапы не тронуты.
+// failChange — раунд правки не начался (грязная рабочая копия и т. п.):
+// правка откладывается, «Повторить» начнёт её, а не продолжит старый раунд.
+func (r *run) failChange(err error) (string, error) {
+	if fb := strings.TrimSpace(r.st.Feedback); fb != "" {
+		r.st.PendingMessage = mergeMessages(r.st.PendingMessage, &protocol.Message{Text: fb, Mode: "change"})
+		r.job.SaveState()
+		err = fmt.Errorf("%w; правка сохранена — «Повторить» начнёт её", err)
+	}
+	return r.failRound(err)
+}
+
 func (r *run) failRound(err error) (string, error) {
 	r.log("", "Ошибка: "+err.Error())
 	r.taskStatus("error")
@@ -985,6 +996,10 @@ func (r *run) reclaimBranch() error {
 	}
 	if holder != "" {
 		proj := r.plan.Project
+		// Исполнитель 0.4.6 забирал ветку в папку без отметки: ветку держит
+		// папка проекта — значит, её коммиты сверх рабочей копии сделал
+		// человек.
+		viaFolder = viaFolder || samePath(holder, proj.Path)
 		if !samePath(holder, proj.Path) {
 			return fmt.Errorf("ветку таски «%s» держит рабочая копия %s — переключите её на другую ветку и повторите", branch, holder)
 		}

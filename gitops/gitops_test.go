@@ -286,3 +286,26 @@ func TestTaskBranchPushesToOwnName(t *testing.T) {
 		t.Fatalf("выбор человека перезаписан: %q", m)
 	}
 }
+
+// Upstream своего имени на другом remote (форк человека) не перенаправляется
+// на origin.
+func TestTrackOwnNameKeepsFork(t *testing.T) {
+	dir, _ := initRepo(t)
+	for _, args := range [][]string{
+		{"remote", "add", "origin", "https://example.invalid/o.git"},
+		{"remote", "add", "fork", "https://example.invalid/f.git"},
+		{"branch", "PROJ-1-fix"},
+		{"config", "branch.PROJ-1-fix.remote", "fork"},
+		{"config", "branch.PROJ-1-fix.merge", "refs/heads/PROJ-1-fix"},
+	} {
+		if _, err := run(dir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := TrackOwnName(dir, "PROJ-1-fix", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := run(dir, "config", "--get", "branch.PROJ-1-fix.remote"); r != "fork" {
+		t.Fatalf("форк перезаписан: %q", r)
+	}
+}
