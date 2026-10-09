@@ -30,6 +30,8 @@ type changeRequest struct {
 	// usage — расход триажа правок до того, как заведён этап, куда его
 	// отнести; пишется из горутины сообщений, читается циклом этапов.
 	usage protocol.Usage
+	// last — последняя правка, вошедшая в Feedback.
+	last string
 }
 
 func (c *changeRequest) request() bool {
@@ -299,9 +301,12 @@ func (r *run) handleMessage(ctx context.Context, text, mode string, live bool) {
 		return
 	}
 	got, pending := r.classify(ctx, text, mode)
-	if live && ctx.Err() != nil {
+	if ctx.Err() != nil {
 		// Триаж прерван паузой: его «правка по умолчанию» — не ответ.
-		r.deferMessage(text, mode)
+		// Сообщение плана сохранит сам Run с исходным режимом.
+		if live {
+			r.deferMessage(text, mode)
+		}
 		return
 	}
 	if got == "question" {
@@ -310,13 +315,20 @@ func (r *run) handleMessage(ctx context.Context, text, mode string, live bool) {
 		}
 		return
 	}
+	if !live {
+		r.job.mu.Lock()
+		r.startChange = true
+		r.job.mu.Unlock()
+	}
 	r.requestChange(text, pending)
 }
 
 // deferMessage откладывает сообщение человека до следующего запуска таски.
 func (r *run) deferMessage(text, mode string) {
+	m := &protocol.Message{Text: text, Mode: mode}
 	r.job.mu.Lock()
-	r.st.PendingMessage = mergeMessages(r.st.PendingMessage, &protocol.Message{Text: text, Mode: mode})
+	r.deferred = append(r.deferred, m)
+	r.st.PendingMessage = mergeMessages(r.st.PendingMessage, m)
 	r.job.mu.Unlock()
 	r.job.SaveState()
 }
@@ -459,11 +471,15 @@ func (r *run) requestChange(text string, pending protocol.Usage) {
 	// Правки, пришедшие до начала раунда, копятся: вторая не вытесняет
 	// первую. Пишут и цикл этапов, и разбор сообщений — под замком правки.
 	r.change.mu.Lock()
-	if r.change.pending && r.st.Feedback != "" && !strings.Contains(r.st.Feedback, strings.TrimSpace(text)) {
-		r.st.Feedback += "\n\n" + strings.TrimSpace(text)
-	} else if !r.change.pending {
-		r.st.Feedback = strings.TrimSpace(text)
+	r.job.mu.Lock()
+	if t := strings.TrimSpace(text); !r.change.pending || r.st.Feedback == "" {
+		r.st.Feedback, r.change.last = t, t
+	} else if t != r.change.last {
+		// Повтор того же разбора (возобновление) не дописывается.
+		r.st.Feedback += "\n\n" + t
+		r.change.last = t
 	}
+	r.job.mu.Unlock()
 	r.change.mu.Unlock()
 	entry := "\n## Правка от пользователя\n" + strings.TrimSpace(text) + "\n"
 	// Повторный разбор (раунд не завёлся, задание возобновили) не дублирует

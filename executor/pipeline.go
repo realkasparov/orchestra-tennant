@@ -56,6 +56,12 @@ type run struct {
 	questions chan question
 	// manifests — манифесты скиллов плана по имени скилла.
 	manifests map[string]*protocol.Manifest
+	// Под job.mu: startDone — сообщение начала задания разобрано и снято из
+	// отложенного (до того отложенное — часть этого сообщения); startChange —
+	// оно само принято правкой; deferred — отложенное этим заданием
+	// (сообщения после паузы, недошедшие уточнения).
+	startDone, startChange bool
+	deferred               []*protocol.Message
 	// question — текст вопроса для системного шага ответа (`$task.question`).
 	question string
 	// pass и passScope — текущий прогон шага для привязок `$task.pass`.
@@ -167,8 +173,7 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 		for more := true; more; {
 			select {
 			case q := <-r.questions:
-				r.st.PendingMessage = mergeMessages(r.st.PendingMessage, &protocol.Message{Text: q.text, Mode: "question"})
-				r.job.SaveState()
+				r.deferMessage(q.text, "question")
 			default:
 				more = false
 			}
@@ -182,8 +187,26 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 		if ctx.Err() != nil {
 			// Сообщение начала задания — в отложенное целиком и разобранным
 			// этим заданием: возобновление разберёт его заново один раз.
-			// Принятую живую правку допишет к нему конец задания.
-			r.st.PendingMessage, r.st.MessageJob = msg, job.ID
+			// Принятая живая правка и отложенное после паузы — после него.
+			stopReader()
+			pend := msg
+			if r.change.take() {
+				r.job.mu.Lock()
+				fb := strings.TrimSpace(r.st.Feedback)
+				fromStart := r.startChange
+				r.job.mu.Unlock()
+				if fromStart {
+					pend = &protocol.Message{Text: fb, Mode: "change"} // начинается с msg
+				} else {
+					pend = mergeMessages(msg, &protocol.Message{Text: fb, Mode: "change"})
+				}
+			}
+			r.job.mu.Lock()
+			for _, d := range r.deferred {
+				pend = mergeMessages(pend, d)
+			}
+			r.st.PendingMessage, r.st.MessageJob = pend, job.ID
+			r.job.mu.Unlock()
 			r.job.SaveState()
 			r.markPaused("")
 			return "paused", nil
@@ -196,8 +219,18 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 				return r.failChange(err)
 			}
 		}
-		r.st.MessageJob, r.st.PendingMessage = job.ID, nil
+		r.job.mu.Lock()
+		var pend *protocol.Message
+		for _, d := range r.deferred {
+			pend = mergeMessages(pend, d)
+		}
+		r.st.MessageJob, r.st.PendingMessage, r.startDone = job.ID, pend, true
+		r.job.mu.Unlock()
 		r.job.SaveState()
+	} else {
+		r.job.mu.Lock()
+		r.startDone = true
+		r.job.mu.Unlock()
 	}
 	restart := false
 	if msg != nil && r.allStagesDone() {
@@ -246,19 +279,26 @@ func (r *run) failChange(err error) (string, error) {
 }
 
 // keepChange откладывает принятую, но не начатую правку: её начнёт
-// следующее задание. Отложенное сообщение, уже вошедшее в неё (разбор начала
-// задания), заменяется, а не дописывается.
+// следующее задание. До конца разбора сообщения начала задания отложенное в
+// состоянии — часть этого сообщения (уже вошло в правку или отвечено):
+// оно заменяется; после — дописывается.
 func (r *run) keepChange() bool {
+	r.job.mu.Lock()
 	fb := strings.TrimSpace(r.st.Feedback)
 	if fb == "" {
+		r.job.mu.Unlock()
 		return false
 	}
 	change := &protocol.Message{Text: fb, Mode: "change"}
-	if p := r.st.PendingMessage; p != nil && !strings.Contains(fb, strings.TrimSpace(p.Text)) {
-		// Отложенное ещё не разобрано (пауза до него) — правка после него.
-		change = mergeMessages(p, change)
+	if r.startDone {
+		change = mergeMessages(r.st.PendingMessage, change)
+	} else {
+		for _, d := range r.deferred {
+			change = mergeMessages(change, d)
+		}
 	}
 	r.st.PendingMessage = change
+	r.job.mu.Unlock()
 	r.job.SaveState()
 	return true
 }
@@ -753,8 +793,7 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 			if clarified != "" {
 				// Уточнение не дошло до агента — его разберёт следующий
 				// запуск таски, как сообщение.
-				r.st.PendingMessage = mergeMessages(r.st.PendingMessage, &protocol.Message{Text: clarified, Mode: "auto"})
-				r.job.SaveState()
+				r.deferMessage(clarified, "auto")
 			}
 			return all.String(), err
 		}

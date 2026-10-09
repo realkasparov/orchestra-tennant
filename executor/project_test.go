@@ -621,13 +621,28 @@ func TestChangeBetweenStagesCancelsNext(t *testing.T) {
 	}
 }
 
-// Правка при паузе до разбора отложенного сообщения встаёт после него.
+// После разбора начала задания отложенное (сообщения после паузы) — не часть
+// правки: она встаёт после него, даже если текст короткий и входит в неё.
 func TestKeepChangeAfterUnhandledPending(t *testing.T) {
 	r, _ := testRun(t, fullPlan())
-	r.st.PendingMessage = &protocol.Message{Text: "старое", Mode: "auto"}
-	r.st.Feedback = "новое"
+	r.startDone = true
+	r.st.PendingMessage = &protocol.Message{Text: "да", Mode: "auto"}
+	r.st.Feedback = "когда будет готово — поправь"
 	r.keepChange()
-	if pm := r.st.PendingMessage; pm == nil || pm.Text != "старое\n\nновое" || pm.Mode != "change" {
+	if pm := r.st.PendingMessage; pm == nil || pm.Text != "да\n\nкогда будет готово — поправь" || pm.Mode != "change" {
+		t.Fatalf("отложенное: %+v", pm)
+	}
+}
+
+// До конца разбора начала задания: отложенное в состоянии — часть правки,
+// отложенное этим заданием (после паузы) — дописывается.
+func TestKeepChangeAtStartKeepsDeferred(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	r.st.PendingMessage = &protocol.Message{Text: "А", Mode: "change"}
+	r.st.Feedback = "А"
+	r.deferMessage("Б?", "auto")
+	r.keepChange()
+	if pm := r.st.PendingMessage; pm == nil || pm.Text != "А\n\nБ?" || pm.Mode != "change" {
 		t.Fatalf("отложенное: %+v", pm)
 	}
 }
@@ -655,9 +670,23 @@ func TestChangesAccumulate(t *testing.T) {
 	r, _ := testRun(t, fullPlan())
 	r.requestChange("первая", protocol.Usage{})
 	r.requestChange("вторая", protocol.Usage{})
+	r.requestChange("вторая", protocol.Usage{}) // повтор разбора — не дубль
+	r.requestChange("вто", protocol.Usage{})    // короткое — не теряется
 	r.change.take()
 	r.keepChange()
-	if pm := r.st.PendingMessage; pm == nil || pm.Text != "первая\n\nвторая" {
+	if pm := r.st.PendingMessage; pm == nil || pm.Text != "первая\n\nвторая\n\nвто" {
 		t.Fatalf("отложенное: %+v", pm)
+	}
+}
+
+// Пауза посреди триажа сообщения начала задания: вопрос не становится
+// правкой (сообщение сохранит Run с исходным режимом).
+func TestStartMessageTriageCutByPause(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.handleMessage(ctx, "как это запустить?", "auto", false)
+	if r.change.take() || r.st.Feedback != "" || r.startChange {
+		t.Fatalf("вопрос стал правкой: feedback=%q", r.st.Feedback)
 	}
 }
