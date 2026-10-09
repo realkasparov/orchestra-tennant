@@ -124,7 +124,12 @@ func AddWorktree(repo, dir, branch, baseBranch string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := run(repo, "worktree", "add", dir, "-b", branch, ref); err != nil {
+	// --no-track: иначе ветка от origin/<base> отслеживает базу, и git push
+	// с неё отказывает или (push.default=upstream) уходит в саму базу.
+	if _, err := run(repo, "worktree", "add", "--no-track", dir, "-b", branch, ref); err != nil {
+		return "", err
+	}
+	if err := TrackOwnName(repo, branch); err != nil {
 		return "", err
 	}
 	return sha, nil
@@ -153,7 +158,10 @@ func CheckoutNewBranch(repo, branch, baseBranch string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := run(repo, "checkout", "-b", branch, ref); err != nil {
+	if _, err := run(repo, "checkout", "--no-track", "-b", branch, ref); err != nil {
+		return "", err
+	}
+	if err := TrackOwnName(repo, branch); err != nil {
 		return "", err
 	}
 	return sha, nil
@@ -164,7 +172,47 @@ func RenameBranch(worktree, oldName, newName string) error {
 	if err := CheckRef(newName); err != nil {
 		return err
 	}
-	_, err := run(worktree, "branch", "-m", oldName, newName)
+	if _, err := run(worktree, "branch", "-m", oldName, newName); err != nil {
+		return err
+	}
+	// git branch -m переносит и upstream: он смотрел бы на старое имя.
+	return TrackOwnName(worktree, newName, oldName)
+}
+
+// TrackOwnName направляет ветку на одноимённую ветку origin: git push (и
+// IDE) создаёт на сервере ветку с тем же именем, а не пишет в базу. Пока её
+// там нет, git status пишет «gone» — это до первого push. Upstream меняется,
+// только если его нет или он смотрит на одно из имён replace (прежнее имя
+// ветки, база): свой выбор человека не трогаем. Без origin — ничего.
+func TrackOwnName(repo, branch string, replace ...string) error {
+	if !HasRemote(repo, "origin") {
+		return nil
+	}
+	if err := CheckRef(branch); err != nil {
+		return err
+	}
+	own := "refs/heads/" + branch
+	cur, _ := run(repo, "config", "--get", "branch."+branch+".merge")
+	if cur == own {
+		if remote, _ := run(repo, "config", "--get", "branch."+branch+".remote"); remote == "origin" {
+			return nil
+		}
+	}
+	if cur != "" && cur != own {
+		ok := false
+		for _, r := range replace {
+			if r != "" && cur == "refs/heads/"+r {
+				ok = true
+			}
+		}
+		if !ok {
+			return nil
+		}
+	}
+	if _, err := run(repo, "config", "branch."+branch+".remote", "origin"); err != nil {
+		return err
+	}
+	_, err := run(repo, "config", "branch."+branch+".merge", own)
 	return err
 }
 

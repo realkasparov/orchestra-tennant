@@ -72,6 +72,13 @@ func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	if other := e.folderHolder(path, 0); other != 0 {
 		return &protocol.ProjectResult{Error: fmt.Sprintf("папка проекта занята таской #%d, которая сейчас идёт прямо в ней; дождитесь её или остановите", other)}
 	}
+	// Ветки таск, созданные до 0.4.7, отслеживают базу: git push с них
+	// уходил бы не в одноимённую ветку. Ветку базы не трогаем.
+	if spec.Branch != spec.BaseBranch {
+		if err := gitops.TrackOwnName(path, spec.Branch, spec.BaseBranch); err != nil {
+			return &protocol.ProjectResult{Error: "настроить push ветки: " + err.Error()}
+		}
+	}
 	// Ветка уже выставлена в папке (открыта раньше или таска шла прямо в
 	// ней): делать нечего, незакоммиченные правки человека этому не помеха.
 	if cur, err := gitops.CurrentBranch(path); err == nil && cur == spec.Branch {

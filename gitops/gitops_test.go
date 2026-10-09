@@ -224,3 +224,65 @@ func TestRedactRemote(t *testing.T) {
 		t.Fatalf("redact scp = %q", got)
 	}
 }
+
+// Ветка таски от origin/<base> пушится в одноимённую ветку, а не в базу:
+// при создании worktree, после переименования и для старой ветки,
+// отслеживающей базу.
+func TestTaskBranchPushesToOwnName(t *testing.T) {
+	dir, _ := initRepo(t)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	git := func(d string, args ...string) string {
+		t.Helper()
+		out, err := run(d, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	git(dir, "init", "--bare", remote)
+	git(dir, "remote", "add", "origin", remote)
+	git(dir, "push", "-u", "origin", "main")
+	git(dir, "fetch", "origin")
+
+	wt := filepath.Join(t.TempDir(), "wt")
+	if _, err := AddWorktree(dir, wt, "task/1-wip", "main"); err != nil {
+		t.Fatal(err)
+	}
+	check := func(branch string) {
+		t.Helper()
+		if m := git(dir, "config", "--get", "branch."+branch+".merge"); m != "refs/heads/"+branch {
+			t.Fatalf("%s: merge = %q", branch, m)
+		}
+		if r := git(dir, "config", "--get", "branch."+branch+".remote"); r != "origin" {
+			t.Fatalf("%s: remote = %q", branch, r)
+		}
+	}
+	check("task/1-wip")
+	if err := RenameBranch(wt, "task/1-wip", "PROJ-1-fix"); err != nil {
+		t.Fatal(err)
+	}
+	check("PROJ-1-fix")
+	git(wt, "commit", "--allow-empty", "-m", "agent")
+	git(wt, "-c", "push.default=simple", "push")
+	if got, want := git(dir, "ls-remote", "origin", "refs/heads/PROJ-1-fix"), git(wt, "rev-parse", "HEAD"); !strings.HasPrefix(got, want) {
+		t.Fatalf("push не создал одноимённую ветку: %q", got)
+	}
+	if got := git(dir, "rev-parse", "origin/main"); got == git(wt, "rev-parse", "HEAD") {
+		t.Fatal("push ушёл в базу")
+	}
+
+	// Старая ветка, отслеживающая базу, перенаправляется; чужой выбор — нет.
+	git(dir, "branch", "--track", "PROJ-2-old", "origin/main")
+	if err := TrackOwnName(dir, "PROJ-2-old", "main"); err != nil {
+		t.Fatal(err)
+	}
+	check("PROJ-2-old")
+	git(dir, "branch", "--track", "PROJ-3-mine", "origin/main")
+	git(dir, "config", "branch.PROJ-3-mine.merge", "refs/heads/release")
+	if err := TrackOwnName(dir, "PROJ-3-mine", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if m := git(dir, "config", "--get", "branch.PROJ-3-mine.merge"); m != "refs/heads/release" {
+		t.Fatalf("выбор человека перезаписан: %q", m)
+	}
+}
