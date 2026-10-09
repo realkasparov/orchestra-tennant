@@ -308,4 +308,20 @@ func TestTrackOwnNameKeepsFork(t *testing.T) {
 	if r, _ := run(dir, "config", "--get", "branch.PROJ-1-fix.remote"); r != "fork" {
 		t.Fatalf("форк перезаписан: %q", r)
 	}
+	// Базу на другом remote человек выбрал сам — тоже не трогаем.
+	for _, args := range [][]string{
+		{"branch", "PROJ-2-up"},
+		{"config", "branch.PROJ-2-up.remote", "fork"},
+		{"config", "branch.PROJ-2-up.merge", "refs/heads/main"},
+	} {
+		if _, err := run(dir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := TrackOwnName(dir, "PROJ-2-up", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := run(dir, "config", "--get", "branch.PROJ-2-up.merge"); m != "refs/heads/main" {
+		t.Fatalf("upstream другого remote перезаписан: %q", m)
+	}
 }

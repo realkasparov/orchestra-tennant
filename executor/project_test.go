@@ -492,6 +492,28 @@ func TestReclaimAfterHumanAmend(t *testing.T) {
 	if gitops.DetachedAt(wt, "task-7-x") != "" {
 		t.Fatal("отметка отсоединения не снята")
 	}
+	// Переписанный коммит агента — не «коммит человека» для ревью, но и не
+	// сворачивается: вся ветка — граница.
+	head := gitc(t, wt, "rev-parse", "HEAD")
+	if len(r.st.HumanCommits) != 0 || r.st.RoundBase != head || r.st.HumanBase != head || r.st.ReviewBase != "" {
+		t.Fatalf("после amend: human=%v round=%s humanBase=%s review=%s", r.st.HumanCommits, r.st.RoundBase, r.st.HumanBase, r.st.ReviewBase)
+	}
+}
+
+// Несостоявшаяся правка откладывается один раз, а не удваивается с каждым
+// «Повторить».
+func TestKeepChangeDoesNotDuplicate(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	r.st.PendingMessage = &protocol.Message{Text: "fix X", Mode: "change"}
+	r.st.Feedback = "fix X" // разбор начала задания взял отложенное
+	for i := 0; i < 3; i++ {
+		if !r.keepChange() {
+			t.Fatal("правка не отложена")
+		}
+	}
+	if pm := r.st.PendingMessage; pm == nil || pm.Text != "fix X" {
+		t.Fatalf("отложенное: %+v", pm)
+	}
 }
 
 // Коммит человека между раундами — не работа следующего раунда: пустое

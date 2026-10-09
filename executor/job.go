@@ -187,21 +187,38 @@ func (j *Job) retire() {
 // finish фиксирует итог. Само сообщение done уходит из flush: там же, где
 // досылка, чтобы итог не обогнал события.
 func (j *Job) finish(status, reason string) {
-	j.mu.Lock()
-	j.finished, j.status, j.reason = true, status, reason
 	// Сообщения, которые прогон уже не прочтёт (пришли, пока он
-	// заканчивался), — в отложенное: их начнёт следующее задание.
-	late := false
+	// заканчивался), — в отложенное: их начнёт следующее задание. Человеку —
+	// запись в журнал таски, пока итог ещё не ушёл.
+	var late []*protocol.Message
 	for drained := false; !drained; {
 		select {
 		case m := <-j.messages:
-			late = j.keepLateLocked(m) || late
+			late = append(late, m)
+		default:
+			drained = true
+		}
+	}
+	for _, m := range late {
+		j.mu.Lock()
+		j.keepLateLocked(m)
+		j.mu.Unlock()
+		j.Emit("", "log", map[string]any{"text": "Сообщение «" + m.Text + "» пришло, когда задание заканчивалось, — сохранено: его начнёт следующий запуск таски (новое сообщение или «Повторить»)."})
+	}
+	j.mu.Lock()
+	j.finished, j.status, j.reason = true, status, reason
+	// Пришедшие между разбором и итогом.
+	for drained := false; !drained; {
+		select {
+		case m := <-j.messages:
+			late = append(late, m)
+			j.keepLateLocked(m)
 		default:
 			drained = true
 		}
 	}
 	j.mu.Unlock()
-	if late {
+	if len(late) > 0 {
 		j.SaveState()
 	}
 }
@@ -269,7 +286,7 @@ func (j *Job) deliverMessage(m *protocol.Message) {
 		j.mu.Unlock()
 		if late {
 			j.SaveState()
-			j.ex.taskNote(j, "Сообщение пришло после конца задания — сохранено, «Повторить» начнёт его")
+			j.ex.taskNote(j, "Сообщение пришло после конца задания — сохранено для следующего запуска таски")
 		}
 		return
 	}

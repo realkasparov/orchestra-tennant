@@ -202,6 +202,9 @@ func TrackOwnName(repo, branch string, replace ...string) error {
 	if cur == own {
 		return nil // уже своё имя — remote (origin или форк) выбран не нами
 	}
+	if remote, _ := run(repo, "config", "--get", "branch."+branch+".remote"); remote != "" && remote != "origin" {
+		return nil // другой remote выбрал человек
+	}
 	if cur != "" {
 		ok := false
 		for _, r := range replace {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/realkasparov/orchestra-tennant/agent"
 	"github.com/realkasparov/orchestra-tennant/codeindex"
@@ -118,11 +119,30 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	}
 	mctx, mcancel := context.WithCancel(ctx)
 	defer mcancel()
+	// startReader запускает разбор сообщений; стоп ждёт, пока разбор взятого
+	// сообщения закончится.
+	startReader := func() func() {
+		quit, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			r.serveMessages(mctx, quit)
+		}()
+		var once sync.Once
+		return func() { once.Do(func() { close(quit); <-done }) }
+	}
 	r.seedSessions()
 	// Сжатие стоящего шага в фоне доделывается до конца задания: события о
 	// нём должны уйти раньше итога.
 	defer r.closeSessions()
-	go r.serveMessages(mctx)
+	stopReader := startReader()
+	// settle — этапы кончились: ответить на вопросы, перестать принимать
+	// сообщения и разобрать уже принятые. true — пришла правка.
+	settle := func() bool {
+		r.answerQueued(ctx)
+		stopReader()
+		r.answerQueued(ctx)
+		return r.change.take()
+	}
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
@@ -144,18 +164,32 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 		r.st.MessageJob, r.st.PendingMessage = job.ID, nil
 		r.job.SaveState()
 	}
+	restart := false
 	if msg != nil && r.allStagesDone() {
-		r.answerQueued(ctx)
-		return "done", nil
+		if !settle() {
+			return "done", nil
+		}
+		// Правка пришла, пока отвечали на вопрос, — новый раунд.
+		stopReader, restart = startReader(), true
 	}
 	for {
-		status, err, restart := r.pipeline(ctx)
 		if !restart {
-			if ctx.Err() == nil {
-				r.answerQueued(ctx)
+			status, err, again := r.pipeline(ctx)
+			if !again {
+				if ctx.Err() != nil || !settle() {
+					return status, err
+				}
+				// Правка пришла под конец (пока отвечали на вопросы):
+				// «Правка принята» уже сказано — раунд начинается сейчас, а
+				// у задания, кончившегося не успехом, — следующим заданием.
+				if status != "done" || err != nil {
+					r.keepChange()
+					return status, err
+				}
+				stopReader = startReader()
 			}
-			return status, err
 		}
+		restart = false
 		if err := r.checkWorkspace(); err != nil {
 			return r.failChange(err)
 		}
@@ -170,12 +204,23 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 // failChange — раунд правки не начался (грязная рабочая копия и т. п.):
 // правка откладывается, «Повторить» начнёт её, а не продолжит старый раунд.
 func (r *run) failChange(err error) (string, error) {
-	if fb := strings.TrimSpace(r.st.Feedback); fb != "" {
-		r.st.PendingMessage = mergeMessages(r.st.PendingMessage, &protocol.Message{Text: fb, Mode: "change"})
-		r.job.SaveState()
+	if r.keepChange() {
 		err = fmt.Errorf("%w; правка сохранена — «Повторить» начнёт её", err)
 	}
 	return r.failRound(err)
+}
+
+// keepChange откладывает принятую, но не начатую правку: её начнёт
+// следующее задание. Отложенное сообщение уже вошло в неё (разбор начала
+// задания), поэтому оно заменяется, а не дописывается.
+func (r *run) keepChange() bool {
+	fb := strings.TrimSpace(r.st.Feedback)
+	if fb == "" {
+		return false
+	}
+	r.st.PendingMessage = &protocol.Message{Text: fb, Mode: "change"}
+	r.job.SaveState()
+	return true
 }
 
 func (r *run) failRound(err error) (string, error) {
@@ -1017,7 +1062,15 @@ func (r *run) reclaimBranch() error {
 		return fmt.Errorf("вернуть ветку «%s» в рабочую копию таски: %w", branch, err)
 	}
 	gitops.ForgetDetached(wt, branch)
-	if head, err := gitops.HeadSHA(wt); err == nil && head != oldHead && viaFolder {
+	if head, err := gitops.HeadSHA(wt); err == nil && head != oldHead && viaFolder && !gitops.IsAncestor(wt, oldHead, head) {
+		// Человек переписал ветку (amend, rebase): коммиты агента стали его
+		// коммитами, отделить их нельзя. Всё в ветке — граница: агент её не
+		// сворачивает и не правит, ревью смотрит только новую работу.
+		r.st.RoundBase, r.st.ReviewBase, r.st.HumanBase = head, "", head
+		r.job.Emit("", "task_field", map[string]any{"round_base": head})
+		r.job.SaveState()
+		r.log("", fmt.Sprintf("Ветку «%s» человек переписал (amend или rebase) — агент продолжит поверх, не сворачивая и не правя её коммиты.", branch))
+	} else if err == nil && head != oldHead && viaFolder {
 		// Человек закоммитил в ветку: дальше раунд считается от его коммитов,
 		// их не сворачивают. Если агент уже закоммитил работу раунда, ревью
 		// смотрит её от прежней базы — коммиты человека в ней помечены.

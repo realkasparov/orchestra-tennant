@@ -229,11 +229,15 @@ func (r *run) dropCompacts() {
 // serveMessages разбирает сообщения, пока идёт задание. Здесь только эхо и
 // триаж (он состояние не трогает): правка прерывает этап сразу, вопрос
 // встаёт в очередь к циклу этапов — у того в руках состояние таски.
-func (r *run) serveMessages(ctx context.Context) {
+func (r *run) serveMessages(ctx context.Context, quit <-chan struct{}) {
 	for {
 		select {
 		case <-ctx.Done():
 			r.dropCompacts()
+			return
+		case <-quit:
+			// Этапы кончились: новые сообщения остаются в очереди задания —
+			// их сохранит его конец; уже взятое разобрано до конца.
 			return
 		case c := <-r.job.Compacts():
 			r.compactRequest(ctx, c)
