@@ -96,7 +96,13 @@ func (c *changeRequest) takeUsage() protocol.Usage {
 func (c *changeRequest) arm(cancel context.CancelFunc) {
 	c.mu.Lock()
 	c.cancel = cancel
+	pending := c.pending
 	c.mu.Unlock()
+	// Правка пришла между этапами (отменять было нечего): следующий этап
+	// не начинается, а сразу уступает новому раунду.
+	if pending && cancel != nil {
+		cancel()
+	}
 }
 
 // clarifyRequest — уточнение человека к идущему агентному шагу: прогон

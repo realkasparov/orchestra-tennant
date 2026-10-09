@@ -188,31 +188,16 @@ func (j *Job) retire() {
 // досылка, чтобы итог не обогнал события.
 func (j *Job) finish(status, reason string) {
 	// Сообщения, которые прогон уже не прочтёт (пришли, пока он
-	// заканчивался), — в отложенное: их начнёт следующее задание. Человеку —
-	// запись в журнал таски, пока итог ещё не ушёл.
+	// заканчивался), — в отложенное: их начнёт следующий запуск таски.
+	j.mu.Lock()
+	j.finished, j.status, j.reason = true, status, reason
 	var late []*protocol.Message
 	for drained := false; !drained; {
 		select {
 		case m := <-j.messages:
-			late = append(late, m)
-		default:
-			drained = true
-		}
-	}
-	for _, m := range late {
-		j.mu.Lock()
-		j.keepLateLocked(m)
-		j.mu.Unlock()
-		j.Emit("", "log", map[string]any{"text": "Сообщение «" + m.Text + "» пришло, когда задание заканчивалось, — сохранено: его начнёт следующий запуск таски (новое сообщение или «Повторить»)."})
-	}
-	j.mu.Lock()
-	j.finished, j.status, j.reason = true, status, reason
-	// Пришедшие между разбором и итогом.
-	for drained := false; !drained; {
-		select {
-		case m := <-j.messages:
-			late = append(late, m)
-			j.keepLateLocked(m)
+			if j.keepLateLocked(m) {
+				late = append(late, m)
+			}
 		default:
 			drained = true
 		}
@@ -221,6 +206,16 @@ func (j *Job) finish(status, reason string) {
 	if len(late) > 0 {
 		j.SaveState()
 	}
+	for _, m := range late {
+		j.noteLate(m)
+	}
+}
+
+// noteLate — запись в журнал таски об отложенном сообщении. Событие уходит
+// раньше итога; если итог уже ушёл, оркестратор его отбросит, а повтор итога
+// ему безвреден.
+func (j *Job) noteLate(m *protocol.Message) {
+	j.Emit("", "log", map[string]any{"text": "Сообщение «" + m.Text + "» пришло, когда задание заканчивалось, — сохранено: его начнёт следующий запуск таски (новое сообщение или «Повторить»)."})
 }
 
 // keepLateLocked откладывает сообщение законченного задания в состояние
@@ -286,7 +281,7 @@ func (j *Job) deliverMessage(m *protocol.Message) {
 		j.mu.Unlock()
 		if late {
 			j.SaveState()
-			j.ex.taskNote(j, "Сообщение пришло после конца задания — сохранено для следующего запуска таски")
+			j.noteLate(m)
 		}
 		return
 	}

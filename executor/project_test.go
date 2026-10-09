@@ -582,3 +582,52 @@ func TestLateMessageKept(t *testing.T) {
 		t.Fatalf("сообщения потеряны: %+v", pm)
 	}
 }
+
+// 0.4.6 (без отметки) и amend человека в папке: не отказ с советом влить
+// старый коммит обратно, а граница по переписанной ветке.
+func TestReclaimLegacyAmend(t *testing.T) {
+	_, repo, wt := viewWorld(t)
+	if err := gitops.SwitchDetach(wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := gitops.Switch(repo, "task-7-x"); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("поправил человек"), 0o644)
+	gitc(t, repo, "commit", "-q", "-a", "--amend", "-m", "агент (поправил человек)")
+	head := gitc(t, repo, "rev-parse", "HEAD")
+	plan := fullPlan()
+	plan.Project = protocol.Project{ID: 1, Name: "demo", Path: repo, BaseBranch: "main"}
+	r, _ := testRun(t, plan)
+	r.st.WorktreeDir, r.st.BranchName, r.st.RoundBase = wt, "task-7-x", gitc(t, wt, "rev-parse", "HEAD~1")
+	if err := r.reclaimBranch(); err != nil {
+		t.Fatalf("возврат после amend (0.4.6): %v", err)
+	}
+	if r.st.RoundBase != head || r.st.HumanBase != head || len(r.st.HumanCommits) != 0 {
+		t.Fatalf("граница: round=%s human=%s commits=%v", r.st.RoundBase, r.st.HumanBase, r.st.HumanCommits)
+	}
+}
+
+// Правка, пришедшая между этапами, прерывает следующий этап сразу.
+func TestChangeBetweenStagesCancelsNext(t *testing.T) {
+	var c changeRequest
+	c.arm(nil)
+	c.request()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.arm(cancel)
+	if ctx.Err() == nil {
+		t.Fatal("этап начался, хотя правка уже ждёт")
+	}
+}
+
+// Правка при паузе до разбора отложенного сообщения встаёт после него.
+func TestKeepChangeAfterUnhandledPending(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	r.st.PendingMessage = &protocol.Message{Text: "старое", Mode: "auto"}
+	r.st.Feedback = "новое"
+	r.keepChange()
+	if pm := r.st.PendingMessage; pm == nil || pm.Text != "старое\n\nновое" || pm.Mode != "change" {
+		t.Fatalf("отложенное: %+v", pm)
+	}
+}

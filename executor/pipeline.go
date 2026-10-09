@@ -140,9 +140,37 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	settle := func() bool {
 		r.answerQueued(ctx)
 		stopReader()
-		r.answerQueued(ctx)
+		// Пока отвечали, могли прийти ещё сообщения: разбираем их здесь же,
+		// пока очередь не опустеет.
+		for more := true; more; {
+			r.answerQueued(ctx)
+			select {
+			case m := <-r.job.Messages():
+				r.handleMessage(ctx, m.Text, m.Mode)
+			default:
+				more = false
+			}
+		}
 		return r.change.take()
 	}
+	// Задание кончается любым путём (пауза, ошибка): принятая, но не
+	// начатая правка и вопросы без ответа — в отложенное, их начнёт
+	// следующий запуск. Разбор сообщений к этому времени остановлен.
+	defer func() {
+		stopReader()
+		if r.change.take() {
+			r.keepChange()
+		}
+		for more := true; more; {
+			select {
+			case q := <-r.questions:
+				r.st.PendingMessage = mergeMessages(r.st.PendingMessage, &protocol.Message{Text: q.text, Mode: "question"})
+				r.job.SaveState()
+			default:
+				more = false
+			}
+		}
+	}()
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
@@ -211,14 +239,19 @@ func (r *run) failChange(err error) (string, error) {
 }
 
 // keepChange откладывает принятую, но не начатую правку: её начнёт
-// следующее задание. Отложенное сообщение уже вошло в неё (разбор начала
-// задания), поэтому оно заменяется, а не дописывается.
+// следующее задание. Отложенное сообщение, уже вошедшее в неё (разбор начала
+// задания), заменяется, а не дописывается.
 func (r *run) keepChange() bool {
 	fb := strings.TrimSpace(r.st.Feedback)
 	if fb == "" {
 		return false
 	}
-	r.st.PendingMessage = &protocol.Message{Text: fb, Mode: "change"}
+	change := &protocol.Message{Text: fb, Mode: "change"}
+	if p := r.st.PendingMessage; p != nil && !strings.Contains(fb, strings.TrimSpace(p.Text)) {
+		// Отложенное ещё не разобрано (пауза до него) — правка после него.
+		change = mergeMessages(p, change)
+	}
+	r.st.PendingMessage = change
 	r.job.SaveState()
 	return true
 }
@@ -710,6 +743,12 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 				st.CompactPending = compactReq
 				r.job.SaveState()
 			}
+			if clarified != "" {
+				// Уточнение не дошло до агента — его разберёт следующий
+				// запуск таски, как сообщение.
+				r.st.PendingMessage = mergeMessages(r.st.PendingMessage, &protocol.Message{Text: clarified, Mode: "auto"})
+				r.job.SaveState()
+			}
 			return all.String(), err
 		}
 		if res != nil {
@@ -1030,21 +1069,21 @@ func (r *run) reclaimBranch() error {
 	// коммиты ветки сделал человек; иначе рабочая копия отсоединилась сама
 	// (агент), и её коммиты человеку не приписываем.
 	at := gitops.DetachedAt(wt, branch)
-	viaFolder := at != ""
-	if at != oldHead && !gitops.IsAncestor(wt, oldHead, branch) {
-		return fmt.Errorf("в рабочей копии таски коммиты агента, которых нет в ветке «%s» (HEAD %s) — влейте их в ветку (git merge %s в папке проекта) и повторите", branch, short(oldHead), oldHead)
-	}
 	_ = gitops.PruneWorktrees(wt)
 	holder, err := gitops.BranchHolder(wt, branch)
 	if err != nil {
 		return err
 	}
+	// Исполнитель 0.4.6 забирал ветку в папку без отметки: ветку держит
+	// папка проекта — значит, она ушла туда с HEAD рабочей копии, и её
+	// коммиты сверх него (и переписанные) сделал человек.
+	legacy := at == "" && holder != "" && samePath(holder, r.plan.Project.Path)
+	viaFolder := at != "" || legacy
+	if at != oldHead && !legacy && !gitops.IsAncestor(wt, oldHead, branch) {
+		return fmt.Errorf("в рабочей копии таски коммиты агента, которых нет в ветке «%s» (HEAD %s) — влейте их в ветку (git merge %s в папке проекта) и повторите", branch, short(oldHead), oldHead)
+	}
 	if holder != "" {
 		proj := r.plan.Project
-		// Исполнитель 0.4.6 забирал ветку в папку без отметки: ветку держит
-		// папка проекта — значит, её коммиты сверх рабочей копии сделал
-		// человек.
-		viaFolder = viaFolder || samePath(holder, proj.Path)
 		if !samePath(holder, proj.Path) {
 			return fmt.Errorf("ветку таски «%s» держит рабочая копия %s — переключите её на другую ветку и повторите", branch, holder)
 		}
