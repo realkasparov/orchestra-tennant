@@ -631,3 +631,33 @@ func TestKeepChangeAfterUnhandledPending(t *testing.T) {
 		t.Fatalf("отложенное: %+v", pm)
 	}
 }
+
+// После паузы живое сообщение не разбирается мёртвым триажем (он сделал бы
+// из вопроса правку), а откладывается как есть; вопросы из очереди — тоже.
+func TestPausedMessagesDeferred(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	r.questions <- question{text: "почему так?"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.handleMessage(ctx, "а что с тестами?", "auto", true)
+	r.answerQueued(ctx)
+	if r.change.take() {
+		t.Fatal("сообщение после паузы стало правкой")
+	}
+	pm := r.st.PendingMessage
+	if pm == nil || pm.Text != "а что с тестами?\n\nпочему так?" || pm.Mode != "auto" {
+		t.Fatalf("отложенное: %+v", pm)
+	}
+}
+
+// Две правки до начала раунда копятся.
+func TestChangesAccumulate(t *testing.T) {
+	r, _ := testRun(t, fullPlan())
+	r.requestChange("первая", protocol.Usage{})
+	r.requestChange("вторая", protocol.Usage{})
+	r.change.take()
+	r.keepChange()
+	if pm := r.st.PendingMessage; pm == nil || pm.Text != "первая\n\nвторая" {
+		t.Fatalf("отложенное: %+v", pm)
+	}
+}

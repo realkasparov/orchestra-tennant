@@ -257,6 +257,11 @@ func (r *run) serveMessages(ctx context.Context, quit <-chan struct{}) {
 				continue
 			}
 			mode, pending := r.classify(ctx, m.Text, m.Mode)
+			if ctx.Err() != nil {
+				// Пауза посреди триажа: его «правка по умолчанию» — не ответ.
+				r.deferMessage(m.Text, m.Mode)
+				return
+			}
 			if mode == "question" {
 				select {
 				case r.questions <- question{m.Text, pending}:
@@ -285,13 +290,43 @@ func (r *run) classify(ctx context.Context, text, mode string) (string, protocol
 
 // handleMessage — сообщение, с которым задание запущено: разбирается в
 // горутине цикла этапов, поэтому ответ идёт сразу.
-func (r *run) handleMessage(ctx context.Context, text, mode string) {
-	mode, pending := r.classify(ctx, text, mode)
-	if mode == "question" {
-		r.answerQuestionRound(ctx, text, pending)
+// live — сообщение пришло живым (не план задания): прерванное паузой оно
+// откладывается, а не теряется; сообщение плана при возобновлении
+// разбирается заново и так.
+func (r *run) handleMessage(ctx context.Context, text, mode string, live bool) {
+	if live && ctx.Err() != nil {
+		r.deferMessage(text, mode)
+		return
+	}
+	got, pending := r.classify(ctx, text, mode)
+	if live && ctx.Err() != nil {
+		// Триаж прерван паузой: его «правка по умолчанию» — не ответ.
+		r.deferMessage(text, mode)
+		return
+	}
+	if got == "question" {
+		if r.answerQuestionRound(ctx, text, pending) && live {
+			r.deferMessage(text, "question")
+		}
 		return
 	}
 	r.requestChange(text, pending)
+}
+
+// deferMessage откладывает сообщение человека до следующего запуска таски.
+func (r *run) deferMessage(text, mode string) {
+	r.job.mu.Lock()
+	r.st.PendingMessage = mergeMessages(r.st.PendingMessage, &protocol.Message{Text: text, Mode: mode})
+	r.job.mu.Unlock()
+	r.job.SaveState()
+}
+
+// answerQueuedOne отвечает на вопрос из очереди; прерванный паузой вопрос
+// откладывается.
+func (r *run) answerQueuedOne(ctx context.Context, q question) {
+	if r.answerQuestionRound(ctx, q.text, q.usage) {
+		r.deferMessage(q.text, "question")
+	}
 }
 
 // answerQueued отвечает на вопросы, накопившиеся, пока шёл этап.
@@ -299,7 +334,11 @@ func (r *run) answerQueued(ctx context.Context) {
 	for {
 		select {
 		case q := <-r.questions:
-			r.answerQuestionRound(ctx, q.text, q.usage)
+			if ctx.Err() != nil {
+				r.deferMessage(q.text, "question")
+				continue
+			}
+			r.answerQueuedOne(ctx, q)
 		default:
 			return
 		}
@@ -343,7 +382,7 @@ func (r *run) triage(ctx context.Context, text string) (string, protocol.Usage) 
 // answerQuestionRound заводит системный этап «answer» новым раундом и даёт
 // агенту ответить в чате без изменения кода. Статус таски не меняется:
 // вопрос не возвращает готовую таску в работу.
-func (r *run) answerQuestionRound(ctx context.Context, text string, pending protocol.Usage) {
+func (r *run) answerQuestionRound(ctx context.Context, text string, pending protocol.Usage) (interrupted bool) {
 	round := r.st.addRound([]string{"answer"})
 	st := r.st.stage("answer")
 	st.Usage = pending // расход триажа
@@ -392,7 +431,7 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 		st.Status = "paused"
 		r.emitStage(st, "paused")
 		r.job.SaveState()
-		return
+		return true
 	}
 	if err != nil || res == nil {
 		msg := "не удалось получить ответ"
@@ -409,6 +448,7 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 	r.emitStage(st, "done")
 	_ = round
 	r.job.SaveState()
+	return false
 }
 
 // requestChange записывает отзыв и просит цикл этапов начать новый раунд.
@@ -416,7 +456,15 @@ func (r *run) answerQuestionRound(ctx context.Context, text string, pending prot
 // дойдёт, — заводить его отсюда значило бы гонку с идущим этапом.
 func (r *run) requestChange(text string, pending protocol.Usage) {
 	path := filepath.Join(r.st.TaskDir, "user-feedback.md")
-	r.st.Feedback = strings.TrimSpace(text)
+	// Правки, пришедшие до начала раунда, копятся: вторая не вытесняет
+	// первую. Пишут и цикл этапов, и разбор сообщений — под замком правки.
+	r.change.mu.Lock()
+	if r.change.pending && r.st.Feedback != "" && !strings.Contains(r.st.Feedback, strings.TrimSpace(text)) {
+		r.st.Feedback += "\n\n" + strings.TrimSpace(text)
+	} else if !r.change.pending {
+		r.st.Feedback = strings.TrimSpace(text)
+	}
+	r.change.mu.Unlock()
 	entry := "\n## Правка от пользователя\n" + strings.TrimSpace(text) + "\n"
 	// Повторный разбор (раунд не завёлся, задание возобновили) не дублирует
 	// запись, которая уже стоит последней.
@@ -515,15 +563,22 @@ func (r *run) startChangeRound() error {
 	// рабочие коммиты ещё не свёрнуты и не проверены — база остаётся прежней,
 	// чтобы новый раунд свернул и проверил их. Коммиты человека (ветка
 	// возвращена с ними) — граница всегда: их не сворачивают и не правят.
-	complete := r.roundComplete()
+	complete, reviewed := r.roundComplete(), r.allStagesDone()
 	round := r.st.addRound(keys)
 	r.markDisabled()
 	// Коммиты человека посреди раунда база раунда уже учла (возврат ветки
 	// передвинул её на них), а база ревью держит работу агента до них —
-	// оборванный раунд их сохраняет.
+	// оборванный раунд их сохраняет. Работа, свёрнутая, но не проверенная
+	// (правка пришла на ревью), остаётся ревью: база свёртки — HEAD, база
+	// ревью — прежняя.
 	if r.st.WorktreeDir != "" && (complete || r.st.RoundBase == "") {
 		if head, err := gitops.HeadSHA(r.st.WorktreeDir); err == nil {
-			r.st.RoundBase, r.st.ReviewBase = head, ""
+			if reviewed || r.st.RoundBase == "" {
+				r.st.ReviewBase = ""
+			} else if r.st.ReviewBase == "" && r.st.RoundBase != head {
+				r.st.ReviewBase = r.st.RoundBase
+			}
+			r.st.RoundBase = head
 			r.job.Emit("", "task_field", map[string]any{"round_base": head})
 		}
 	}

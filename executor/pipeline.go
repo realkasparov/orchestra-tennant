@@ -146,9 +146,12 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			r.answerQueued(ctx)
 			select {
 			case m := <-r.job.Messages():
-				r.handleMessage(ctx, m.Text, m.Mode)
+				r.handleMessage(ctx, m.Text, m.Mode, true)
 			default:
 				more = false
+			}
+			if ctx.Err() != nil {
+				more = false // остальное сохранит конец задания
 			}
 		}
 		return r.change.take()
@@ -175,9 +178,13 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
 	if m := msg; m != nil {
-		r.handleMessage(ctx, m.Text, m.Mode)
+		r.handleMessage(ctx, m.Text, m.Mode, false)
 		if ctx.Err() != nil {
-			r.change.take()
+			// Сообщение начала задания — в отложенное целиком и разобранным
+			// этим заданием: возобновление разберёт его заново один раз.
+			// Принятую живую правку допишет к нему конец задания.
+			r.st.PendingMessage, r.st.MessageJob = msg, job.ID
+			r.job.SaveState()
 			r.markPaused("")
 			return "paused", nil
 		}
@@ -518,7 +525,7 @@ func (r *run) waitContinue(ctx context.Context, key string) (paused bool) {
 			r.job.SaveState()
 			return false
 		case q := <-r.questions:
-			r.answerQuestionRound(ctx, q.text, q.usage)
+			r.answerQueuedOne(ctx, q)
 		case <-r.change.wake():
 			r.st.AwaitContinue = ""
 			r.job.SaveState()
@@ -851,7 +858,7 @@ func (r *run) waitAndCollectAnswers(ctx context.Context, st *StageState) (string
 				r.job.SaveState()
 			}
 		case q := <-r.questions:
-			r.answerQuestionRound(ctx, q.text, q.usage)
+			r.answerQueuedOne(ctx, q)
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
@@ -1148,7 +1155,19 @@ func (r *run) humanCommitsResumeNote() string {
 // или пропущены.
 func (r *run) roundComplete() bool {
 	// Последний этап каждого рабочего шага; ответ на вопрос — не раунд.
-	return r.allStagesDone()
+	if r.allStagesDone() {
+		return true
+	}
+	// «Выполнение» уже свернуло работу раунда (правка пришла на ревью или
+	// позже): база нового раунда — HEAD, иначе он свернул бы прошлый коммит
+	// вместе с новой работой.
+	for _, key := range r.stageKeys() {
+		if def := r.plan.Step(key); def != nil && def.Skill == "execute-plan" {
+			st := r.st.stage(key)
+			return st != nil && (st.Status == "done" || st.Status == "skipped")
+		}
+	}
+	return false
 }
 
 // mergeMessages — отложенное сообщение и новое одним: правка, если хоть одно
