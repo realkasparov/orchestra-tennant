@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/realkasparov/orchestra-tennant/agent"
 	"github.com/realkasparov/orchestra-tennant/codeindex"
@@ -55,6 +56,12 @@ type run struct {
 	questions chan question
 	// manifests — манифесты скиллов плана по имени скилла.
 	manifests map[string]*protocol.Manifest
+	// Под job.mu: startDone — сообщение начала задания разобрано и снято из
+	// отложенного (до того отложенное — часть этого сообщения); startChange —
+	// оно само принято правкой; deferred — отложенное этим заданием
+	// (сообщения после паузы, недошедшие уточнения).
+	startDone, startChange bool
+	deferred               []*protocol.Message
 	// question — текст вопроса для системного шага ответа (`$task.question`).
 	question string
 	// pass и passScope — текущий прогон шага для привязок `$task.pass`.
@@ -89,13 +96,25 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			r.log("", "Индекс кода: "+err.Error())
 		}
 	}
-	// Сообщение задания или отложенное прошлым заданием.
+	// Сообщение задания вместе с отложенным прошлым заданием: новое сообщение
+	// до «Повторить» не должно вытеснить отложенную правку.
 	msg := r.plan.Message
-	if msg == nil {
-		msg = r.st.PendingMessage
+	if msg != nil && r.st.MessageJob == job.ID {
+		msg = nil // уже разобрано этим заданием до перезапуска
 	}
+	msg = mergeMessages(r.st.PendingMessage, msg)
 	if err := r.reclaimBranch(); err != nil {
-		if msg != nil && r.st.MessageJob != job.ID {
+		// Сообщения, пришедшие живыми к возобновлённому заданию, тоже не
+		// теряются: их разберёт «Повторить».
+		for drained := false; !drained; {
+			select {
+			case lm := <-r.job.Messages():
+				msg = mergeMessages(msg, &protocol.Message{Text: lm.Text, Mode: lm.Mode})
+			default:
+				drained = true
+			}
+		}
+		if msg != nil {
 			r.st.PendingMessage = msg
 			r.job.SaveState()
 			err = fmt.Errorf("%w; сообщение сохранено — «Повторить» начнёт его", err)
@@ -106,55 +125,184 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	}
 	mctx, mcancel := context.WithCancel(ctx)
 	defer mcancel()
+	// startReader запускает разбор сообщений; стоп ждёт, пока разбор взятого
+	// сообщения закончится.
+	startReader := func() func() {
+		quit, done := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(done)
+			r.serveMessages(mctx, quit)
+		}()
+		var once sync.Once
+		return func() { once.Do(func() { close(quit); <-done }) }
+	}
 	r.seedSessions()
 	// Сжатие стоящего шага в фоне доделывается до конца задания: события о
 	// нём должны уйти раньше итога.
 	defer r.closeSessions()
-	go r.serveMessages(mctx)
+	stopReader := startReader()
+	// settle — этапы кончились: ответить на вопросы, перестать принимать
+	// сообщения и разобрать уже принятые. true — пришла правка.
+	settle := func() bool {
+		r.answerQueued(ctx)
+		stopReader()
+		// Пока отвечали, могли прийти ещё сообщения: разбираем их здесь же,
+		// пока очередь не опустеет.
+		for more := true; more; {
+			r.answerQueued(ctx)
+			select {
+			case m := <-r.job.Messages():
+				r.handleMessage(ctx, m.Text, m.Mode, true)
+			default:
+				more = false
+			}
+			if ctx.Err() != nil {
+				more = false // остальное сохранит конец задания
+			}
+		}
+		return r.change.take()
+	}
+	// Задание кончается любым путём (пауза, ошибка): принятая, но не
+	// начатая правка и вопросы без ответа — в отложенное, их начнёт
+	// следующий запуск. Разбор сообщений к этому времени остановлен.
+	defer func() {
+		stopReader()
+		if r.change.take() {
+			r.keepChange()
+		}
+		for more := true; more; {
+			select {
+			case q := <-r.questions:
+				r.deferMessage(q.text, "question")
+			default:
+				more = false
+			}
+		}
+	}()
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
-	if m := msg; m != nil && r.st.MessageJob != job.ID {
-		r.handleMessage(ctx, m.Text, m.Mode)
+	if m := msg; m != nil {
+		r.handleMessage(ctx, m.Text, m.Mode, false)
 		if ctx.Err() != nil {
-			r.change.take()
+			// Сообщение начала задания — в отложенное целиком и разобранным
+			// этим заданием: возобновление разберёт его заново один раз.
+			// Принятая живая правка и отложенное после паузы — после него.
+			stopReader()
+			pend := msg
+			if r.change.take() {
+				r.job.mu.Lock()
+				fb := strings.TrimSpace(r.st.Feedback)
+				fromStart := r.startChange
+				r.job.mu.Unlock()
+				if fromStart {
+					pend = &protocol.Message{Text: fb, Mode: "change"} // начинается с msg
+				} else {
+					pend = mergeMessages(msg, &protocol.Message{Text: fb, Mode: "change"})
+				}
+			}
+			r.job.mu.Lock()
+			for _, d := range r.deferred {
+				pend = mergeMessages(pend, d)
+			}
+			r.st.PendingMessage, r.st.MessageJob = pend, job.ID
+			r.job.mu.Unlock()
+			r.job.SaveState()
 			r.markPaused("")
 			return "paused", nil
 		}
 		if r.change.take() {
 			if err := r.checkWorkspace(); err != nil {
-				return r.failRound(err)
+				return r.failChange(err)
 			}
 			if err := r.startChangeRound(); err != nil {
-				return r.failRound(err)
+				return r.failChange(err)
 			}
 		}
-		r.st.MessageJob, r.st.PendingMessage = job.ID, nil
+		r.job.mu.Lock()
+		var pend *protocol.Message
+		for _, d := range r.deferred {
+			pend = mergeMessages(pend, d)
+		}
+		r.st.MessageJob, r.st.PendingMessage, r.startDone = job.ID, pend, true
+		r.job.mu.Unlock()
 		r.job.SaveState()
+	} else {
+		r.job.mu.Lock()
+		r.startDone = true
+		r.job.mu.Unlock()
 	}
+	restart := false
 	if msg != nil && r.allStagesDone() {
-		r.answerQueued(ctx)
-		return "done", nil
+		if !settle() {
+			return "done", nil
+		}
+		// Правка пришла, пока отвечали на вопрос, — новый раунд.
+		stopReader, restart = startReader(), true
 	}
 	for {
-		status, err, restart := r.pipeline(ctx)
 		if !restart {
-			if ctx.Err() == nil {
-				r.answerQueued(ctx)
+			status, err, again := r.pipeline(ctx)
+			if !again {
+				if ctx.Err() != nil || !settle() {
+					return status, err
+				}
+				// Правка пришла под конец (пока отвечали на вопросы):
+				// «Правка принята» уже сказано — раунд начинается сейчас, а
+				// у задания, кончившегося не успехом, — следующим заданием.
+				if status != "done" || err != nil {
+					r.keepChange()
+					return status, err
+				}
+				stopReader = startReader()
 			}
-			return status, err
 		}
+		restart = false
 		if err := r.checkWorkspace(); err != nil {
-			return r.failRound(err)
+			return r.failChange(err)
 		}
 		if err := r.startChangeRound(); err != nil {
-			return r.failRound(err)
+			return r.failChange(err)
 		}
 	}
 }
 
 // failRound — новый раунд не начался (грязная рабочая копия): ошибка в
 // журнал и статус задания, этапы не тронуты.
+// failChange — раунд правки не начался (грязная рабочая копия и т. п.):
+// правка откладывается, «Повторить» начнёт её, а не продолжит старый раунд.
+func (r *run) failChange(err error) (string, error) {
+	if r.keepChange() {
+		err = fmt.Errorf("%w; правка сохранена — «Повторить» начнёт её", err)
+	}
+	return r.failRound(err)
+}
+
+// keepChange откладывает принятую, но не начатую правку: её начнёт
+// следующее задание. До конца разбора сообщения начала задания отложенное в
+// состоянии — часть этого сообщения (уже вошло в правку или отвечено):
+// оно заменяется; после — дописывается.
+func (r *run) keepChange() bool {
+	r.job.mu.Lock()
+	fb := strings.TrimSpace(r.st.Feedback)
+	if fb == "" {
+		r.job.mu.Unlock()
+		return false
+	}
+	change := &protocol.Message{Text: fb, Mode: "change"}
+	if r.startDone {
+		change = mergeMessages(r.st.PendingMessage, change)
+	} else {
+		for _, d := range r.deferred {
+			change = mergeMessages(change, d)
+		}
+	}
+	r.st.PendingMessage = change
+	r.job.mu.Unlock()
+	r.job.SaveState()
+	return true
+}
+
 func (r *run) failRound(err error) (string, error) {
 	r.log("", "Ошибка: "+err.Error())
 	r.taskStatus("error")
@@ -417,7 +565,7 @@ func (r *run) waitContinue(ctx context.Context, key string) (paused bool) {
 			r.job.SaveState()
 			return false
 		case q := <-r.questions:
-			r.answerQuestionRound(ctx, q.text, q.usage)
+			r.answerQueuedOne(ctx, q)
 		case <-r.change.wake():
 			r.st.AwaitContinue = ""
 			r.job.SaveState()
@@ -491,6 +639,11 @@ func (r *run) runAgentStage(ctx context.Context, st *StageState, sp agentSpec, p
 			prompt = answers
 		} else {
 			prompt = continuationPrompt
+		}
+		// Пока шаг стоял, человек закоммитил в ветку: сессия помнит прежнюю
+		// базу из первого промпта — свёртка от неё поглотила бы его коммиты.
+		if note := r.humanCommitsResumeNote(); note != "" {
+			prompt += "\n\n" + note
 		}
 	}
 	return r.runAgentSession(ctx, st, sp, prompt, resume, pass)
@@ -637,6 +790,11 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 				st.CompactPending = compactReq
 				r.job.SaveState()
 			}
+			if clarified != "" {
+				// Уточнение не дошло до агента — его разберёт следующий
+				// запуск таски, как сообщение.
+				r.deferMessage(clarified, "auto")
+			}
 			return all.String(), err
 		}
 		if res != nil {
@@ -739,7 +897,7 @@ func (r *run) waitAndCollectAnswers(ctx context.Context, st *StageState) (string
 				r.job.SaveState()
 			}
 		case q := <-r.questions:
-			r.answerQuestionRound(ctx, q.text, q.usage)
+			r.answerQueuedOne(ctx, q)
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
@@ -937,9 +1095,38 @@ func (r *run) reclaimBranch() error {
 	if cur, err := gitops.CurrentBranch(wt); err != nil || cur == branch {
 		return nil // рабочей копии нет (её заведёт шаг) или ветка на месте
 	}
+	// Рабочая копия таски должна встать на ветку целиком: незакоммиченное в
+	// ней или коммиты вне ветки (агент коммитил, пока ветку забирали) —
+	// отказ до того, как трогать папку проекта.
+	if dirty, err := gitops.DirtyFiles(wt); err != nil {
+		return err
+	} else if len(dirty) > 0 {
+		return fmt.Errorf("в рабочей копии таски незакоммиченные изменения (%s) — ветку «%s» ей не вернуть", strings.Join(dirty, ", "), branch)
+	}
+	oldHead, err := gitops.HeadSHA(wt)
+	if err != nil {
+		return err
+	}
+	// Агент закоммитил в рабочую копию после того, как ветку забрали в
+	// папку: его коммиты не в ветке, и переключение их бросило бы. Сверка — с
+	// коммитом, на котором worktree отпустил ветку (человек мог переписать
+	// ветку amend или rebase — это его право, не повод отказывать).
+	// Ветку отпустило «Открыть в папке проекта» (есть отметка) — новые
+	// коммиты ветки сделал человек; иначе рабочая копия отсоединилась сама
+	// (агент), и её коммиты человеку не приписываем.
+	at := gitops.DetachedAt(wt, branch)
+	_ = gitops.PruneWorktrees(wt)
 	holder, err := gitops.BranchHolder(wt, branch)
 	if err != nil {
 		return err
+	}
+	// Исполнитель 0.4.6 забирал ветку в папку без отметки: ветку держит
+	// папка проекта — значит, она ушла туда с HEAD рабочей копии, и её
+	// коммиты сверх него (и переписанные) сделал человек.
+	legacy := at == "" && holder != "" && samePath(holder, r.plan.Project.Path)
+	viaFolder := at != "" || legacy
+	if at != oldHead && !legacy && !gitops.IsAncestor(wt, oldHead, branch) {
+		return fmt.Errorf("в рабочей копии таски коммиты агента, которых нет в ветке «%s» (HEAD %s) — влейте их в ветку (git merge %s в папке проекта) и повторите", branch, short(oldHead), oldHead)
 	}
 	if holder != "" {
 		proj := r.plan.Project
@@ -959,7 +1146,89 @@ func (r *run) reclaimBranch() error {
 	if err := gitops.Switch(wt, branch); err != nil {
 		return fmt.Errorf("вернуть ветку «%s» в рабочую копию таски: %w", branch, err)
 	}
+	gitops.ForgetDetached(wt, branch)
+	if head, err := gitops.HeadSHA(wt); err == nil && head != oldHead && viaFolder && !gitops.IsAncestor(wt, oldHead, head) {
+		// Человек переписал ветку (amend, rebase): коммиты агента стали его
+		// коммитами, отделить их нельзя. Всё в ветке — граница: агент её не
+		// сворачивает и не правит, ревью смотрит только новую работу.
+		r.st.RoundBase, r.st.ReviewBase, r.st.HumanBase = head, "", head
+		r.job.Emit("", "task_field", map[string]any{"round_base": head})
+		r.job.SaveState()
+		r.log("", fmt.Sprintf("Ветку «%s» человек переписал (amend или rebase) — агент продолжит поверх, не сворачивая и не правя её коммиты.", branch))
+	} else if err == nil && head != oldHead && viaFolder {
+		// Человек закоммитил в ветку: дальше раунд считается от его коммитов,
+		// их не сворачивают. Если агент уже закоммитил работу раунда, ревью
+		// смотрит её от прежней базы — коммиты человека в ней помечены.
+		if shas, err := gitops.RevList(wt, oldHead, head); err == nil {
+			r.st.HumanCommits = append(r.st.HumanCommits, shas...)
+		}
+		if r.st.RoundBase != "" {
+			if oldHead != r.st.RoundBase && r.st.ReviewBase == "" {
+				r.st.ReviewBase = r.st.RoundBase
+			}
+			r.st.RoundBase = head
+			r.job.Emit("", "task_field", map[string]any{"round_base": head})
+		}
+		r.st.HumanBase = head
+		r.job.SaveState()
+		r.log("", fmt.Sprintf("В ветке «%s» коммиты человека — агент продолжит поверх них, не сворачивая и не правя их.", branch))
+	}
 	return nil
+}
+
+// humanCommitsResumeNote — для продолжаемой сессии: какие коммиты добавил
+// человек и от какой базы теперь сворачивать. Пусто — коммитов человека в
+// этом задании не было.
+func (r *run) humanCommitsResumeNote() string {
+	if r.st.HumanBase == "" {
+		return ""
+	}
+	return fmt.Sprintf("Пока шаг стоял, пользователь закоммитил в ветку свои правки — HEAD теперь %s. "+
+		"Это его решения: не сворачивай, не переписывай (reset, rebase, amend) и не откатывай коммиты до %s включительно. "+
+		"База для свёртки твоих коммитов теперь %s (вместо BASE/ROUND_BASE из начала шага); "+
+		"твои незакоммиченные изменения и коммиты ниже неё остаются как есть.",
+		short(r.st.HumanBase), short(r.st.HumanBase), r.st.HumanBase)
+}
+
+// roundComplete — последний раунд дошёл до конца: все его этапы исполнены
+// или пропущены.
+func (r *run) roundComplete() bool {
+	// Последний этап каждого рабочего шага; ответ на вопрос — не раунд.
+	if r.allStagesDone() {
+		return true
+	}
+	// «Выполнение» уже свернуло работу раунда (правка пришла на ревью или
+	// позже): база нового раунда — HEAD, иначе он свернул бы прошлый коммит
+	// вместе с новой работой.
+	for _, key := range r.stageKeys() {
+		if def := r.plan.Step(key); def != nil && def.Skill == "execute-plan" {
+			st := r.st.stage(key)
+			return st != nil && (st.Status == "done" || st.Status == "skipped")
+		}
+	}
+	return false
+}
+
+// mergeMessages — отложенное сообщение и новое одним: правка, если хоть одно
+// из них — правка.
+func mergeMessages(pending, next *protocol.Message) *protocol.Message {
+	switch {
+	case pending == nil:
+		return next
+	case next == nil:
+		return pending
+	}
+	m := *next
+	m.Text = pending.Text + "\n\n" + next.Text
+	switch {
+	case pending.Mode == "change" || next.Mode == "change":
+		m.Mode = "change"
+	case pending.Mode != next.Mode:
+		// Отложенное не разобрано: пусть разберёт триаж, ошибка в нём — в
+		// пользу правки.
+		m.Mode = "auto"
+	}
+	return &m
 }
 
 // checkWorkspace — рабочая копия в папке проекта всё ещё наша: там наша
@@ -1085,6 +1354,15 @@ func short(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// reviewBase — база ревью: прежняя база раунда, если его поделили коммиты
+// человека, иначе база раунда.
+func (r *run) reviewBase() string {
+	if r.st.ReviewBase != "" {
+		return r.st.ReviewBase
+	}
+	return r.roundBase()
 }
 
 // roundBase — база текущего раунда (для старых задач — база задачи).

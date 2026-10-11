@@ -187,9 +187,45 @@ func (j *Job) retire() {
 // finish фиксирует итог. Само сообщение done уходит из flush: там же, где
 // досылка, чтобы итог не обогнал события.
 func (j *Job) finish(status, reason string) {
+	// Сообщения, которые прогон уже не прочтёт (пришли, пока он
+	// заканчивался), — в отложенное: их начнёт следующий запуск таски.
 	j.mu.Lock()
 	j.finished, j.status, j.reason = true, status, reason
+	var late []*protocol.Message
+	for drained := false; !drained; {
+		select {
+		case m := <-j.messages:
+			if j.keepLateLocked(m) {
+				late = append(late, m)
+			}
+		default:
+			drained = true
+		}
+	}
 	j.mu.Unlock()
+	if len(late) > 0 {
+		j.SaveState()
+	}
+	for _, m := range late {
+		j.noteLate(m)
+	}
+}
+
+// noteLate — запись в журнал таски об отложенном сообщении. Событие уходит
+// раньше итога; если итог уже ушёл, оркестратор его отбросит, а повтор итога
+// ему безвреден.
+func (j *Job) noteLate(m *protocol.Message) {
+	j.Emit("", "log", map[string]any{"text": "Сообщение «" + m.Text + "» пришло, когда задание заканчивалось, — сохранено: его начнёт следующий запуск таски (новое сообщение или «Повторить»)."})
+}
+
+// keepLateLocked откладывает сообщение законченного задания в состояние
+// таски (под j.mu).
+func (j *Job) keepLateLocked(m *protocol.Message) bool {
+	if j.State == nil || m == nil {
+		return false
+	}
+	j.State.PendingMessage = mergeMessages(j.State.PendingMessage, m)
+	return true
 }
 
 // worktreeDir — рабочая копия таски из состояния; пусто до этапа branch.
@@ -237,6 +273,19 @@ func (j *Job) deliverAnswer(a *protocol.Answer) {
 }
 
 func (j *Job) deliverMessage(m *protocol.Message) {
+	j.mu.Lock()
+	if j.finished {
+		// Прогон закончился (например, ветку не вернуть): сообщение не
+		// теряется — его начнёт «Повторить».
+		late := j.keepLateLocked(m)
+		j.mu.Unlock()
+		if late {
+			j.SaveState()
+			j.noteLate(m)
+		}
+		return
+	}
+	defer j.mu.Unlock()
 	select {
 	case j.messages <- m:
 	default:

@@ -219,7 +219,7 @@ func (e *Executor) session(ctx context.Context, conn protocol.Conn) error {
 		Version: e.cfg.Version, MinSchema: protocol.MinSchemaVersion,
 		MaxSchema: protocol.SchemaVersion, Slots: e.cfg.Slots, ProjectsDir: e.cfg.ProjectsDir,
 		Models: e.cfg.Models, ModelCatalog: protocol.Catalog(e.cfg.Models),
-		Features: []string{protocol.FeatureCompact, protocol.FeatureUsage},
+		Features: []string{protocol.FeatureCompact, protocol.FeatureUsage, protocol.FeatureBranchHandover},
 		Running:  e.runningIDs(), Parked: e.parkedJobs(),
 	}
 	if e.cfg.Skills != nil {

@@ -72,6 +72,13 @@ func (e *Executor) view(spec *protocol.ProjectSpec) *protocol.ProjectResult {
 	if other := e.folderHolder(path, 0); other != 0 {
 		return &protocol.ProjectResult{Error: fmt.Sprintf("папка проекта занята таской #%d, которая сейчас идёт прямо в ней; дождитесь её или остановите", other)}
 	}
+	// Ветки таск, созданные до 0.4.7, отслеживают базу: git push с них
+	// уходил бы не в одноимённую ветку. Ветку базы не трогаем.
+	if spec.Branch != spec.BaseBranch {
+		if err := gitops.TrackOwnName(path, spec.Branch, spec.BaseBranch); err != nil {
+			e.logf("upstream ветки %s: %v", spec.Branch, err)
+		}
+	}
 	// Ветка уже выставлена в папке (открыта раньше или таска шла прямо в
 	// ней): делать нечего, незакоммиченные правки человека этому не помеха.
 	if cur, err := gitops.CurrentBranch(path); err == nil && cur == spec.Branch {
@@ -380,6 +387,8 @@ func hasStage(plan *protocol.Plan, key string) bool {
 // отсоединённой, — и папка встаёт на ветку. Человек коммитит в ветку сам;
 // агенту ветка вернётся в начале его следующего задания (reclaimBranch).
 func (e *Executor) takeBranch(path, branch string) error {
+	// Записи о рабочих копиях, чьих папок уже нет, держали бы ветку зря.
+	_ = gitops.PruneWorktrees(path)
 	holder, err := gitops.BranchHolder(path, branch)
 	if err != nil {
 		return err
@@ -398,10 +407,24 @@ func (e *Executor) takeBranch(path, branch string) error {
 	} else if len(dirty) > 0 {
 		return fmt.Errorf("в рабочей копии таски незакоммиченные изменения агента (%s) — продолжите таску до конца шага", strings.Join(dirty, ", "))
 	}
+	if err := gitops.MarkDetached(holder, branch); err != nil {
+		return fmt.Errorf("запомнить коммит рабочей копии таски: %w", err)
+	}
 	if err := gitops.SwitchDetach(holder); err != nil {
+		gitops.ForgetDetached(holder, branch)
 		return fmt.Errorf("отпустить ветку в рабочей копии таски: %w", err)
 	}
+	// Задание таски могло стартовать между проверкой и отсоединением: тогда
+	// агент закоммитил бы мимо ветки — возвращаем ветку ему.
+	if id := e.runningIn(holder); id != 0 {
+		gitops.ForgetDetached(holder, branch)
+		if back := gitops.Switch(holder, branch); back != nil {
+			return fmt.Errorf("агент начал работу над таской #%d, а вернуть ему ветку не вышло: %v", id, back)
+		}
+		return fmt.Errorf("агент работает над таской #%d — поставьте её на паузу или дождитесь", id)
+	}
 	if err := gitops.Switch(path, branch); err != nil {
+		gitops.ForgetDetached(holder, branch)
 		if back := gitops.Switch(holder, branch); back != nil {
 			return fmt.Errorf("переключить папку: %v; вернуть ветку в рабочую копию таски тоже не вышло: %v", err, back)
 		}
