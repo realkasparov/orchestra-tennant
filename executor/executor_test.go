@@ -237,14 +237,41 @@ func newRig(t *testing.T, cfg Config) *rig {
 		dials: make(chan protocol.Conn, 4)}
 	ctx, cancel := context.WithCancel(context.Background())
 	r.stop = cancel
-	t.Cleanup(cancel)
-	go ex.Serve(ctx, func() (protocol.Conn, error) { //nolint:errcheck
-		c, ok := <-r.dials
-		if !ok {
-			return nil, errors.New("закрыто")
+	served := make(chan struct{})
+	// Уборка ждёт исполнителя: иначе его горутины дописывают журнал в папку,
+	// которую тест уже удаляет («directory not empty» на медленном CI).
+	// Регистрируется после t.TempDir — значит, выполняется раньше удаления.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-served:
+		case <-time.After(5 * time.Second):
 		}
-		return c, nil
+		ex.mu.Lock()
+		var ended []chan struct{}
+		for _, j := range ex.jobs {
+			if j.ended != nil {
+				ended = append(ended, j.ended)
+			}
+		}
+		ex.mu.Unlock()
+		for _, e := range ended {
+			select {
+			case <-e:
+			case <-time.After(5 * time.Second):
+			}
+		}
 	})
+	go func() {
+		defer close(served)
+		_ = ex.Serve(ctx, func() (protocol.Conn, error) {
+			c, ok := <-r.dials
+			if !ok {
+				return nil, errors.New("закрыто")
+			}
+			return c, nil
+		})
+	}()
 	return r
 }
 
@@ -327,11 +354,15 @@ func TestReconnectResendsWithoutDuplicates(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // первые три дошли и подтверждены
 
 	first.Close() // разрыв
-	time.Sleep(50 * time.Millisecond)
-	r.run.emit(4) // без связи: копятся
+	// Разрыв исполнитель замечает асинхронно: на медленной машине — не за
+	// фиксированные 50 мс.
+	for deadline := time.Now().Add(3 * time.Second); r.ex.Connected() && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if r.ex.Connected() {
 		t.Fatal("исполнитель считает себя подключённым после разрыва")
 	}
+	r.run.emit(4) // без связи: копятся
 
 	r.connect()
 	r.waitConnected()
