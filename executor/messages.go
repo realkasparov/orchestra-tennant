@@ -295,10 +295,12 @@ func (r *run) classify(ctx context.Context, text, mode string) (string, protocol
 // live — сообщение пришло живым (не план задания): прерванное паузой оно
 // откладывается, а не теряется; сообщение плана при возобновлении
 // разбирается заново и так.
-func (r *run) handleMessage(ctx context.Context, text, mode string, live bool) {
+// Возвращает true, если сообщение разобрано до конца (вопрос отвечен,
+// правка принята).
+func (r *run) handleMessage(ctx context.Context, text, mode string, live bool) bool {
 	if live && ctx.Err() != nil {
 		r.deferMessage(text, mode)
-		return
+		return false
 	}
 	got, pending := r.classify(ctx, text, mode)
 	if ctx.Err() != nil {
@@ -307,20 +309,19 @@ func (r *run) handleMessage(ctx context.Context, text, mode string, live bool) {
 		if live {
 			r.deferMessage(text, mode)
 		}
-		return
+		return false
 	}
 	if got == "question" {
-		if r.answerQuestionRound(ctx, text, pending) && live {
-			r.deferMessage(text, "question")
+		if r.answerQuestionRound(ctx, text, pending) {
+			if live {
+				r.deferMessage(text, "question")
+			}
+			return false
 		}
-		return
-	}
-	if !live {
-		r.job.mu.Lock()
-		r.startChange = true
-		r.job.mu.Unlock()
+		return true
 	}
 	r.requestChange(text, pending)
+	return true
 }
 
 // deferMessage откладывает сообщение человека до следующего запуска таски.
@@ -328,7 +329,7 @@ func (r *run) deferMessage(text, mode string) {
 	m := &protocol.Message{Text: text, Mode: mode}
 	r.job.mu.Lock()
 	r.deferred = append(r.deferred, m)
-	r.st.PendingMessage = mergeMessages(r.st.PendingMessage, m)
+	r.st.PendingQueue = append(r.st.PendingQueue, m)
 	r.job.mu.Unlock()
 	r.job.SaveState()
 }
@@ -472,26 +473,33 @@ func (r *run) requestChange(text string, pending protocol.Usage) {
 	// первую. Пишут и цикл этапов, и разбор сообщений — под замком правки.
 	r.change.mu.Lock()
 	r.job.mu.Lock()
+	prevFb := ""
 	if t := strings.TrimSpace(text); !r.change.pending || r.st.Feedback == "" {
 		r.st.Feedback, r.change.last = t, t
 	} else if t != r.change.last {
 		// Повтор того же разбора (возобновление) не дописывается.
+		prevFb = r.st.Feedback
 		r.st.Feedback += "\n\n" + t
 		r.change.last = t
 	}
+	fb := r.st.Feedback
 	r.job.mu.Unlock()
 	r.change.mu.Unlock()
-	entry := "\n## Правка от пользователя\n" + strings.TrimSpace(text) + "\n"
-	// Повторный разбор (раунд не завёлся, задание возобновили) не дублирует
-	// запись, которая уже стоит последней.
-	if prev, err := os.ReadFile(path); err == nil && strings.HasSuffix(string(prev), entry) {
-		r.change.addUsage(pending)
-		r.change.request()
-		return
-	}
-	if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-		_, _ = f.WriteString(entry)
-		_ = f.Close()
+	// В файле — та же правка, что в Feedback: накопленная до раунда — одной
+	// записью (анализ читает последнюю запись как текущий запрос).
+	entry := "\n## Правка от пользователя\n" + fb + "\n"
+	prev, _ := os.ReadFile(path)
+	switch old := "\n## Правка от пользователя\n" + prevFb + "\n"; {
+	case prevFb != "" && strings.HasSuffix(string(prev), old):
+		_ = os.WriteFile(path, append(prev[:len(prev)-len(old)], entry...), 0o644)
+	case strings.HasSuffix(string(prev), entry):
+		// Повторный разбор (раунд не завёлся, задание возобновили): запись
+		// уже стоит последней.
+	default:
+		if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			_, _ = f.WriteString(entry)
+			_ = f.Close()
+		}
 	}
 	r.change.addUsage(pending)
 	if r.change.request() {

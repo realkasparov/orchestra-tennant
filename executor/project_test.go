@@ -504,15 +504,15 @@ func TestReclaimAfterHumanAmend(t *testing.T) {
 // «Повторить».
 func TestKeepChangeDoesNotDuplicate(t *testing.T) {
 	r, _ := testRun(t, fullPlan())
-	r.st.PendingMessage = &protocol.Message{Text: "fix X", Mode: "change"}
+	r.st.PendingQueue = []*protocol.Message{{Text: "fix X", Mode: "change"}}
 	r.st.Feedback = "fix X" // разбор начала задания взял отложенное
 	for i := 0; i < 3; i++ {
 		if !r.keepChange() {
 			t.Fatal("правка не отложена")
 		}
 	}
-	if pm := r.st.PendingMessage; pm == nil || pm.Text != "fix X" {
-		t.Fatalf("отложенное: %+v", pm)
+	if got := queueOf(r.st); got != "change:fix X" {
+		t.Fatalf("отложенное: %s", got)
 	}
 }
 
@@ -577,9 +577,8 @@ func TestLateMessageKept(t *testing.T) {
 	j.deliverMessage(&protocol.Message{Text: "раз", Mode: "change"})
 	j.finish("error", "ветку не вернуть")
 	j.deliverMessage(&protocol.Message{Text: "два", Mode: "auto"})
-	pm := j.State.PendingMessage
-	if pm == nil || pm.Text != "раз\n\nдва" || pm.Mode != "change" {
-		t.Fatalf("сообщения потеряны: %+v", pm)
+	if got := queueOf(j.State); got != "change:раз | auto:два" {
+		t.Fatalf("сообщения потеряны: %s", got)
 	}
 }
 
@@ -626,11 +625,11 @@ func TestChangeBetweenStagesCancelsNext(t *testing.T) {
 func TestKeepChangeAfterUnhandledPending(t *testing.T) {
 	r, _ := testRun(t, fullPlan())
 	r.startDone = true
-	r.st.PendingMessage = &protocol.Message{Text: "да", Mode: "auto"}
+	r.st.PendingQueue = []*protocol.Message{{Text: "да", Mode: "auto"}}
 	r.st.Feedback = "когда будет готово — поправь"
 	r.keepChange()
-	if pm := r.st.PendingMessage; pm == nil || pm.Text != "да\n\nкогда будет готово — поправь" || pm.Mode != "change" {
-		t.Fatalf("отложенное: %+v", pm)
+	if got := queueOf(r.st); got != "auto:да | change:когда будет готово — поправь" {
+		t.Fatalf("отложенное: %s", got)
 	}
 }
 
@@ -638,12 +637,12 @@ func TestKeepChangeAfterUnhandledPending(t *testing.T) {
 // отложенное этим заданием (после паузы) — дописывается.
 func TestKeepChangeAtStartKeepsDeferred(t *testing.T) {
 	r, _ := testRun(t, fullPlan())
-	r.st.PendingMessage = &protocol.Message{Text: "А", Mode: "change"}
+	r.st.PendingQueue = []*protocol.Message{{Text: "А", Mode: "change"}}
 	r.st.Feedback = "А"
 	r.deferMessage("Б?", "auto")
 	r.keepChange()
-	if pm := r.st.PendingMessage; pm == nil || pm.Text != "А\n\nБ?" || pm.Mode != "change" {
-		t.Fatalf("отложенное: %+v", pm)
+	if got := queueOf(r.st); got != "change:А | auto:Б?" {
+		t.Fatalf("отложенное: %s", got)
 	}
 }
 
@@ -659,9 +658,8 @@ func TestPausedMessagesDeferred(t *testing.T) {
 	if r.change.take() {
 		t.Fatal("сообщение после паузы стало правкой")
 	}
-	pm := r.st.PendingMessage
-	if pm == nil || pm.Text != "а что с тестами?\n\nпочему так?" || pm.Mode != "auto" {
-		t.Fatalf("отложенное: %+v", pm)
+	if got := queueOf(r.st); got != "auto:а что с тестами? | question:почему так?" {
+		t.Fatalf("отложенное: %s", got)
 	}
 }
 
@@ -674,8 +672,14 @@ func TestChangesAccumulate(t *testing.T) {
 	r.requestChange("вто", protocol.Usage{})    // короткое — не теряется
 	r.change.take()
 	r.keepChange()
-	if pm := r.st.PendingMessage; pm == nil || pm.Text != "первая\n\nвторая\n\nвто" {
-		t.Fatalf("отложенное: %+v", pm)
+	if got := queueOf(r.st); got != "change:первая\n\nвторая\n\nвто" {
+		t.Fatalf("отложенное: %s", got)
+	}
+	// В файле правок — одна запись с накопленной правкой: анализ читает
+	// последнюю запись как текущий запрос.
+	b, _ := os.ReadFile(filepath.Join(r.st.TaskDir, "user-feedback.md"))
+	if strings.Count(string(b), "## Правка") != 1 || !strings.HasSuffix(string(b), "первая\n\nвторая\n\nвто\n") {
+		t.Fatalf("user-feedback.md: %q", b)
 	}
 }
 
@@ -686,7 +690,16 @@ func TestStartMessageTriageCutByPause(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r.handleMessage(ctx, "как это запустить?", "auto", false)
-	if r.change.take() || r.st.Feedback != "" || r.startChange {
+	if r.change.take() || r.st.Feedback != "" {
 		t.Fatalf("вопрос стал правкой: feedback=%q", r.st.Feedback)
 	}
+}
+
+// queueOf — отложенные сообщения строкой «режим:текст | …».
+func queueOf(st *TaskState) string {
+	var parts []string
+	for _, m := range st.PendingQueue {
+		parts = append(parts, m.Mode+":"+m.Text)
+	}
+	return strings.Join(parts, " | ")
 }

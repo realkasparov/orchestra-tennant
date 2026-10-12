@@ -56,12 +56,11 @@ type run struct {
 	questions chan question
 	// manifests — манифесты скиллов плана по имени скилла.
 	manifests map[string]*protocol.Manifest
-	// Под job.mu: startDone — сообщение начала задания разобрано и снято из
-	// отложенного (до того отложенное — часть этого сообщения); startChange —
-	// оно само принято правкой; deferred — отложенное этим заданием
-	// (сообщения после паузы, недошедшие уточнения).
-	startDone, startChange bool
-	deferred               []*protocol.Message
+	// Под job.mu: startDone — сообщения начала задания разобраны и сняты из
+	// отложенного (до того отложенное — эти сообщения); deferred — отложенное
+	// этим заданием (сообщения после паузы, недошедшие уточнения).
+	startDone bool
+	deferred  []*protocol.Message
 	// question — текст вопроса для системного шага ответа (`$task.question`).
 	question string
 	// pass и passScope — текущий прогон шага для привязок `$task.pass`.
@@ -96,26 +95,31 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 			r.log("", "Индекс кода: "+err.Error())
 		}
 	}
-	// Сообщение задания вместе с отложенным прошлым заданием: новое сообщение
-	// до «Повторить» не должно вытеснить отложенную правку.
-	msg := r.plan.Message
-	if msg != nil && r.st.MessageJob == job.ID {
-		msg = nil // уже разобрано этим заданием до перезапуска
+	// Сообщения начала задания: отложенные прошлыми заданиями (по порядку,
+	// каждое со своим режимом), затем сообщение плана — новое сообщение до
+	// «Повторить» не должно вытеснить отложенную правку.
+	var items []*protocol.Message
+	if r.st.PendingMessage != nil {
+		items = append(items, r.st.PendingMessage)
 	}
-	msg = mergeMessages(r.st.PendingMessage, msg)
+	items = append(items, r.st.PendingQueue...)
+	if m := r.plan.Message; m != nil && r.st.MessageJob != job.ID {
+		items = append(items, m) // иначе уже разобрано этим заданием до перезапуска
+	}
+	r.st.PendingMessage, r.st.PendingQueue = nil, items
 	if err := r.reclaimBranch(); err != nil {
 		// Сообщения, пришедшие живыми к возобновлённому заданию, тоже не
 		// теряются: их разберёт «Повторить».
 		for drained := false; !drained; {
 			select {
 			case lm := <-r.job.Messages():
-				msg = mergeMessages(msg, &protocol.Message{Text: lm.Text, Mode: lm.Mode})
+				items = append(items, &protocol.Message{Text: lm.Text, Mode: lm.Mode})
 			default:
 				drained = true
 			}
 		}
-		if msg != nil {
-			r.st.PendingMessage = msg
+		if len(items) > 0 {
+			r.st.PendingQueue, r.st.MessageJob = items, job.ID
 			r.job.SaveState()
 			err = fmt.Errorf("%w; сообщение сохранено — «Повторить» начнёт его", err)
 		}
@@ -182,58 +186,52 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	// Сообщение, с которым задание запущено (правка или вопрос к готовой
 	// таске), разбирается до этапов: правка заведёт новый раунд, вопрос —
 	// ответ в чате.
-	if m := msg; m != nil {
-		r.handleMessage(ctx, m.Text, m.Mode, false)
-		if ctx.Err() != nil {
-			// Сообщение начала задания — в отложенное целиком и разобранным
-			// этим заданием: возобновление разберёт его заново один раз.
-			// Принятая живая правка и отложенное после паузы — после него.
-			stopReader()
-			pend := msg
-			if r.change.take() {
-				r.job.mu.Lock()
-				fb := strings.TrimSpace(r.st.Feedback)
-				fromStart := r.startChange
-				r.job.mu.Unlock()
-				if fromStart {
-					pend = &protocol.Message{Text: fb, Mode: "change"} // начинается с msg
-				} else {
-					pend = mergeMessages(msg, &protocol.Message{Text: fb, Mode: "change"})
-				}
-			}
-			r.job.mu.Lock()
-			for _, d := range r.deferred {
-				pend = mergeMessages(pend, d)
-			}
-			r.st.PendingMessage, r.st.MessageJob = pend, job.ID
-			r.job.mu.Unlock()
-			r.job.SaveState()
-			r.markPaused("")
-			return "paused", nil
+	for i, m := range items {
+		handled := r.handleMessage(ctx, m.Text, m.Mode, false)
+		if ctx.Err() == nil {
+			continue
 		}
+		// Пауза посреди сообщений начала задания: в отложенное — принятая
+		// правка, неразобранные сообщения (каждое со своим режимом) и
+		// отложенное после паузы; возобновление того же задания разберёт их
+		// один раз.
+		stopReader()
+		var q []*protocol.Message
 		if r.change.take() {
-			if err := r.checkWorkspace(); err != nil {
-				return r.failChange(err)
-			}
-			if err := r.startChangeRound(); err != nil {
-				return r.failChange(err)
+			r.job.mu.Lock()
+			fb := strings.TrimSpace(r.st.Feedback)
+			r.job.mu.Unlock()
+			if fb != "" {
+				q = append(q, &protocol.Message{Text: fb, Mode: "change"})
 			}
 		}
+		if handled {
+			i++
+		}
+		q = append(q, items[i:]...)
 		r.job.mu.Lock()
-		var pend *protocol.Message
-		for _, d := range r.deferred {
-			pend = mergeMessages(pend, d)
-		}
-		r.st.MessageJob, r.st.PendingMessage, r.startDone = job.ID, pend, true
+		q = append(q, r.deferred...)
+		r.st.PendingQueue, r.st.MessageJob = q, job.ID
 		r.job.mu.Unlock()
 		r.job.SaveState()
-	} else {
-		r.job.mu.Lock()
-		r.startDone = true
-		r.job.mu.Unlock()
+		r.markPaused("")
+		return "paused", nil
 	}
+	if len(items) > 0 && r.change.take() {
+		if err := r.checkWorkspace(); err != nil {
+			return r.failChange(err)
+		}
+		if err := r.startChangeRound(); err != nil {
+			return r.failChange(err)
+		}
+	}
+	r.job.mu.Lock()
+	r.st.PendingQueue = append([]*protocol.Message(nil), r.deferred...)
+	r.st.MessageJob, r.startDone = job.ID, true
+	r.job.mu.Unlock()
+	r.job.SaveState()
 	restart := false
-	if msg != nil && r.allStagesDone() {
+	if len(items) > 0 && r.allStagesDone() {
 		if !settle() {
 			return "done", nil
 		}
@@ -279,9 +277,9 @@ func (r *run) failChange(err error) (string, error) {
 }
 
 // keepChange откладывает принятую, но не начатую правку: её начнёт
-// следующее задание. До конца разбора сообщения начала задания отложенное в
-// состоянии — часть этого сообщения (уже вошло в правку или отвечено):
-// оно заменяется; после — дописывается.
+// следующее задание. До конца разбора сообщений начала задания отложенное в
+// состоянии — эти сообщения (уже разобраны: правки — в ней, вопросы
+// отвечены): оно заменяется; после — правка встаёт за отложенным.
 func (r *run) keepChange() bool {
 	r.job.mu.Lock()
 	fb := strings.TrimSpace(r.st.Feedback)
@@ -291,13 +289,10 @@ func (r *run) keepChange() bool {
 	}
 	change := &protocol.Message{Text: fb, Mode: "change"}
 	if r.startDone {
-		change = mergeMessages(r.st.PendingMessage, change)
+		r.st.PendingQueue = append(r.st.PendingQueue, change)
 	} else {
-		for _, d := range r.deferred {
-			change = mergeMessages(change, d)
-		}
+		r.st.PendingQueue = append([]*protocol.Message{change}, r.deferred...)
 	}
-	r.st.PendingMessage = change
 	r.job.mu.Unlock()
 	r.job.SaveState()
 	return true
@@ -781,6 +776,9 @@ func (r *run) runAgentSession(ctx context.Context, st *StageState, sp agentSpec,
 		}
 		r.job.SaveState()
 		if timedOut {
+			if clarified != "" {
+				r.deferMessage(clarified, "auto") // уточнение не дошло до агента
+			}
 			return all.String(), fmt.Errorf("этап превысил лимит времени (%s) и был остановлен", r.plan.StageTimeout.Duration())
 		}
 		if err != nil && ((clarified == "" && compactReq == "") || ctx.Err() != nil || res == nil || res.SessionID == "") {
