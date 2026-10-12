@@ -106,7 +106,10 @@ func (p *Pipeline) Run(ctx context.Context, job *Job) (string, error) {
 	if m := r.plan.Message; m != nil && r.st.MessageJob != job.ID {
 		items = append(items, m) // иначе уже разобрано этим заданием до перезапуска
 	}
-	r.st.PendingMessage, r.st.PendingQueue = nil, items
+	// Сообщение плана теперь в очереди состояния — значит, этим заданием оно
+	// уже принято: перезапуск исполнителя посреди разбора не возьмёт его из
+	// плана второй раз.
+	r.st.PendingMessage, r.st.PendingQueue, r.st.MessageJob = nil, items, job.ID
 	if err := r.reclaimBranch(); err != nil {
 		// Сообщения, пришедшие живыми к возобновлённому заданию, тоже не
 		// теряются: их разберёт «Повторить».
