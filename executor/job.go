@@ -224,7 +224,7 @@ func (j *Job) keepLateLocked(m *protocol.Message) bool {
 	if j.State == nil || m == nil {
 		return false
 	}
-	j.State.PendingMessage = mergeMessages(j.State.PendingMessage, m)
+	j.State.PendingQueue = append(j.State.PendingQueue, m)
 	return true
 }
 
