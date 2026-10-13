@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -114,6 +115,30 @@ func (r *Result) Window(model string) int64 {
 	return best
 }
 
+// headlessDeny — инструменты, которым в шаге без человека не место: шаг
+// кончается вместе с процессом, а с ними агент «уходит ждать» (будильник,
+// cron, наблюдение за фоновой командой) и завершает ход без работы.
+var headlessDeny = []string{"ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Monitor", "RemoteTrigger"}
+
+// headlessEnv — окружение claude для шага: фоновые команды выключены
+// (run_in_background, авто-фон по таймауту) — долгие сборки и тесты идут на
+// переднем плане, с потолком таймаута Bash в 30 минут вместо 10. Заданное
+// человеком в окружении демона не перебивается.
+func headlessEnv(base []string) []string {
+	env := append([]string(nil), base...)
+	set := func(k, v string) {
+		for _, kv := range base {
+			if strings.HasPrefix(kv, k+"=") {
+				return
+			}
+		}
+		env = append(env, k+"="+v)
+	}
+	set("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
+	set("BASH_MAX_TIMEOUT_MS", "1800000")
+	return env
+}
+
 // Run spawns one headless claude turn and streams normalized events to onEvent.
 // stdin is closed immediately; the turn ends when the process exits.
 func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result, error) {
@@ -144,11 +169,13 @@ func Run(ctx context.Context, opts RunOpts, onEvent func(StreamEvent)) (*Result,
 	} else {
 		args = append(args, "--permission-mode", "bypassPermissions")
 	}
+	args = append(args, "--disallowedTools", strings.Join(headlessDeny, ","))
 	for _, d := range opts.AddDirs {
 		args = append(args, "--add-dir", d)
 	}
 	cmd := exec.Command("claude", args...)
 	cmd.Dir = opts.CWD
+	cmd.Env = headlessEnv(os.Environ())
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err

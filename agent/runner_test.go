@@ -1,6 +1,12 @@
 package agent
 
-import "testing"
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // Итог result-события несёт usage всего прогона — из него считается расход
 // этапа; при отсутствии полей остаются нули.
@@ -114,5 +120,34 @@ func TestSessionLine(t *testing.T) {
 	}}, res, on)
 	if res.Window("claude-haiku-4-5-20251001") != 200000 || res.Window("claude-sonnet-5") != 1000000 {
 		t.Fatalf("окна: %+v", res.Windows)
+	}
+}
+
+// Шаг без человека: агент не может уйти ждать (будильник, cron, наблюдение
+// за фоном), фоновые команды выключены, потолок Bash поднят; заданное
+// человеком в окружении не перебивается.
+func TestRunHeadlessGuards(t *testing.T) {
+	dir := t.TempDir()
+	rec := filepath.Join(dir, "rec")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + rec + ".args'\nenv > '" + rec + ".env'\n" +
+		`echo '{"type":"result","subtype":"success","session_id":"s1","result":"ok","usage":{}}'` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BASH_MAX_TIMEOUT_MS", "600000") // выбор человека
+	if _, err := Run(context.Background(), RunOpts{Prompt: "p", Model: "m", CWD: dir}, func(StreamEvent) {}); err != nil {
+		t.Fatal(err)
+	}
+	args, _ := os.ReadFile(rec + ".args")
+	if !strings.Contains(string(args), "--disallowedTools\nScheduleWakeup,CronCreate,CronDelete,CronList,Monitor,RemoteTrigger\n") {
+		t.Fatalf("аргументы claude:\n%s", args)
+	}
+	env, _ := os.ReadFile(rec + ".env")
+	if !strings.Contains(string(env), "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1\n") {
+		t.Fatal("фоновые команды не выключены")
+	}
+	if strings.Count(string(env), "BASH_MAX_TIMEOUT_MS=") != 1 || !strings.Contains(string(env), "BASH_MAX_TIMEOUT_MS=600000\n") {
+		t.Fatalf("потолок Bash перебит: %s", env)
 	}
 }
